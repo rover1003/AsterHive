@@ -291,9 +291,10 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     // phase='end' 或主脑正式消息（message.created）到达 → 撤除，正式消息由既有流程照常插入。
     let streamRow: HTMLElement | null = null;
     let streamContent: HTMLElement | null = null;
+    let streamActivity: HTMLElement | null = null;
     let streamSuppressed = false; // 正式消息已插入：本轮剩余流式增量不再显示（end / 下一轮 turn_started 复位）
 
-    const showStreamBubble = (text: string) => {
+    const showStreamBubble = (text: string, activity?: { tool: string; detail: string }[]) => {
       if (!streamRow) {
         const row = document.createElement('div');
         row.className = 'msg stream-msg';
@@ -301,16 +302,33 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
           <div class="avatar role-${brainRole}"><span>${esc(brainName.slice(0, 1))}</span><i class="avatar-dot"></i></div>
           <div class="bubble stream-bubble">
             <div class="meta"><b class="role-${brainRole}">${esc(brainName)}</b><span class="stream-hint">正在回复…</span></div>
+            <div class="stream-activity" hidden></div>
             <div class="content stream-content"></div>
           </div>`;
         streamRow = row;
         streamContent = row.querySelector('.stream-content') as HTMLElement;
+        streamActivity = row.querySelector('.stream-activity') as HTMLElement;
         list.appendChild(row);
         syncSendButton(); // 主脑转活跃：发送按钮 → 停止按钮（仅创建时机状态变化，更新帧无需重设）
       }
+      // 工具活动面板：主脑一轮大部分时间在调工具（此阶段无 text 增量）——不展示的话
+      // 上游在烧 token 而界面静默，用户无从判断。显示最近 8 条，最后一条为进行中
+      if (streamActivity) {
+        if (activity && activity.length > 0) {
+          streamActivity.hidden = false;
+          streamActivity.innerHTML = activity
+            .map(
+              (a, i, arr) =>
+                `<div class="stream-activity-row${i === arr.length - 1 ? ' current' : ''}">${esc(a.tool)}${a.detail ? `<span>${esc(a.detail)}</span>` : ''}</div>`,
+            )
+            .join('');
+        } else if (text) {
+          streamActivity.hidden = true; // 已有正文输出：活动列表收起
+        }
+      }
       // 全文重渲 Markdown（parse→消毒→DOM 遍历）：流式期间无 taskRef，任务号暂不链接，
       // 正式消息插入时由 messageHtml 补上
-      if (streamContent) streamContent.innerHTML = renderMarkdown(text);
+      if (text && streamContent) streamContent.innerHTML = renderMarkdown(text);
       scrollToBottom();
     };
 
@@ -412,7 +430,10 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         // streaming：主脑已开始输出 → 撤"思考中"指示行，改显流式气泡
         hideThinking();
         if (streamSuppressed) return;
-        showStreamBubble(typeof payload.text === 'string' ? payload.text : '');
+        const acts = Array.isArray(payload.activity)
+          ? (payload.activity as { tool: string; detail: string }[])
+          : undefined;
+        showStreamBubble(typeof payload.text === 'string' ? payload.text : '', acts);
       }
     });
 

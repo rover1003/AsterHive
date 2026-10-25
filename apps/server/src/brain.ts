@@ -139,6 +139,33 @@ function assistantText(message: StreamAssistantMessage): string {
     .join('');
 }
 
+export interface BrainToolActivity {
+  tool: string;
+  detail: string;
+}
+
+// 提取 assistant 消息里的工具调用（toolCall 块）——主脑一轮的大部分时间在调工具，
+// 只推 text 增量会让聊天室在工具阶段长时间静默（用户视角：上游在烧 token 但界面无动静）。
+// 返回"本轮已见"的全部调用（按出现顺序）；调用方与已发布集合做差量。
+function assistantToolCalls(message: StreamAssistantMessage): BrainToolActivity[] {
+  const content = (message as {
+    content?: ReadonlyArray<{ type?: string; name?: string; arguments?: unknown }>;
+  }).content;
+  if (!Array.isArray(content)) return [];
+  const out: BrainToolActivity[] = [];
+  for (const c of content) {
+    if (c?.type !== 'toolCall' || typeof c.name !== 'string') continue;
+    let detail = '';
+    const args = c.arguments;
+    if (args && typeof args === 'object') {
+      const pick = (args as Record<string, unknown>).taskId ?? (args as Record<string, unknown>).boardId ?? '';
+      detail = pick ? String(pick) : JSON.stringify(args).slice(0, 60);
+    }
+    out.push({ tool: c.name.replace(/^asterhive_/, ''), detail });
+  }
+  return out;
+}
+
 // ---- 主脑系统提示（角色纪律）----
 
 const BRAIN_SYSTEM_PROMPT = `你是 AsterHive（星巢）的内置主脑（@主脑）——舰队的大脑、唯一的调度者与验收者。
@@ -720,8 +747,23 @@ export class Brain {
       this.#ctx.bus.publish('brain.stream', { ...frame, boardId });
     }, { intervalMs: STREAM_INTERVAL_MS, maxChars: STREAM_MAX_CHARS });
     this.#streamer = streamer;
+    const seenCalls = new Set<string>(); // 已发布过的工具调用（callId/name+序），差量发布
     this.#streamUnsub = session.subscribe((event) => {
       if (event.type !== 'message_update') return;
+      // 工具活动帧：新 toolCall 出现即即时发布（不经 300ms 节流）——工具阶段没有 text 增量，
+      // 不单独推的话聊天室会静默到轮末；帧 text 取当下累积全文，与节流帧同构（整体替换渲染）
+      const calls = assistantToolCalls(event.message);
+      const fresh = calls.filter((c) => !seenCalls.has(`${c.tool}|${c.detail}|${calls.indexOf(c)}`));
+      if (fresh.length > 0) {
+        for (const c of calls) seenCalls.add(`${c.tool}|${c.detail}|${calls.indexOf(c)}`);
+        this.#ctx.bus.publish('brain.stream', {
+          boardId,
+          phase: 'streaming',
+          text: assistantText(event.message),
+          activity: calls.slice(-8),
+        });
+        return;
+      }
       if (event.assistantMessageEvent.type !== 'text_delta') return; // thinking/toolcall 增量不进聊天流
       streamer.push(assistantText(event.message));
     });

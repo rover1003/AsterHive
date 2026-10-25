@@ -369,6 +369,13 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 
 /* 流式气泡：复用 .msg/.avatar/.bubble/.meta 配方，仅补"正在回复…"提示与闪烁光标 */
 .stream-hint { font-size: 11px; color: var(--subtle-foreground); }
+
+/* 流式气泡内的工具活动面板：主脑轮内工具调用阶段的可视化（无 text 增量时的"它在干嘛"） */
+.stream-activity { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 8px; padding: 6px 8px; background: var(--secondary); border-radius: var(--radius-sm); }
+.stream-activity-row { font-size: 12px; color: var(--subtle-foreground); font-family: ui-monospace, Consolas, monospace; }
+.stream-activity-row span { margin-left: 8px; color: var(--muted-foreground); }
+.stream-activity-row.current { color: var(--foreground); }
+.stream-activity-row.current::before { content: "▸ "; color: var(--primary); }
 /* 光标挂在最后一个 MD 块的末尾（renderMarkdown 输出块级元素），跟随文字而非独占一行；
    内容为空的一帧无光标（瞬态，可忽略） */
 .stream-content > :last-child::after {
