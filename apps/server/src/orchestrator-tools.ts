@@ -127,19 +127,35 @@ export const TOOL_DEFS: ToolDef[] = [
   ),
   tool(
     'asterhive_list_tasks',
-    '列出指定看板的卡，可按泳道（lane）与认领人（assignee）过滤。',
+    '列出指定看板的卡（紧凑视图：id/标题/泳道/优先级/认领人）。要看完整 detail/acceptance 用 asterhive_get_task。',
     {
       boardId: z.string(),
       lane: z.enum(LANES).optional(),
       assignee: z.string().optional(),
     },
-    (ctx, _a, args) => listTasks(ctx, args.boardId, { lane: args.lane as Lane, assignee: args.assignee }),
+    // 紧凑投影：完整任务表可随长文 detail 滚到 MB 级（实测撑爆主脑上下文），列表只回轻字段
+    (ctx, _a, args) =>
+      listTasks(ctx, args.boardId, { lane: args.lane as Lane, assignee: args.assignee }).map((t) => ({
+        id: t.id,
+        title: t.title,
+        lane: t.lane,
+        priority: t.priority,
+        assignee: t.assignee,
+        deps: t.dependsOn,
+      })),
   ),
   tool(
     'asterhive_get_task',
-    '按 id 查看单张卡的完整状态（泳道、认领人、依赖、文件清单、证据）。',
+    '按 id 查看单张卡的完整状态（泳道、认领人、依赖、文件清单、证据；长文本字段截断至 2000 字符）。',
     { taskId: z.string() },
-    (ctx, _a, args) => getTask(ctx, args.taskId),
+    (ctx, _a, args) => {
+      const t = getTask(ctx, args.taskId);
+      return {
+        ...t,
+        detail: t.detail?.slice(0, 2000),
+        acceptance: t.acceptance?.slice(0, 2000),
+      };
+    },
   ),
   tool(
     'asterhive_overview',

@@ -267,7 +267,21 @@ function toPiTool(
     execute: async (_toolCallId, params) => {
       try {
         const out = def.handle(ctx, actor, params as Record<string, unknown>);
-        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }], details: {} };
+        // 工具结果统一截断兜底：全量 JSON（如实测 2.58MB 的看板任务表）进上下文会把
+        // 每轮请求撑到数百 KB，上游对超长上下文直接 400。主脑要完整数据应分次精确查询。
+        const text = JSON.stringify(out, null, 2);
+        const capped = text.length > 32_768;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: capped
+                ? `${text.slice(0, 32_768)}\n…[输出已截断：完整 ${text.length} 字符。请缩小过滤范围（lane/assignee/任务号）分次查询]`
+                : text,
+            },
+          ],
+          details: {},
+        };
       } catch (err) {
         const msg =
           err instanceof HttpError
@@ -318,10 +332,10 @@ function buildSnapshot(ctx: Ctx): string {
     }
     lines.push('【Review 待验收】');
     for (const t of reviewTasks) {
-      lines.push(`  ${t.id}「${t.title}」@板${t.boardId}（提交人 ${t.assignee}）`);
-      lines.push(`    验收标准：${t.acceptance || '（卡面未写验收标准）'}`);
-      lines.push(`    提交摘要：${summaries.get(t.id) || '（无）'}`);
-      lines.push(`    证据：${t.evidence.map((e) => e.path).join(', ') || '（无）'}`);
+      lines.push(`  ${t.id}「${t.title.slice(0, 120)}」@板${t.boardId}（提交人 ${t.assignee}）`);
+      lines.push(`    验收标准：${(t.acceptance || '（卡面未写验收标准）').slice(0, 300)}`);
+      lines.push(`    提交摘要：${(summaries.get(t.id) || '（无）').slice(0, 300)}`);
+      lines.push(`    证据：${t.evidence.slice(0, 5).map((e) => e.path).join(', ') || '（无）'}`);
     }
   }
 
@@ -367,7 +381,6 @@ export class Brain {
   #lastBoardId: string | null = null; // 最近一次唤醒事件所在板（失败提示要发回对应的房）
   #errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
   #consecutiveModelFailures = 0; // 连续上游失败计数：≥3 停自动重试（成功/用户新消息复位）
-  #turnCount = 0; // 会话累计轮次：会话旋转阈值之一（上下文防膨胀）
   #aborting = false; // 主动中止标记：abortTurn 置位，#turn 收尾据此识别"用户主动停"并与上游失败隔离（用后即清）
   #piCache = new Map<string, PiModule>(); // 运行时入口 → 已加载模块（版本更替即换 URL 重载）
   #streamer: ThrottledStream | null = null; // 本轮 brain.stream 节流发布器（null = 本轮不发流）
@@ -557,11 +570,9 @@ export class Brain {
       return;
     }
     this.#running = true;
-    this.#turnCount += 1;
     const started = Date.now();
     const reasons = this.#reasons;
     this.#reasons = [];
-    await this.#maybeRotateSession(); // 上下文防膨胀：体积/轮次超阈值则归档旧会话、本轮重建
     // 流式发布目标板：取走即清——本轮固定推这个板；中途 steer 进来的新消息由下一轮决定
     const streamBoardId = this.#streamBoardId;
     this.#streamBoardId = null;
@@ -660,6 +671,11 @@ export class Brain {
       });
       this.#disposeSession(); // 会话可能已坏：下次唤醒重建
     } finally {
+      // 无状态化（省 token 的正解，2026-10-26 用户定调）：每轮结束即弃会话，下轮全新开始。
+      // 持久会话每轮重发全部历史（随轮次线性增长、无上界），与"主脑最大限度节省 token"
+      // 的初衷背道而驰；主脑的记忆 = 事件台账按需查询 + 每轮快照（自带全量看板状态），
+      // 对话历史几乎无损。abortTurn 路径已提前 dispose，此处幂等。
+      this.#disposeSession();
       this.#running = false;
       this.#aborting = false; // 兜底：catch 路径未走到收尾清标记处，也绝不能把"中止"带进下一轮
       this.#streamBoardId = null; // 运行中 steer 进来的消息会重设此值：本轮流已固定目标板，清掉防残留到无关轮
@@ -729,44 +745,6 @@ export class Brain {
    * 多模型组：入参即本轮激活组（activeGroup 已解密 KEY）；组切换经
    * settings.orchestrator_updated → #onEvent → #disposeSession 到达这里时指纹必变。
    */
-  // 会话旋转：持久会话的 JSONL 随轮次/工具结果无限增长（实测一晚 26MB，上游直接 400）。
-  // 体积 >8MB 或累计 ≥30 轮即归档旧会话（保留 .bak-<时间戳> 一份）并重建全新会话——
-  // 主脑的记忆依赖事件台账与每轮快照（自带全量看板状态），对话历史几乎无损。
-  static readonly SESSION_MAX_BYTES = 8 * 1024 * 1024;
-  static readonly SESSION_MAX_TURNS = 30;
-
-  async #maybeRotateSession(): Promise<void> {
-    const sessionsDir = join(this.#ctx.cfg.dataDir, 'brain-session', 'sessions');
-    let size = 0;
-    try {
-      for (const f of readdirSync(sessionsDir)) {
-        if (!f.endsWith('.jsonl')) continue;
-        const st = statSync(join(sessionsDir, f));
-        if (st.size > size) size = st.size;
-      }
-    } catch {
-      return; // 目录不存在 = 尚无任何会话，无需旋转
-    }
-    if (size <= Brain.SESSION_MAX_BYTES && this.#turnCount < Brain.SESSION_MAX_TURNS) return;
-    this.#disposeSession();
-    this.#sessionKey = ''; // 强制 #ensureSession 以全新会话重建
-    try {
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      for (const f of readdirSync(sessionsDir)) {
-        if (f.endsWith('.jsonl')) renameSync(join(sessionsDir, f), join(sessionsDir, `${f}.bak-${stamp}`));
-      }
-    } catch {
-      // 归档失败不阻塞：新会话文件名自带时间戳，与旧文件天然不冲突
-    }
-    withWrite(this.#ctx, 'brain.sessionRotate', () => {
-      logEvent(this.#ctx, 'brain.session_rotated', {
-        sizeMB: Math.round(size / 1048576),
-        turns: this.#turnCount,
-      });
-    });
-    this.#turnCount = 0;
-  }
-
   async #ensureSession(g: ActiveOrchestratorGroup): Promise<AgentSession> {
     const rt = this.#runtime.ensureRuntimeEntry(); // 数据卷优先，回落仓库基线；包不完整直接报错
     // 指纹含解密后的 apiKey：仅换 KEY/换组也能触发会话重建
