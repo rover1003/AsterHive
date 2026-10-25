@@ -29,6 +29,7 @@ const KNOWN_EVENTS = [
   'brain.turn_finished',
   'brain.stream',
   'brain.error', // 上游模型异常轮：无 turn_finished，收到即撤"思考中"指示防残留
+  'brain.turn_aborted', // 用户主动停止当前轮次：收到即撤指示行/流式气泡（turn_finished 随后照常到达）
 ];
 
 const handlers = new Set<SseHandler>();

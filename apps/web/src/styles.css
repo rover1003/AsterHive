@@ -467,6 +467,11 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 .composer-send:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); background-image: none; }
 .composer-send:disabled { opacity: 0.4; }
 .composer-send svg.i { width: 14px; height: 14px; }
+/* 停止态：主脑活跃期间发送按钮切换为停止（room.ts 切换 .stopping 类 + stop 图标）——
+   --danger 实色底配深色图形（同主按钮的中明度实色配方），hover 加深一档；
+   类移除后即恢复上方发送态样式 */
+.composer-send.stopping { background: var(--danger); border-color: var(--danger); color: var(--primary-foreground); }
+.composer-send.stopping:hover:not(:disabled) { background: #ef4444; border-color: #ef4444; background-image: none; }
 
 /* ---------- 看板监视栏：占剩余大头的宽栏（用户终裁：聊天收窄、看板放宽） ---------- */
 .board-rail {

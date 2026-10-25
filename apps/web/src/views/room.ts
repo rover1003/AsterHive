@@ -178,6 +178,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     const list = container.querySelector('.messages') as HTMLElement;
     const input = container.querySelector('.composer-input') as HTMLTextAreaElement;
     const targetSelect = container.querySelector('.composer-target') as HTMLSelectElement;
+    const sendBtn = container.querySelector('.composer-send') as HTMLButtonElement;
     let msgTarget = localStorage.getItem(MSG_TARGET_KEY) ?? '主脑'; // 默认发给主脑
 
     // 输入框自适应：输入时按内容撑高（封顶 220px ≈ 十行，让长提示词完整可读），
@@ -230,6 +231,18 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       opts.onTaskClick?.(a.dataset.task!);
     });
 
+    // ---- 功能C：发送/停止按钮切换 ----
+    // 主脑活跃 = 思考指示行或流式气泡任一可见（复用功能A/B 维护的显隐状态，不另设标志位——
+    // 显隐路径是唯一事实源，syncSendButton 挂在其收尾处即全覆盖）。活跃期间 .composer-send
+    // 变停止按钮（--danger 底 + stop 图标，样式见 styles.css .composer-send.stopping）：
+    // 点击 POST /settings/orchestrator/abort 中止主脑当前轮次；非活跃恢复发送态。
+    const syncSendButton = () => {
+      const active = thinkingRow !== null || streamRow !== null;
+      sendBtn.classList.toggle('stopping', active);
+      sendBtn.title = active ? '停止主脑当前轮次' : '发送';
+      sendBtn.innerHTML = active ? icon.stop : icon.send;
+    };
+
     // ---- 功能A：主脑"思考中"指示行 ----
     // 生命周期：brain.turn_started 显示 → brain.turn_finished / brain.error / 主脑消息到达 撤除
     //（多路撤除是防事件乱序/异常轮残留的双保险）。计时秒数每秒递增。
@@ -258,6 +271,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         elapsedEl.textContent = `${thinkingSeconds}s`;
       }, 1000);
       scrollToBottom();
+      syncSendButton(); // 主脑转活跃：发送按钮 → 停止按钮
     };
 
     const hideThinking = () => {
@@ -268,6 +282,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       thinkingRow?.remove();
       thinkingRow = null;
       thinkingSeconds = 0;
+      syncSendButton(); // 可能因此转非活跃：停止按钮 → 发送按钮（流式气泡仍活跃则保持停止态）
     };
 
     // ---- 功能B：主脑流式回复气泡 ----
@@ -291,6 +306,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         streamRow = row;
         streamContent = row.querySelector('.stream-content') as HTMLElement;
         list.appendChild(row);
+        syncSendButton(); // 主脑转活跃：发送按钮 → 停止按钮（仅创建时机状态变化，更新帧无需重设）
       }
       // 全文重渲 Markdown（parse→消毒→DOM 遍历）：流式期间无 taskRef，任务号暂不链接，
       // 正式消息插入时由 messageHtml 补上
@@ -302,6 +318,27 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       streamRow?.remove();
       streamRow = null;
       streamContent = null;
+      syncSendButton(); // 可能因此转非活跃：停止按钮 → 发送按钮
+    };
+
+    // 中止主脑当前轮次（停止按钮点击 / 停止态 Enter）：请求在途防抖，连点只在第一发生效
+    //（服务端 abortTurn 本身幂等，这里省的是多余请求）。成功即本地撤指示行/流式气泡
+    //（服务端 brain.turn_aborted / brain.turn_finished 事件兜底），并抑制本轮剩余流式增量
+    //（turn_started 复位）——防中止收尾前迟到的节流帧把气泡显回来。失败 toast 且保持现状。
+    let abortInFlight = false;
+    const stopBrain = async () => {
+      if (abortInFlight) return;
+      abortInFlight = true;
+      try {
+        await api.post('/settings/orchestrator/abort', {});
+        hideThinking();
+        hideStreamBubble();
+        streamSuppressed = true;
+      } catch (err) {
+        toast(`停止失败：${err instanceof Error ? err.message : ''}`, true);
+      } finally {
+        abortInFlight = false;
+      }
     };
 
     // 卸载清理：destroy 时停计时器、撤节点（SSE 已随 unsub 退订），防闭包持有旧 DOM 继续跑
@@ -356,6 +393,14 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       }
       if (type === 'brain.turn_finished' || type === 'brain.error') {
         hideThinking(); // 轮次结束/上游异常（异常轮没有 turn_finished，brain.error 兜底）
+        return;
+      }
+      if (type === 'brain.turn_aborted') {
+        // 本页或其他端触发的主动停止：撤指示行/流式气泡并抑制剩余增量（turn_started 复位）；
+        // turn_finished 随后照常到达，再次收尾是幂等空操作
+        hideThinking();
+        hideStreamBubble();
+        streamSuppressed = true;
         return;
       }
       if (type === 'brain.stream' && payload.boardId === boardId) {
@@ -418,11 +463,17 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         toast(`发送失败：${err instanceof Error ? err.message : ''}`, true);
       }
     };
-    (container.querySelector('.composer-send') as HTMLElement).addEventListener('click', () => void send());
+    // 发送按钮：主脑活跃期间它是停止按钮（点击=中止当前轮次），非活跃才是发送
+    sendBtn.addEventListener('click', () => {
+      if (thinkingRow || streamRow) void stopBrain();
+      else void send();
+    });
     input.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter' && !ev.shiftKey) {
         ev.preventDefault();
-        void send();
+        // 停止态下 Enter = 触发停止（而非发送）：与按钮当前语义保持一致
+        if (thinkingRow || streamRow) void stopBrain();
+        else void send();
       }
     });
 

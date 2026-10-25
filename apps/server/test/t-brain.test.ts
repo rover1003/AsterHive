@@ -98,6 +98,26 @@ function httpHeaders(extra: Record<string, string> = {}): Record<string, string>
   return { 'content-type': 'application/json', ...extra };
 }
 
+// 挂起型 mock：收到 chat/completions 后只计数、不写响应——SDK 侧请求一直挂着，
+// 用于制造"轮次运行中、卡在模型调用"的窗口（abortTurn 测试用）
+function startHangingMock(): { server: Server; port: () => number; calls: () => number } {
+  let n = 0;
+  const server = createServer((req, res) => {
+    if (req.method !== 'POST' || !(req.url ?? '').endsWith('/chat/completions')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `unexpected ${req.method} ${req.url}` } }));
+      return;
+    }
+    req.on('data', () => {}); // 消费请求体，保持连接但不响应
+    n += 1;
+  });
+  return {
+    server,
+    port: () => (server.address() as AddressInfo).port,
+    calls: () => n,
+  };
+}
+
 // ---- 主脑端到端（mock 模型）----
 
 test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落账；worker 语义不受影响', async () => {
@@ -197,6 +217,91 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
     assert.equal(off.status, 200);
     await sleep(300);
     assert.ok(earlyTypes().includes('brain.stopped'), '关闭后应有 brain.stopped');
+  } finally {
+    mock.server.close();
+    rig.cleanup();
+  }
+});
+
+test('主脑：停止按钮——运行中 abort 落账 turn_finished(aborted) 且不计失败；未运行幂等 false', async () => {
+  const rig = mkRig();
+  const mock = startHangingMock();
+  try {
+    const app = createApp(rig.ctx);
+    createBoard(rig.ctx, { id: 'b', name: '板' });
+    await new Promise<void>((r) => mock.server.listen(0, '127.0.0.1', r));
+    const grp = await app.request('/settings/orchestrator/groups', {
+      method: 'POST',
+      headers: httpHeaders(),
+      body: JSON.stringify({ name: '挂起通道', baseURL: `http://127.0.0.1:${mock.port()}/v1`, apiKey: 'sk-mock', model: 'mock-1' }),
+    });
+    assert.equal(grp.status, 201);
+    const put = await app.request('/settings/orchestrator', {
+      method: 'PUT',
+      headers: httpHeaders(),
+      body: JSON.stringify({ enabled: true }),
+    });
+    assert.equal(put.status, 200);
+
+    // 授权：worker token 403（requireElevated）；匿名（=user）放行
+    const worker = registerAgent(rig.ctx, { name: '工蜂', handle: 'bee' });
+    const forbidden = await app.request('/settings/orchestrator/abort', {
+      method: 'POST',
+      headers: httpHeaders({ authorization: `Bearer ${worker.token}` }),
+    });
+    assert.equal(forbidden.status, 403);
+
+    // 未运行：幂等 false
+    const idle = await app.request('/settings/orchestrator/abort', { method: 'POST', headers: httpHeaders() });
+    assert.equal(idle.status, 200);
+    assert.equal(((await idle.json()) as { aborted: boolean }).aborted, false);
+
+    // 用户消息唤醒 → 等轮次开始 → 等模型请求抵达挂起 mock（此刻轮次卡在模型调用中）
+    await app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: httpHeaders(),
+      body: JSON.stringify({ content: '@主脑 停止测试' }),
+    });
+    let started: { id: number } | undefined;
+    for (let i = 0; i < 150 && !started; i++) {
+      await sleep(200);
+      started = listEvents(rig.ctx, { type: 'brain.turn_started', limit: 1 })[0];
+    }
+    assert.ok(started, '30 秒内应出现 brain.turn_started');
+    for (let i = 0; i < 100 && mock.calls() === 0; i++) await sleep(100);
+    assert.ok(mock.calls() >= 1, '模型请求应已抵达挂起 mock');
+    await sleep(500); // 留出请求在途窗口，确保 abort 打断的是 prompt 而非会话创建
+
+    // 运行中 abort：返回 true，brain.turn_aborted 落账
+    const abort = await app.request('/settings/orchestrator/abort', { method: 'POST', headers: httpHeaders() });
+    assert.equal(abort.status, 200);
+    assert.equal(((await abort.json()) as { aborted: boolean }).aborted, true);
+    assert.equal(listEvents(rig.ctx, { type: 'brain.turn_aborted', limit: 5 }).length, 1);
+
+    // 立即二次 abort：会话已在第一次 abort 中同步弃置（#session=null）→ 幂等 false
+    const again = await app.request('/settings/orchestrator/abort', { method: 'POST', headers: httpHeaders() });
+    assert.equal(((await again.json()) as { aborted: boolean }).aborted, false);
+
+    // 轮次收尾：turn_finished 照常落账，payload 标注 aborted: true（modelError 可能非空但不进失败统计）
+    let finished: { payload: Record<string, unknown> } | undefined;
+    for (let i = 0; i < 150 && !finished; i++) {
+      await sleep(200);
+      finished = listEvents(rig.ctx, { type: 'brain.turn_finished', limit: 1 })[0];
+    }
+    assert.ok(finished, '30 秒内应出现 brain.turn_finished（abort 后轮次正常收尾）');
+    assert.equal(finished.payload.aborted, true);
+
+    // 失败计数隔离：中止轮不计 modelError 失败 → 不排 60s 自动重试。若被误计，
+    // 会排自动重试并在去抖后开新轮——观察窗口内 turn_started 不应增多；
+    // 也不应出现"连续失败停止自动重试"的系统提示
+    const before = listEvents(rig.ctx, { type: 'brain.turn_started', limit: 10 }).length;
+    await sleep(2000);
+    const after = listEvents(rig.ctx, { type: 'brain.turn_started', limit: 10 }).length;
+    assert.equal(after, before, '中止轮不应触发自动重试（失败计数未递增）');
+    const sysMsgs = listMessages(rig.ctx, 'b', {}).filter(
+      (m) => m.author === 'asterhive-brain' && m.kind === 'system',
+    );
+    assert.equal(sysMsgs.length, 0, '主动中止不应产生失败系统提示');
   } finally {
     mock.server.close();
     rig.cleanup();

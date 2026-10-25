@@ -26,7 +26,7 @@
 //     ② session.prompt() 默认展开轮首 /skill:<名>（agent-session.js _expandSkillCommand，
 //        由 Pi 进程读文件全文注入该轮 prompt，与工具面无关）——为将来 UI 触发的定向调用预留。
 //     自定义工具扩展走 extensions/（additionalExtensionPaths，工厂签名见 examples/brain-extension/）。
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readdirSync, renameSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { Type, type TSchema } from 'typebox';
 import type { ZodType } from 'zod';
@@ -367,6 +367,8 @@ export class Brain {
   #lastBoardId: string | null = null; // 最近一次唤醒事件所在板（失败提示要发回对应的房）
   #errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
   #consecutiveModelFailures = 0; // 连续上游失败计数：≥3 停自动重试（成功/用户新消息复位）
+  #turnCount = 0; // 会话累计轮次：会话旋转阈值之一（上下文防膨胀）
+  #aborting = false; // 主动中止标记：abortTurn 置位，#turn 收尾据此识别"用户主动停"并与上游失败隔离（用后即清）
   #piCache = new Map<string, PiModule>(); // 运行时入口 → 已加载模块（版本更替即换 URL 重载）
   #streamer: ThrottledStream | null = null; // 本轮 brain.stream 节流发布器（null = 本轮不发流）
   #streamUnsub: (() => void) | null = null; // Pi 会话增量订阅退订器
@@ -518,6 +520,30 @@ export class Brain {
     }, DEBOUNCE_MS);
   }
 
+  // ---- 主动中止（用户停止按钮 → POST /settings/orchestrator/abort）----
+
+  /**
+   * 中止主脑当前轮次（用户主动停止）。仅运行中且已有会话时生效，否则返回 false（幂等可连点）：
+   * ① 置 #aborting——#turn 收尾据此识别"用户主动停 ≠ 上游故障"：跳过失败计数与失败系统提示
+   *   （中止后 session.errorMessage 可能非空——SDK 把中止记为错误态，只能靠本标记区分）；
+   * ② session.abort()——SDK 语义"中止当前运行并等 agent 空闲"，#turn 里 await 的 prompt
+   *   promise 随之返回（与单轮超时同款）。不 await：端点即时返回，收尾走 #turn 既定流程
+   *   （stopStreamer 补发 end 帧、turn_finished 照常落账）；
+   * ③ #disposeSession()——中止即弃会话，下次唤醒重建（与换通道/异常路径同策）；同步执行
+   *   同时保证了本方法的幂等：二次调用时 #session 已为 null，直接返回 false；
+   * ④ 落账 brain.turn_aborted（withWrite 提交后经总线发布 → SSE 下发，各端据此撤指示）。
+   */
+  abortTurn(reason: string): boolean {
+    if (!this.#running || !this.#session) return false;
+    this.#aborting = true;
+    void this.#session.abort().catch(() => {}); // abort() 同步段即触发 agent.abort() 取消当前运行
+    this.#disposeSession();
+    withWrite(this.#ctx, 'brain.abortTurn', () => {
+      logEvent(this.#ctx, 'brain.turn_aborted', { reason });
+    });
+    return true;
+  }
+
   // ---- 轮次 ----
 
   async #turn(): Promise<void> {
@@ -531,9 +557,11 @@ export class Brain {
       return;
     }
     this.#running = true;
+    this.#turnCount += 1;
     const started = Date.now();
     const reasons = this.#reasons;
     this.#reasons = [];
+    await this.#maybeRotateSession(); // 上下文防膨胀：体积/轮次超阈值则归档旧会话、本轮重建
     // 流式发布目标板：取走即清——本轮固定推这个板；中途 steer 进来的新消息由下一轮决定
     const streamBoardId = this.#streamBoardId;
     this.#streamBoardId = null;
@@ -574,43 +602,54 @@ export class Brain {
           logEvent(this.#ctx, 'brain.turn_timeout', { turnMs: Date.now() - started });
         });
       }
-      // 模型侧失败（如端点不可达）不抛异常——pi 以 errorMessage 结束轮次；一并落账供 UI 显示
+      // 主动中止收尾：用后即清（异常路径由 finally 兜底再清，防误标下一轮）
+      const aborted = this.#aborting;
+      this.#aborting = false;
+      // 模型侧失败（如端点不可达）不抛异常——pi 以 errorMessage 结束轮次；一并落账供 UI 显示。
+      // 注意 abort 后 errorMessage 可能非空（SDK 把中止记为错误态）——是否失败轮一律以 aborted 标记为准。
       const modelError = session.agent.state.errorMessage;
       withWrite(this.#ctx, 'brain.turnFinish', () => {
-        logEvent(this.#ctx, 'brain.turn_finished', { turnMs: Date.now() - started, modelError });
+        logEvent(this.#ctx, 'brain.turn_finished', {
+          turnMs: Date.now() - started,
+          modelError,
+          ...(aborted ? { aborted: true } : {}),
+        });
       });
       // 上游瞬时故障（如中转站账号池瞬时耗尽 503）先静默重试（60s 后）；连续失败封顶：
       // 连续 ≥3 轮失败即停止自动重试并提示用户换通道——否则中转站整体故障时会在
-      // "失败→60s→再试→再败"里无限空转（每轮还烧几分钟超时），指示器常亮误导用户
-      if (modelError) {
-        this.#consecutiveModelFailures += 1;
-        if (this.#consecutiveModelFailures <= 2) {
-          if (this.#errorRetryTimer) clearTimeout(this.#errorRetryTimer);
-          const brief = modelError.slice(0, 160);
-          this.#errorRetryTimer = setTimeout(() => {
-            this.#errorRetryTimer = null;
-            this.#reasons.push(`[自动重试] 上一轮上游模型调用失败（${brief}），请重新处理本清单`);
-            this.#markDirty();
-          }, 60_000);
-        } else {
-          const board = this.#lastBoardId;
-          // 已提示过就不再刷屏：封顶后保持静默，直到成功或用户真实介入（新消息唤醒）复位
-          if (this.#consecutiveModelFailures === 3 && board) {
-            withWrite(this.#ctx, 'brain.upstreamError', () => {
-              messageInner(this.#ctx, {
-                boardId: board,
-                author: BRAIN_AGENT_ID,
-                kind: 'system',
-                content:
-                  `⚠ 主脑连续 ${this.#consecutiveModelFailures} 轮调用上游模型失败，已停止自动重试：${modelError.slice(0, 160)}。` +
-                  '请到「设置 → 主脑设置」刷新模型列表/测试连通，启用一条可用通道，或稍后再 @主脑（会自动恢复重试）。',
-                mentions: [],
+      // "失败→60s→再试→再败"里无限空转（每轮还烧几分钟超时），指示器常亮误导用户。
+      // 主动中止的轮不走失败统计：用户主动停 ≠ 上游故障——不复位也不递增，不发失败提示
+      if (!aborted) {
+        if (modelError) {
+          this.#consecutiveModelFailures += 1;
+          if (this.#consecutiveModelFailures <= 2) {
+            if (this.#errorRetryTimer) clearTimeout(this.#errorRetryTimer);
+            const brief = modelError.slice(0, 160);
+            this.#errorRetryTimer = setTimeout(() => {
+              this.#errorRetryTimer = null;
+              this.#reasons.push(`[自动重试] 上一轮上游模型调用失败（${brief}），请重新处理本清单`);
+              this.#markDirty();
+            }, 60_000);
+          } else {
+            const board = this.#lastBoardId;
+            // 已提示过就不再刷屏：封顶后保持静默，直到成功或用户真实介入（新消息唤醒）复位
+            if (this.#consecutiveModelFailures === 3 && board) {
+              withWrite(this.#ctx, 'brain.upstreamError', () => {
+                messageInner(this.#ctx, {
+                  boardId: board,
+                  author: BRAIN_AGENT_ID,
+                  kind: 'system',
+                  content:
+                    `⚠ 主脑连续 ${this.#consecutiveModelFailures} 轮调用上游模型失败，已停止自动重试：${modelError.slice(0, 160)}。` +
+                    '请到「设置 → 主脑设置」刷新模型列表/测试连通，启用一条可用通道，或稍后再 @主脑（会自动恢复重试）。',
+                  mentions: [],
+                });
               });
-            });
+            }
           }
+        } else {
+          this.#consecutiveModelFailures = 0; // 成功即复位
         }
-      } else {
-        this.#consecutiveModelFailures = 0; // 成功即复位
       }
     } catch (err) {
       withWrite(this.#ctx, 'brain.error', () => {
@@ -622,6 +661,7 @@ export class Brain {
       this.#disposeSession(); // 会话可能已坏：下次唤醒重建
     } finally {
       this.#running = false;
+      this.#aborting = false; // 兜底：catch 路径未走到收尾清标记处，也绝不能把"中止"带进下一轮
       this.#streamBoardId = null; // 运行中 steer 进来的消息会重设此值：本轮流已固定目标板，清掉防残留到无关轮
       if (this.#dirty) {
         this.#dirty = false;
@@ -689,6 +729,44 @@ export class Brain {
    * 多模型组：入参即本轮激活组（activeGroup 已解密 KEY）；组切换经
    * settings.orchestrator_updated → #onEvent → #disposeSession 到达这里时指纹必变。
    */
+  // 会话旋转：持久会话的 JSONL 随轮次/工具结果无限增长（实测一晚 26MB，上游直接 400）。
+  // 体积 >8MB 或累计 ≥30 轮即归档旧会话（保留 .bak-<时间戳> 一份）并重建全新会话——
+  // 主脑的记忆依赖事件台账与每轮快照（自带全量看板状态），对话历史几乎无损。
+  static readonly SESSION_MAX_BYTES = 8 * 1024 * 1024;
+  static readonly SESSION_MAX_TURNS = 30;
+
+  async #maybeRotateSession(): Promise<void> {
+    const sessionsDir = join(this.#ctx.cfg.dataDir, 'brain-session', 'sessions');
+    let size = 0;
+    try {
+      for (const f of readdirSync(sessionsDir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        const st = statSync(join(sessionsDir, f));
+        if (st.size > size) size = st.size;
+      }
+    } catch {
+      return; // 目录不存在 = 尚无任何会话，无需旋转
+    }
+    if (size <= Brain.SESSION_MAX_BYTES && this.#turnCount < Brain.SESSION_MAX_TURNS) return;
+    this.#disposeSession();
+    this.#sessionKey = ''; // 强制 #ensureSession 以全新会话重建
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      for (const f of readdirSync(sessionsDir)) {
+        if (f.endsWith('.jsonl')) renameSync(join(sessionsDir, f), join(sessionsDir, `${f}.bak-${stamp}`));
+      }
+    } catch {
+      // 归档失败不阻塞：新会话文件名自带时间戳，与旧文件天然不冲突
+    }
+    withWrite(this.#ctx, 'brain.sessionRotate', () => {
+      logEvent(this.#ctx, 'brain.session_rotated', {
+        sizeMB: Math.round(size / 1048576),
+        turns: this.#turnCount,
+      });
+    });
+    this.#turnCount = 0;
+  }
+
   async #ensureSession(g: ActiveOrchestratorGroup): Promise<AgentSession> {
     const rt = this.#runtime.ensureRuntimeEntry(); // 数据卷优先，回落仓库基线；包不完整直接报错
     // 指纹含解密后的 apiKey：仅换 KEY/换组也能触发会话重建

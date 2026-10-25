@@ -581,6 +581,13 @@ export function createApp(ctx: Ctx): Hono {
   const brain = new Brain(ctx, piRuntime);
   brain.start(); // 只订阅总线；settings.enabled 决定是否激活（默认关，测试与裸部署零副作用）
 
+  // 主动中止主脑当前轮次（聊天页停止按钮）：授权同主脑设置（requireElevated，worker token 403）。
+  // 幂等——未在运行（含已收尾/会话已弃）返回 { aborted: false }，前端据此保持现状不误撤指示。
+  app.post('/settings/orchestrator/abort', (c) => {
+    requireElevated(ctx, c);
+    return c.json({ aborted: brain.abortTurn('user') });
+  });
+
   app.get('/settings/runtime', async (c) => {
     const status = piRuntime.status();
     // 上游 latest 用 npm view 子进程现查（失败 → null，UI 显示未知）；管理页低频调用可接受
