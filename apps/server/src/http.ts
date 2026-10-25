@@ -1,0 +1,613 @@
+import { Hono } from 'hono';
+import { streamSSE } from 'hono/streaming';
+import type { Context } from 'hono';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import type { Ctx } from './types.ts';
+import { HttpError } from './types.ts';
+import { withWrite, listEvents, logEvent } from './write.ts';
+import { listSnapshots, snapshotNow, restoreSnapshot, readAudit } from './backup.ts';
+import {
+  registerAgent,
+  listAgents,
+  setAgentEnabled,
+  deleteAgent,
+  heartbeat,
+  authByToken,
+  reportAgentModels,
+  updateAgentProfile,
+  getAgentProfile,
+  type Agent,
+  type AgentRole,
+} from './agents.ts';
+import {
+  listBoards,
+  createBoard,
+  getBoard,
+  updateBoard,
+  deleteBoard,
+  getParticipants,
+  setParticipants,
+  listTasks,
+  getTask,
+  createTask,
+  updateTask,
+  addDependencies,
+  type Lane,
+  type Priority,
+} from './tasks.ts';
+import { claimTask, nextTask, checkpointTask, releaseTask, submitTask } from './verbs.ts';
+import { createMessage, listMessages, inboxFor, dispatchTask, type MessageKind } from './messages.ts';
+import { getOverview } from './overview.ts';
+import { getOrchestratorSettings, putOrchestratorSettings, listOrchestratorModels, testOrchestratorModel } from './settings.ts';
+import { getUserStatus, renameUser, ensureUserAgent } from './user.ts';
+import { mountMcp } from './mcp.ts';
+import { PiRuntimeManager } from './pi-runtime.ts';
+import { Brain } from './brain.ts';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { serveStatic } from '@hono/node-server/serve-static';
+
+function bearerToken(c: Context): string | null {
+  const h = c.req.header('authorization');
+  if (!h?.startsWith('Bearer ')) return null;
+  return h.slice(7).trim() || null;
+}
+
+// 身份解析（2026-10-25 用户终裁）：浏览器端零令牌——不携带 Bearer 的请求即视为唯一用户。
+// token 仅是 agent（worker/主脑/内置脑）的身份归属机制，不是用户账号体系；
+// 内网（WireGuard）即信任边界，匿名请求获得 user 权限是有意语义。
+// 注意：带了 token 但无效（吊销/伪造）必须 401——agent 客户端需要明确失败而非静默降权成用户。
+function resolveActor(ctx: Ctx, c: Context): Agent {
+  const token = bearerToken(c);
+  if (token) {
+    const agent = authByToken(ctx, token);
+    if (!agent) throw new HttpError(401, 'invalid bearer token');
+    return agent;
+  }
+  return ensureUserAgent(ctx);
+}
+
+function requireActor(ctx: Ctx, c: Context): Agent {
+  return resolveActor(ctx, c);
+}
+
+// 提权写闸门：worker 角色的 token 不放行（信任分层仍对 agent 生效）；匿名即 user，自然通过。
+function requireElevated(ctx: Ctx, c: Context): Agent {
+  const agent = resolveActor(ctx, c);
+  if (agent.role !== 'user' && agent.role !== 'orchestrator') {
+    throw new HttpError(403, `role '${agent.role}' cannot perform elevated operations`);
+  }
+  return agent;
+}
+
+export function createApp(ctx: Ctx): Hono {
+  const app = new Hono();
+
+  // Web UI 静态托管（生产形态：单容器同时供 API 与界面）。
+  // 必须先于其余路由注册，'/' 才会落到 index.html 而不是被 API 路由抢占。
+  const staticRoot = process.env.ASTERHIVE_STATIC_DIR ?? '../web/dist';
+  const staticEnabled = existsSync(staticRoot);
+
+  app.onError((err, c) => {
+    if (err instanceof HttpError) {
+      return c.json({ error: err.message }, err.status as ContentfulStatusCode);
+    }
+    return c.json({ error: err instanceof Error ? err.message : 'internal error' }, 500);
+  });
+
+  if (staticEnabled) {
+    app.use('*', serveStatic({ root: staticRoot }));
+  }
+
+  app.get(staticEnabled ? '/api/info' : '/', (c) =>
+    c.json({
+      name: 'AsterHive',
+      service: 'dispatch-server',
+      version: '0.1.0',
+      endpoints: ['/health', '/events (SSE)', '/api/events', '/api/audit', '/api/user', '/settings/runtime', '/skill/asterhive-worker', '/bootstrap/', '/mcp'],
+    }),
+  );
+
+  app.get('/health', (c) => {
+    const row = ctx.holder.db.prepare('SELECT COUNT(*) AS n FROM event').get() as { n: number };
+    return c.json({ ok: true, db: true, events: row.n });
+  });
+
+  // SSE 事件流：主脑唤醒与 UI 实时刷新共用（立项计划 §7）。
+  // 连接建立即订阅总线；事务提交后的领域事件实时下发，另以心跳保活。
+  app.get('/events', (c) =>
+    streamSSE(c, async (stream) => {
+      await stream.writeSSE({ event: 'hello', data: 'asterhive event stream' });
+      const queue: { id: number; type: string; payload: Record<string, unknown> }[] = [];
+      let notify: (() => void) | undefined;
+      const unsub = ctx.bus.subscribe((type, payload, id) => {
+        queue.push({ id, type, payload });
+        notify?.();
+      });
+      stream.onAbort(() => unsub());
+      while (!stream.aborted) {
+        if (queue.length === 0) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 15_000);
+            notify = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+          });
+          notify = undefined;
+        }
+        if (stream.aborted) break;
+        while (queue.length > 0 && !stream.aborted) {
+          const e = queue.shift()!;
+          await stream.writeSSE({
+            id: String(e.id),
+            event: e.type,
+            data: JSON.stringify(e.payload),
+          });
+        }
+        if (queue.length === 0 && !stream.aborted) {
+          await stream.writeSSE({ event: 'heartbeat', data: String(Date.now()) });
+        }
+      }
+    }),
+  );
+
+  // ---- 事件台账（只读投影）----
+
+  app.get('/api/events', (c) => {
+    const events = listEvents(ctx, {
+      type: c.req.query('type') || undefined,
+      before: c.req.query('before') ? Number(c.req.query('before')) : undefined,
+      limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+    });
+    return c.json({ events });
+  });
+
+  app.get('/api/audit', (c) => {
+    const limit = c.req.query('limit') ? Number(c.req.query('limit')) : 50;
+    return c.json({ entries: readAudit(ctx.cfg.dataDir, Math.min(limit, 500)) });
+  });
+
+  // ---- 快照与恢复（管理）----
+
+  app.get('/api/admin/snapshots', (c) => c.json({ snapshots: listSnapshots(ctx.cfg.dataDir) }));
+
+  app.post('/api/admin/snapshots', async (c) => {
+    withWrite(ctx, 'admin.snapshot', () => {
+      logEvent(ctx, 'snapshot.manual', {});
+    });
+    return c.json({ snapshots: listSnapshots(ctx.cfg.dataDir) }, 201);
+  });
+
+  app.post('/api/admin/restore', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { snapshot?: string; confirm?: boolean };
+    if (!body.snapshot || body.confirm !== true) {
+      throw new HttpError(400, 'restore requires {snapshot, confirm:true}');
+    }
+    restoreSnapshot(ctx.holder, ctx.cfg.dataDir, body.snapshot);
+    withWrite(ctx, 'admin.restore', () => {
+      logEvent(ctx, 'server.restored', { snapshot: body.snapshot });
+    });
+    return c.json({ ok: true, restored: body.snapshot, snapshots: listSnapshots(ctx.cfg.dataDir) });
+  });
+
+  // ---- Agent 注册表（§5.3）----
+
+  // 注册自由化（单用户模型）：role 参数自由（worker/orchestrator/user 均可，无门槛）——
+  // 外部主脑 A 会话与 worker 设备都走这里；浏览器"用户"身份走 PUT /api/user。
+  app.post('/agents/register', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      id?: string;
+      name?: string;
+      handle?: string;
+      role?: AgentRole;
+      models?: string[];
+      host?: string;
+    };
+    if (!body.name || !body.handle) throw new HttpError(422, 'name and handle required');
+    const { agent, token } = registerAgent(ctx, {
+      id: body.id,
+      name: body.name,
+      handle: body.handle,
+      role: body.role,
+      models: body.models,
+      host: body.host,
+    });
+    return c.json({ agent, token }, 201); // token 仅此一次返回
+  });
+
+  // 用户（id='user'）不是被管理的 agent——它是匿名请求的身份落点，不进接入列表
+  app.get('/agents', (c) => c.json({ agents: listAgents(ctx).filter((a) => a.id !== 'user') }));
+
+  // 自己的模型清单自报/更新：token 即身份，worker token 即可，只能改自己（全量覆盖语义）
+  app.post('/agents/me/models', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { models?: unknown };
+    const agent = reportAgentModels(ctx, actor.id, body.models);
+    return c.json({ agent });
+  });
+
+  // 自己的档案速览（CLI worker 每轮取活前拉取）：自报模型 + 用户设置的首选模型
+  app.get('/agents/me/profile', (c) => {
+    const actor = requireActor(ctx, c);
+    return c.json(getAgentProfile(ctx, actor.id));
+  });
+
+  // agent 档案与启停（合一端点）：启停沿用原语义；name/note/preferredModel 为档案字段。
+  // 零令牌语义：匿名（=user）与 orchestrator 放行，worker token 403；id='user' 也允许改（用户自己的备注）。
+  app.patch('/agents/:id', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      enabled?: boolean;
+      name?: string;
+      note?: string;
+      preferredModel?: string;
+    };
+    const hasProfile =
+      body.name !== undefined || body.note !== undefined || body.preferredModel !== undefined;
+    if (typeof body.enabled !== 'boolean' && !hasProfile) {
+      throw new HttpError(422, 'enabled:boolean 或 name/note/preferredModel 至少一项');
+    }
+    let agent: Agent | undefined;
+    if (typeof body.enabled === 'boolean') {
+      agent = setAgentEnabled(ctx, c.req.param('id'), body.enabled);
+    }
+    if (hasProfile) {
+      const result = updateAgentProfile(ctx, c.req.param('id'), {
+        name: body.name,
+        note: body.note,
+        preferredModel: body.preferredModel,
+      });
+      agent = result.agent;
+    }
+    return c.json({ agent });
+  });
+
+  // 删除 agent（真删行，≠ 停用；单用户身份受保护）
+  app.delete('/agents/:id', (c) => {
+    requireElevated(ctx, c);
+    deleteAgent(ctx, c.req.param('id'));
+    return c.json({ ok: true, deleted: c.req.param('id') });
+  });
+
+  app.post('/agents/:id/heartbeat', (c) => c.json({ agent: heartbeat(ctx, c.req.param('id')) }));
+
+  // ---- 看板（§5.1 / §7）----
+
+  app.get('/boards', (c) => c.json({ boards: listBoards(ctx) }));
+
+  app.post('/boards', async (c) => {
+    requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      id?: string;
+      name?: string;
+      repo?: string;
+      description?: string;
+    };
+    if (!body.name) throw new HttpError(422, 'name required');
+    return c.json(
+      {
+        board: createBoard(ctx, {
+          id: body.id,
+          name: body.name,
+          repo: body.repo === undefined ? undefined : String(body.repo),
+          description: body.description === undefined ? undefined : String(body.description),
+        }),
+      },
+      201,
+    );
+  });
+
+  // 看板管理：改项目元数据（匿名即 user，requireElevated 自然放行；worker token 拒绝）
+  app.patch('/boards/:b', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const board = updateBoard(ctx, c.req.param('b'), {
+      name: body.name === undefined ? undefined : String(body.name),
+      repo: body.repo === undefined ? undefined : String(body.repo),
+      description: body.description === undefined ? undefined : String(body.description),
+    });
+    return c.json({ board });
+  });
+
+  // 删除看板：级联清空任务/消息/参与者（事件台账保留历史）
+  app.delete('/boards/:b', (c) => {
+    requireElevated(ctx, c);
+    const result = deleteBoard(ctx, c.req.param('b'));
+    return c.json({ ok: true, deleted: c.req.param('b'), ...result });
+  });
+
+  // 参与者读取：空数组 = 开放给所有 agent
+  app.get('/boards/:b/participants', (c) =>
+    c.json({ agentIds: getParticipants(ctx, c.req.param('b')) }),
+  );
+
+  // 参与者全量覆盖设置（user/orchestrator 身份可操作）
+  app.put('/boards/:b/participants', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { agentIds?: unknown };
+    if (!Array.isArray(body.agentIds)) throw new HttpError(422, 'agentIds: string[] required');
+    const agentIds = setParticipants(ctx, c.req.param('b'), body.agentIds.map(String));
+    return c.json({ agentIds });
+  });
+
+  app.get('/boards/:b/tasks', (c) =>
+    c.json({
+      tasks: listTasks(ctx, c.req.param('b'), {
+        lane: (c.req.query('lane') as Lane | undefined) || undefined,
+        assignee: c.req.query('assignee') || undefined,
+      }),
+    }),
+  );
+
+  app.post('/boards/:b/tasks', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const task = createTask(ctx, c.req.param('b'), {
+      id: String(body.id ?? ''),
+      title: String(body.title ?? ''),
+      detail: body.detail === undefined ? undefined : String(body.detail),
+      lane: (body.lane as Lane | undefined) || undefined,
+      priority: (body.priority as Priority | undefined) || undefined,
+      category: body.category === undefined ? undefined : String(body.category),
+      acceptance: body.acceptance === undefined ? undefined : String(body.acceptance),
+      workspace: (body.workspace as Record<string, unknown> | undefined) || undefined,
+      files: (body.files as string[] | undefined) || undefined,
+      protectedPaths: (body.protectedPaths as string[] | undefined) || undefined,
+      dependsOn: (body.dependsOn as string[] | undefined) || undefined,
+    });
+    return c.json({ task, by: actor.id }, 201);
+  });
+
+  app.get('/tasks/:id', (c) => c.json({ task: getTask(ctx, c.req.param('id')) }));
+
+  app.patch('/tasks/:id', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const task = updateTask(ctx, actor, c.req.param('id'), {
+      title: body.title === undefined ? undefined : String(body.title),
+      detail: body.detail === undefined ? undefined : String(body.detail),
+      lane: (body.lane as Lane | undefined) || undefined,
+      assignee: body.assignee === undefined ? undefined : String(body.assignee),
+      priority: (body.priority as Priority | undefined) || undefined,
+      category: body.category === undefined ? undefined : String(body.category),
+      acceptance: body.acceptance === undefined ? undefined : String(body.acceptance),
+      workspace: (body.workspace as Record<string, unknown> | undefined) || undefined,
+      files: (body.files as string[] | undefined) || undefined,
+      protectedPaths: (body.protectedPaths as string[] | undefined) || undefined,
+    });
+    return c.json({ task, by: actor.id });
+  });
+
+  app.post('/tasks/:id/depends', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { on?: string[] };
+    const task = addDependencies(ctx, actor, c.req.param('id'), body.on ?? []);
+    return c.json({ task, by: actor.id });
+  });
+
+  // ---- Worker 动词（交接协议：claim / checkpoint / release / submit + next 动态拉取）----
+
+  app.post('/boards/:b/next', (c) => {
+    const actor = requireActor(ctx, c);
+    return c.json(nextTask(ctx, actor, c.req.param('b')));
+  });
+
+  app.post('/tasks/:id/claim', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { files?: string[] };
+    const task = claimTask(ctx, actor, c.req.param('id'), body.files);
+    return c.json({ task, by: actor.id });
+  });
+
+  app.post('/tasks/:id/checkpoint', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { note?: string };
+    const result = checkpointTask(ctx, actor, c.req.param('id'), body.note ?? '');
+    return c.json({ ...result, by: actor.id });
+  });
+
+  app.post('/tasks/:id/release', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+    const task = releaseTask(ctx, actor, c.req.param('id'), body.reason);
+    return c.json({ task, by: actor.id });
+  });
+
+  app.post('/tasks/:id/submit', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      summary?: string;
+      evidence?: { path: string; machine?: string; note?: string }[];
+    };
+    const task = submitTask(ctx, actor, c.req.param('id'), {
+      summary: body.summary ?? '',
+      evidence: body.evidence,
+    });
+    return c.json({ task, by: actor.id });
+  });
+
+  // ---- 聊天室（§6：统一控制面）----
+
+  app.get('/boards/:b/messages', (c) =>
+    c.json({
+      messages: listMessages(ctx, c.req.param('b'), {
+        since: c.req.query('since') ? Number(c.req.query('since')) : undefined,
+        limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+      }),
+    }),
+  );
+
+  // 发言：带 token 落 agent 身份；无 token 按单用户 'user'（内网信任，浏览器未配身份时兜底）
+  app.post('/boards/:b/messages', async (c) => {
+    // 零令牌语义：无/无效 token 一律按唯一用户发言（agent 仍可用 token 以自身身份发言）
+    const agent = resolveActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { content?: string; kind?: MessageKind };
+    // 用户发言即指令（§6）：user 角色/匿名用户默认 intervention，worker 默认 progress
+    const kind: MessageKind | undefined =
+      body.kind ?? (agent.role !== 'user' ? 'progress' : 'intervention');
+    const message = createMessage(ctx, {
+      boardId: c.req.param('b'),
+      author: agent.id,
+      kind,
+      content: body.content ?? '',
+    });
+    return c.json({ message }, 201);
+  });
+
+  app.get('/agents/me/inbox', (c) => {
+    const actor = requireActor(ctx, c);
+    const since = c.req.query('since') ? Number(c.req.query('since')) : 0;
+    return c.json({ messages: inboxFor(ctx, actor, since) });
+  });
+
+  app.post('/tasks/:id/dispatch', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { content?: string; assignee?: string };
+    if (!body.content?.trim()) throw new HttpError(422, 'content required');
+    const result = dispatchTask(ctx, actor, c.req.param('id'), {
+      content: body.content,
+      assignee: body.assignee,
+    });
+    return c.json({ ...result, by: actor.id }, 201);
+  });
+
+  // ---- 总览与设置（§7）----
+
+  app.get('/overview', (c) => c.json(getOverview(ctx)));
+
+  app.get('/settings/orchestrator', (c) => c.json(getOrchestratorSettings(ctx)));
+
+  // 上游 /models 清单（60s 缓存）——设置页模型下拉的数据源，让用户看得见当前有哪些模型
+  app.get('/settings/orchestrator/models', async (c) => {
+    requireElevated(ctx, c);
+    return c.json(await listOrchestratorModels(ctx));
+  });
+
+  // 一键探测模型连通（默认探测当前配置的模型）——上游账号池状态瞬时万变，选中后再试一把
+  app.post('/settings/orchestrator/test', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    return c.json(await testOrchestratorModel(ctx, body.model === undefined ? undefined : String(body.model)));
+  });
+
+  app.put('/settings/orchestrator', async (c) => {
+    requireElevated(ctx, c); // user/orchestrator 身份可写（单用户模型，管理令牌已移除）
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const settings = putOrchestratorSettings(ctx, {
+      provider: body.provider === undefined ? undefined : String(body.provider),
+      baseURL: body.baseURL === undefined ? undefined : String(body.baseURL),
+      model: body.model === undefined ? undefined : String(body.model),
+      apiKey: body.apiKey === undefined ? undefined : String(body.apiKey),
+      enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
+      wakeOn: body.wakeOn as never,
+    });
+    return c.json(settings);
+  });
+
+  // ---- Pi 运行时（T14：数据卷自管理，更新/回滚不重启服务器进程）----
+
+  const piRuntime = new PiRuntimeManager(ctx);
+  const brain = new Brain(ctx, piRuntime);
+  brain.start(); // 只订阅总线；settings.enabled 决定是否激活（默认关，测试与裸部署零副作用）
+
+  app.get('/settings/runtime', async (c) => {
+    const status = piRuntime.status();
+    // 上游 latest 用 npm view 子进程现查（失败 → null，UI 显示未知）；管理页低频调用可接受
+    status.latest = await piRuntime.latestVersion();
+    return c.json(status);
+  });
+
+  // 更新/回滚授权与主脑设置一致：user/orchestrator 身份（requireElevated）
+  app.post('/settings/runtime/update', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { version?: string };
+    const result = await piRuntime.update(typeof body.version === 'string' ? body.version : undefined);
+    return c.json({ ok: true, ...result });
+  });
+
+  app.post('/settings/runtime/rollback', async (c) => {
+    requireElevated(ctx, c);
+    return c.json({ ok: true, ...(await piRuntime.rollback()) });
+  });
+
+  // ---- 单用户身份（设置页"用户名"；浏览器写操作以该身份 token 作 Bearer）----
+
+  // 公开读：设置页回填用户名。
+  app.get('/api/user', (c) => c.json(getUserStatus(ctx)));
+
+  // 改用户名（显示名）。零令牌：不存在签发/轮换 token 的任何流程（用户终裁 2026-10-25）。
+  app.put('/api/user', async (c) => {
+    requireElevated(ctx, c); // 无头=用户放行；worker token/无效 token 拒绝
+    const body = (await c.req.json().catch(() => ({}))) as { handle?: string };
+    return c.json(renameUser(ctx, body));
+  });
+
+  // ---- 技能分发：桌面会话无需预装，直接拉取技能全文 ----
+  // 路径以 src/ 为基准向上三级（src → server → apps → 仓库根）：
+  // 本地仓库（<repo>/skills）与容器 /app 布局（/app/skills）均成立。
+
+  app.get('/skill/:name', (c) => {
+    if (c.req.param('name') !== 'asterhive-worker') {
+      throw new HttpError(404, `unknown skill: ${c.req.param('name')}`);
+    }
+    const path = fileURLToPath(new URL('../../../skills/asterhive-worker/SKILL.md', import.meta.url));
+    if (!existsSync(path)) {
+      throw new HttpError(404, 'skill file not found: skills/asterhive-worker/SKILL.md 未随服务器部署');
+    }
+    return c.body(readFileSync(path, 'utf8'), 200, {
+      'content-type': 'text/markdown; charset=utf-8',
+    });
+  });
+
+  // ---- 自举快捷通道（/bootstrap/）：偏爱现成 CLI 的 agent 用两条命令把单文件 CLI 拉到本机 ----
+  // 公开只读端点（不挂 requireActor）：零令牌语义下匿名即可读，与 /skill/:name 同级。
+  // 源文件定位（按序尝试）：容器布局 COPY packages/sdk/src → /app/sdk/（相对 http.ts 向上三级）；
+  // 仓库直跑布局 <repo>/packages/sdk/src（同样向上三级即仓库根）。都缺失 → 503，不许崩。
+  const BOOTSTRAP_FILES = new Set(['cli.ts', 'index.ts']); // 白名单：仅这两个文件可读，不作目录敞开
+
+  function readBootstrapSource(file: string): string {
+    const candidates = [
+      fileURLToPath(new URL(`../../../sdk/${file}`, import.meta.url)), // 容器：/app/sdk/<file>
+      fileURLToPath(new URL(`../../../packages/sdk/src/${file}`, import.meta.url)), // 仓库：<repo>/packages/sdk/src/<file>
+    ];
+    for (const p of candidates) {
+      if (existsSync(p)) return readFileSync(p, 'utf8');
+    }
+    throw new HttpError(503, 'bootstrap 文件未随镜像安装');
+  }
+
+  const bootstrapIndex = (c: Context) => {
+    const base = new URL(c.req.url).origin;
+    const text = [
+      'AsterHive worker 自举（可选快捷通道；完整协议见 ' + `${base}/skill/asterhive-worker` + '）',
+      '',
+      '# 1) 下载单文件 CLI（零第三方依赖，node >= 23.6 直接运行 .ts；cli.ts 依赖同目录的 index.ts）',
+      `curl -fLo cli.ts ${base}/bootstrap/cli.ts`,
+      `curl -fLo index.ts ${base}/bootstrap/index.ts`,
+      '',
+      '# 2) 注册（默认身份，撞名自愈；token 自动写入 ~/.asterhive/worker.json，仅此一次返回）',
+      `node cli.ts register --url ${base}`,
+      '',
+      '# 3) 之后用 CLI 走同样的领活循环：next / claim / checkpoint / submit / release / inbox / message',
+      'node cli.ts next --board <boardId>',
+    ].join('\n');
+    return c.body(text, 200, { 'content-type': 'text/plain; charset=utf-8' });
+  };
+
+  app.get('/bootstrap', bootstrapIndex); // 无斜杠别名：浏览器手输少打一个字符也能到
+  app.get('/bootstrap/', bootstrapIndex);
+  app.get('/bootstrap/:file', (c) => {
+    const file = c.req.param('file');
+    if (!BOOTSTRAP_FILES.has(file)) {
+      throw new HttpError(404, `unknown bootstrap file: ${file}`);
+    }
+    return c.body(readBootstrapSource(file), 200, { 'content-type': 'text/plain; charset=utf-8' });
+  });
+
+  // ---- MCP 服务端（Streamable HTTP，挂在 /mcp）----
+  // 分派服务器自身即 MCP 服务：桌面 agent 会话配一个 URL + Bearer token 即成 worker/主脑。
+  mountMcp(app, ctx);
+
+  return app;
+}

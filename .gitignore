@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.*
+apps/server/data/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+Thumbs.db
+.shots/

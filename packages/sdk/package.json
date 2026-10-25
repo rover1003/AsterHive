@@ -1,0 +1,10 @@
+{
+  "name": "@asterhive/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AsterHive worker 薄 SDK：5+2 个调用包成库（§9.1），任何 Node 设备当 worker",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

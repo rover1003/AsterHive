@@ -1,0 +1,27 @@
+# AsterHive 分派服务器 —— 部署于你的内网服务器，局域网设备以 worker 身份接入
+# 用法：docker compose up -d --build
+services:
+  asterhive:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    image: asterhive/server:latest
+    container_name: asterhive
+    ports:
+      - "8067:8067"
+    environment:
+      ASTERHIVE_DATA: /data
+      # ASTERHIVE_SECRET 仅用于旧密文一次性迁移（apiKey 加密密钥已自动生成存库，见 apps/server/src/settings.ts）
+      ASTERHIVE_SECRET: ${ASTERHIVE_SECRET:-}
+    volumes:
+      - asterhive-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8067/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  asterhive-data:

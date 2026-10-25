@@ -1,0 +1,24 @@
+{
+  "name": "asterhive",
+  "version": "0.0.1",
+  "private": true,
+  "description": "AsterHive（星巢）——部署在服务器上的通用多 agent 任务分派系统",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "dev": "npm run dev -w apps/server",
+    "start": "npm run start -w apps/server",
+    "typecheck": "tsc --noEmit -p apps/server && tsc --noEmit -p apps/web && tsc --noEmit -p packages/sdk && tsc --noEmit -p apps/worker-zcode",
+    "test": "node --test \"apps/server/test/*.test.ts\" \"apps/worker-zcode/test/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,419 @@
+// ZCode headless worker 适配器（§9.1：适配器只写三件事——怎么启动、怎么组 prompt、怎么变成 submit）
+//
+// 环境变量：
+//   ASTERHIVE_URL      服务器地址（默认 http://127.0.0.1:8067）
+//   ASTERHIVE_BOARD    轮询的看板 id（可选；缺省=多板巡检模式——每轮对全部看板逐板领活，
+//                      非参与者板自动跳过，板清单每 5 分钟刷新、新板自动纳入）
+//   WORKER_HANDLE      @句柄（默认 <内核>-<主机名短缀>，内核名自动探测：omp/zcode/opencode…；
+//                      撞名自动加后缀自愈）
+//   WORKER_NAME        显示名（默认 <内核>@<主机名>）
+//   WORKER_TOKEN       已有 token；缺省则现场注册新 worker（token 只打印一次）
+//   WORKER_WORKDIR     工作目录（默认 <本目录>/work；repo 看板的项目工作区在其下 projects/<看板id> 持久化）
+//   WORKER_PUSH        任务成果 commit 后是否自动 push 任务分支（默认关；push 凭据完全用设备 git 自身配置）
+//   WORKER_MODELS      本机可用模型清单（逗号分隔，注册/启动时上报服务器供用户指派首选）
+//   ZCODE_BIN          zcode 可执行（默认本机 ZCode Desktop 的 zcode.cjs，找不到再退 PATH 的 zcode）
+//   POLL_MS            轮询间隔（默认 10000；每次轮询同时充当心跳）
+//   TASK_TIMEOUT_MS    单任务执行超时（默认 1800000 = 30 分钟）
+import { SdkError, Worker, defaultWorkerIdentity, registerWithRetry, type Task, type PendingMessage } from '@asterhive/sdk';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, hostname } from 'node:os';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
+import { firstSkip, nextBoardsToPoll } from './polling.ts';
+
+const here = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+// 模型清单重报节流：常驻巡检期间每 60 分钟重报一次 CFG.models——
+// 设备主人装了新模型后无需重启 worker，服务器档案最迟一小时内对齐
+const MODEL_REREPORT_MS = 60 * 60_000;
+
+const CFG = {
+  url: process.env.ASTERHIVE_URL ?? 'http://127.0.0.1:8067',
+  board: process.env.ASTERHIVE_BOARD ?? '', // 空 = 未绑板 → 多板巡检模式
+  // 默认身份自报内核：探测本机执行内核（omp/zcode/opencode…），写成 <内核>-<主机名短缀> /
+  // <内核>@<主机名>——用户一眼看出"这台设备跑的是什么"；探测不到兜底 worker-（SDK 同款中性名）
+  handle: process.env.WORKER_HANDLE ?? (() => {
+    const id = defaultWorkerIdentity(hostname());
+    const kind = detectExecutorKind();
+    return kind === 'worker' ? id.handle : `${kind}-${id.handle.replace(/^worker-/, '')}`;
+  })(),
+  name: process.env.WORKER_NAME ?? (() => {
+    const id = defaultWorkerIdentity(hostname());
+    const kind = detectExecutorKind();
+    return kind === 'worker' ? id.name : `${kind[0].toUpperCase()}${kind.slice(1)}@${hostname()}`;
+  })(),
+  token: process.env.WORKER_TOKEN,
+  workdirRoot: process.env.WORKER_WORKDIR ?? join(here, 'work'),
+  pollMs: Number(process.env.POLL_MS ?? 10_000),
+  taskTimeoutMs: Number(process.env.TASK_TIMEOUT_MS ?? 1_800_000),
+  // 模型渠道由 worker 所有者自选（§8.3 服务器不感知）；omp 模糊匹配如 gpt-5.2 / openai/gpt-5.2
+  model: process.env.WORKER_MODEL,
+  // 项目工作区 push 开关（T15）：默认关，成果只以本地 commit 留在工作区；=1 时任务 commit 后推送任务分支
+  push: process.env.WORKER_PUSH === '1',
+  // 设备主人声明的本机可用模型（逗号分隔）：上报到服务器档案，供 UI 下拉与首选模型指派
+  models: (process.env.WORKER_MODELS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+};
+
+// 探测本机执行内核名（供默认身份自报"我是什么"）：显式 WORKER_EXECUTOR 优先，
+// 否则按 PATH 逐个探测常见 CLI，兜底 worker——名字必须内核无关地反映真实内核
+function detectExecutorKind(): string {
+  const explicit = process.env.WORKER_EXECUTOR?.trim();
+  if (explicit) return explicit;
+  const pathDirs = (process.env.PATH ?? '').split(process.platform === 'win32' ? ';' : ':');
+  const has = (bin: string) =>
+    pathDirs.some((d) => {
+      try {
+        return d && existsSync(join(d, process.platform === 'win32' ? `${bin}.exe` : bin));
+      } catch {
+        return false;
+      }
+    });
+  if (has('omp')) return 'omp';
+  if (has('zcode')) return 'zcode';
+  if (has('opencode')) return 'opencode';
+  return 'worker';
+}
+
+function detectExecutor(): { kind: 'omp' | 'zcode'; cmd: string; args: string[] } {
+  const kind = process.env.WORKER_EXECUTOR === 'zcode' ? 'zcode' : 'omp';
+  if (kind === 'omp') {
+    return { kind, cmd: process.env.OMP_BIN ?? 'omp', args: [] };
+  }
+  const envBin = process.env.ZCODE_BIN;
+  const desktopCjs = join(
+    homedir(),
+    'AppData',
+    'Local',
+    'Programs',
+    'ZCode',
+    'resources',
+    'glm',
+    'zcode.cjs',
+  );
+  const bin = envBin ?? (existsSync(desktopCjs) ? desktopCjs : 'zcode');
+  if (/\.(cjs|mjs|js)$/.test(bin)) return { kind, cmd: process.execPath, args: [resolve(bin)] };
+  return { kind, cmd: bin, args: [] };
+}
+
+function buildPrompt(task: Task, ws: PreparedWorkspace, reworkNotes: string[] = []): string {
+  // 工作区模式说明：repo 模式告知分支名与「完成后由系统提交」，scratch 模式维持一次性目录语义
+  const workspaceLine =
+    ws.mode === 'repo'
+      ? `## 工作区\n当前目录是本设备的持久项目工作区，所在分支 ${ws.branch}${ws.pulled ? '（开工前已 pull --rebase 同步远端）' : ''}${ws.cloned ? '（本次为新 clone）' : ''}；完成后由系统统一 git 提交，你不需要自行 commit/push。`
+      : '## 工作区\n当前目录是本次任务的一次性工作目录。';
+  const lines = [
+    `你是 AsterHive 星巢的一名 worker，领取了任务 ${task.id}。请在当前工作目录内完成任务。`,
+    '',
+    `# 任务 ${task.id}：${task.title}`,
+    workspaceLine,
+    task.detail ? `## 说明\n${task.detail}` : '',
+    `## 验收标准\n${task.acceptance || '（未填写——按标题合理完成）'}`,
+    task.files.length ? `## 预期触碰文件\n${task.files.join('\n')}` : '',
+    task.protectedPaths.length ? `## 禁止触碰\n${task.protectedPaths.join('\n')}` : '',
+    reworkNotes.length ? `## 主脑/用户反馈（这是被退回后的重做，必须逐条落实）\n${reworkNotes.join('\n')}` : '',
+    '',
+    '要求：',
+    '1. 只在当前目录下工作，不要越界；',
+    '2. 完成后，用 3-5 句话总结你做了什么、产出物在哪里；',
+    '3. 不要创建多余文件；',
+    '4. 文件名优先用 ASCII 字符（Windows shell 下中文文件名易乱码）。',
+  ];
+  return lines.filter((l) => l !== '').join('\n');
+}
+
+// prompt 写入文件经 @file 传入（避免长中文参数在 shell 下的引号问题；omp 支持 @file）
+// model：本次执行用的模型渠道（服务器首选模型覆盖本地 WORKER_MODEL 后由 poll 传入）
+function runExecutor(prompt: string, cwd: string, model: string | undefined): Promise<{ stdout: string; code: number | null }> {
+  const ex = detectExecutor();
+  const promptFile = join(CFG.workdirRoot, 'prompt.md');
+  writeFileSync(promptFile, prompt, 'utf8');
+  const promptArg = ex.kind === 'omp' ? `@${promptFile.replace(/\\/g, '/')}` : prompt;
+  const flagArgs =
+    ex.kind === 'omp'
+      ? ['--cwd', `"${cwd.replace(/\\/g, '/')}"`, ...(model ? ['--model', model] : [])]
+      : ['--mode', 'yolo'];
+  return new Promise((resolveRun) => {
+    const child = spawn(ex.cmd, [...ex.args, promptArg, ...flagArgs], {
+      cwd,
+      shell: process.platform === 'win32',
+      env: { ...process.env, ASTERHIVE_WORKER: '1' },
+    });
+    let stdout = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, CFG.taskTimeoutMs);
+    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
+    child.stderr.on('data', (d: Buffer) => (stdout += d.toString()));
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolveRun({ stdout, code });
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolveRun({ stdout: stdout + String(err), code: -1 });
+    });
+  });
+}
+
+// 上交证据：工作目录内全部文件（相对路径 + 本机名）
+function collectEvidence(workdir: string): Task['evidence'] {
+  const out: Task['evidence'] = [];
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir)) {
+      if (name === '.git' || name === 'node_modules') continue;
+      const full = join(dir, name);
+      const st = statSync(full);
+      if (st.isDirectory()) walk(full);
+      else out.push({ path: relative(workdir, full).replace(/\\/g, '/'), machine: hostname() });
+    }
+  };
+  if (existsSync(workdir)) walk(workdir);
+  return out;
+}
+
+function log(...args: unknown[]): void {
+  console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...args);
+}
+
+function logPending(msgs: PendingMessage[]): void {
+  for (const m of msgs) {
+    log(`  📩 待达消息(${m.author}): ${m.content}`);
+  }
+}
+
+async function main(): Promise<void> {
+  // 复用 token 时必须同时给 agentId（注册时 id 默认取 handle）。
+  // token.txt 第一行存 token、第二行存注册后实际生效的 handle（撞名自动加后缀的场景下两者不同）；
+  // 旧格式（只有一行）也能读——handle 退回 WORKER_HANDLE/默认值。
+  const tokenFile = join(CFG.workdirRoot, 'token.txt');
+  if (!CFG.token && existsSync(tokenFile)) {
+    const lines = readFileSync(tokenFile, 'utf8').split('\n').map((s) => s.trim()).filter(Boolean);
+    CFG.token = lines[0];
+    if (lines[1]) CFG.handle = lines[1];
+  }
+  const worker = new Worker(CFG.url, CFG.token, CFG.handle);
+  if (!CFG.token) {
+    // 注册时自报接入设备名（本机主机名），UI「设备」列据此显示 worker 属于哪台设备；
+    // registerWithRetry：handle 撞名（409）自动加 -2/-3… 后缀，接入不需要人工挑名字
+    const reg = await registerWithRetry(worker, {
+      name: CFG.name,
+      handle: CFG.handle,
+      models: CFG.models,
+      host: hostname(),
+    });
+    if (reg.handle !== CFG.handle) log(`句柄 @${CFG.handle} 已被占用，自动改用 @${reg.handle}`);
+    CFG.handle = reg.handle; // 后续日志与 token.txt 落盘用实际生效的句柄
+    // token 只此一次：落盘到 work 目录（连同实际 handle），供下次复用
+    mkdirSync(CFG.workdirRoot, { recursive: true });
+    writeFileSync(join(CFG.workdirRoot, 'token.txt'), `${reg.token}\n${reg.handle}\n`, 'utf8');
+    log(`已注册 worker ${reg.handle}（token 已存 ${join(CFG.workdirRoot, 'token.txt')}）`);
+  } else if (CFG.models.length > 0) {
+    // token 复用（已注册）：设备主人可能改过本机模型，启动时全量重报一次
+    try {
+      const reported = await worker.reportModels(CFG.models);
+      log(`已上报模型清单：${reported.join('、')}`);
+    } catch (err) {
+      log('模型清单上报失败（不影响取活）：', err instanceof Error ? err.message : err);
+    }
+  }
+
+  let busy = false;
+  // 定期重报基线：启动时注册/复用 token 分支已上报过一次模型，从现在起再计时
+  let lastModelReport = Date.now();
+  const authHeaders = { authorization: `Bearer ${worker.token ?? ''}` };
+  // 多板巡检状态：已知板清单（定期刷新）+ 403 跳过集合（只 log 一次防刷屏）
+  const knownBoards: { ids: string[]; lastRefresh: number } = { ids: [], lastRefresh: 0 };
+  const skipped403 = new Set<string>();
+  const listMine = async (boardId: string, lane: string): Promise<Task[]> => {
+    const r = await fetch(
+      `${CFG.url}/boards/${boardId}/tasks?lane=${lane}&assignee=${encodeURIComponent(worker.agentId)}`,
+      { headers: authHeaders },
+    );
+    // 非 2xx 一律抛 SdkError（与 SDK call() 同语义）：多板巡检靠 403 识别非参与者板
+    const json = (await r.json().catch(() => ({}))) as { tasks?: Task[]; error?: string };
+    if (!r.ok) throw new SdkError(r.status, String(json.error ?? r.statusText));
+    return json.tasks ?? [];
+  };
+  const taskFeedback = async (boardId: string, taskId: string): Promise<string[]> => {
+    const r = await fetch(`${CFG.url}/boards/${boardId}/messages?limit=500`, { headers: authHeaders });
+    const json = (await r.json().catch(() => ({}))) as {
+      messages?: { taskRef: string | null; author: string; content: string }[];
+      error?: string;
+    };
+    if (!r.ok) throw new SdkError(r.status, String(json.error ?? r.statusText));
+    return (json.messages ?? [])
+      .filter((m) => m.taskRef === taskId && m.author !== worker.agentId)
+      .slice(-3)
+      .map((m) => `（${m.author}）${m.content}`);
+  };
+
+  // 看板 repo 缓存（T15：board.repo 不常变，进程内 Map；boardId → repo 字符串或 null=无 repo）
+  const boardRepoCache = new Map<string, string | null>();
+  const boardRepo = async (boardId: string): Promise<string | null> => {
+    if (!boardRepoCache.has(boardId)) {
+      const board = await worker.getBoard(boardId);
+      const repo = board.repo?.trim() || null;
+      boardRepoCache.set(boardId, repo);
+      if (repo) log(`项目仓库（board.repo）：${repo}`);
+    }
+    return boardRepoCache.get(boardId)!;
+  };
+
+  const poll = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      // 每轮取活前拉服务器档案：用户在设置页为本 agent 选了首选模型则覆盖本地 WORKER_MODEL。
+      // 拉取失败不阻塞取活——记一行日志后继续用本地配置。
+      let model = CFG.model;
+      try {
+        const profile = await worker.getMyProfile();
+        if (profile.preferredModel) {
+          model = profile.preferredModel;
+          log(`模型通道：${model}（服务器设置）`);
+        }
+      } catch (err) {
+        log('拉取首选模型失败，沿用本地配置：', err instanceof Error ? err.message : err);
+      }
+      // 定期重报模型清单（节流 MODEL_REREPORT_MS=60 分钟，非空才报）：顺带做，失败不阻塞取活
+      if (CFG.models.length > 0 && Date.now() - lastModelReport >= MODEL_REREPORT_MS) {
+        lastModelReport = Date.now();
+        try {
+          const reported = await worker.reportModels(CFG.models);
+          log(`已定期重报模型清单：${reported.join('、')}`);
+        } catch (err) {
+          log('模型清单定期重报失败（不影响取活）：', err instanceof Error ? err.message : err);
+        }
+      }
+      // 板清单决策（polling.ts 纯函数）：ASTERHIVE_BOARD 显式绑板=只巡检它、永不刷新；
+      // 缺省=多板巡检，距上次拉取超过 5 分钟（或首轮）重新 getBoards——新板自动纳入、
+      // 拉取失败沿用已知清单下轮再试。
+      const decision = nextBoardsToPoll(knownBoards.ids, {
+        explicitBoard: CFG.board || undefined,
+        now: Date.now(),
+        lastRefresh: knownBoards.lastRefresh,
+      });
+      if (decision.refreshDue) {
+        try {
+          const ids = (await worker.getBoards()).map((b) => b.id);
+          const prev = knownBoards.ids.join(',');
+          knownBoards.ids = ids;
+          knownBoards.lastRefresh = Date.now();
+          if (ids.join(',') !== prev) log(`看板清单更新（${ids.length} 块）：${ids.join('、') || '（空）'}`);
+        } catch (err) {
+          log('拉取看板清单失败，沿用已知清单：', err instanceof Error ? err.message : err);
+        }
+      }
+
+      // 取活三通道，逐板按序尝试（多板巡检时命中即止——一次只做一张卡）：
+      // 被退回重做（InProgress 归我）＞ 派给我的 Ready ＞ 未指派池 next。
+      // 某板 403（非参与者）→ 该板本轮跳过，只 log 一次（Set 防刷屏）；下轮自然再试，
+      // 参与者在页面里被勾上后无需任何处理即自动恢复。
+      let reworkNotes: string[] = [];
+      let task: Task | undefined;
+      for (const boardId of decision.poll) {
+        try {
+          const reworks = await listMine(boardId, 'InProgress');
+          if (reworks.length > 0) {
+            task = reworks[0];
+            reworkNotes = await taskFeedback(boardId, task.id);
+            log(`重做被退回的任务 ${task.id}`);
+            break;
+          }
+          const mine = await listMine(boardId, 'Ready');
+          if (mine.length > 0) {
+            task = await worker.claim(mine[0].id);
+            break;
+          }
+          task = (await worker.next(boardId)) ?? undefined;
+          if (task) break;
+        } catch (err) {
+          if (err instanceof SdkError && err.status === 403) {
+            if (firstSkip(skipped403, boardId)) log(`板 ${boardId} 非参与者，已跳过`);
+            continue;
+          }
+          throw err; // 其余错误交外层统一记录
+        }
+      }
+      if (!task) return;
+      log(`领取任务 ${task.id}：${task.title}`);
+
+      // 工作区准备（T15 / §9.4）：repo 模式=持久项目工作区（clone/pull --rebase/任务分支），
+      // scratch 模式=一次性目录。repo 模式失败 → checkpoint 上报详情后 release，绝不静默改道 scratch。
+      let ws: PreparedWorkspace;
+      try {
+        ws = await prepareWorkspace({
+          workdirRoot: CFG.workdirRoot,
+          boardId: task.boardId,
+          taskId: task.id,
+          repo: await boardRepo(task.boardId),
+          push: CFG.push,
+          log,
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        log(`工作区准备失败：${reason}`);
+        try {
+          await worker.checkpoint(task.id, `工作区准备失败：${reason}`);
+          await worker.release(task.id, `工作区准备失败：${reason}`);
+        } catch (reportErr) {
+          log('失败上报/释放出错：', reportErr instanceof Error ? reportErr.message : reportErr);
+        }
+        return;
+      }
+      if (ws.cloned) log(`已 clone 项目工作区：${ws.dir}`);
+      if (ws.pulled) log(`已同步远端（pull --rebase）：${ws.dir}`);
+
+      const cp1 = await worker.checkpoint(task.id, reworkNotes.length ? '收到退回反馈，开始重做' : '开始执行');
+      logPending(cp1.pendingMessages);
+
+      const { stdout, code } = await runExecutor(buildPrompt(task, ws, reworkNotes), ws.dir, model);
+      log(`执行结束（exit=${code}），输出 ${stdout.length} 字符`);
+      const cp2 = await worker.checkpoint(task.id, code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），仍上交现场`);
+      logPending(cp2.pendingMessages);
+
+      // repo 模式：成果以本地 commit 留在工作区（分支不合并——汇合策略后续再定）；push 由 WORKER_PUSH 显式开启
+      let commitNote = '';
+      let evidence = collectEvidence(ws.dir);
+      if (ws.mode === 'repo') {
+        try {
+          const hash = await commitWorkspace(ws, task.title);
+          if (hash) {
+            commitNote = `\n[workspace] 本地提交 ${ws.branch}@${hash}（${ws.changedFiles?.length ?? 0} 个文件${ws.push ? '，已推送 origin' : '，未推送'}）`;
+            // repo 模式证据只登记本任务变更文件（整仓文件开工前就存在，逐个登记是噪音），并追加 git 定位符
+            evidence = (ws.changedFiles ?? []).map((p) => ({ path: p, machine: hostname() }));
+            evidence.push({ path: `git:${ws.branch}@${hash}`, machine: hostname() });
+          } else {
+            commitNote = '\n[workspace] 工作区无文件变更，未产生提交';
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          commitNote = `\n[workspace] 本地提交失败：${reason}`;
+          log(`本地提交失败（仍上交现场）：${reason}`);
+        }
+      }
+
+      const summary = (stdout.trim().split('\n').slice(-6).join('\n') || '(无输出)') + commitNote;
+      await worker.submit(task.id, summary, evidence);
+      log(`已上交 ${task.id}，证据 ${evidence.length} 项`);
+    } catch (err) {
+      log('轮询/执行出错：', err instanceof Error ? err.message : err);
+    } finally {
+      busy = false;
+    }
+  };
+
+  log(
+    `worker ${CFG.handle} 就绪，轮询 ${CFG.url} ` +
+      `${CFG.board ? `板 ${CFG.board}` : '全部看板（多板巡检，非参与者板自动跳过）'}（${CFG.pollMs}ms）`,
+  );
+  await poll();
+  setInterval(() => void poll(), CFG.pollMs);
+}
+
+void main();

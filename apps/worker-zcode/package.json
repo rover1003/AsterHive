@@ -1,0 +1,13 @@
+{
+  "name": "@asterhive/worker-zcode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ZCode headless worker 适配器：轮询 next → 组 prompt → 拉起 zcode -p → checkpoint/上交",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.ts"
+  },
+  "dependencies": {
+    "@asterhive/sdk": "*"
+  }
+}
