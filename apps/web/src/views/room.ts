@@ -2,7 +2,11 @@
 // 由独立「聊天室」路由视图重构而来——消息渲染/发送/SSE 增量/目标下拉/自动 @前缀/目标态持久化逻辑不变；
 // 变化点：① 板由宿主传入（opts.boardId），切板 = 宿主销毁重挂；② taskRef 点击回调宿主
 //（opts.onTaskClick → 看板页开任务抽屉，同页联动），不再跳路由；③ UI 翻新：user 气泡右对齐、
-// 头像角色状态点、composer 单行化、目标下拉移除「全体」并默认主脑。
+// 头像角色状态点、composer 单行化、目标下拉移除「全体」并默认主脑；④ 正文 Markdown 渲染管线
+//（renderMarkdown：marked 解析 → DOMPurify 消毒 → DOM 文本节点遍历内联提及/任务号），
+// 普通消息与主脑流式气泡共用，样式见 styles.css「消息正文 Markdown 元素」节。
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { api, type Message } from '../api.ts';
 import { subscribe } from '../sse.ts';
 import { esc, fmtTime, KIND_LABELS, agentsCached, roleOf, displayAuthor, toast } from '../ui.ts';
@@ -32,18 +36,95 @@ export interface ChatPanelHandle {
 // kind 小标签仅这些类型展示（灰阶弱化）；日常 chat/question/progress/system 不打标
 const BADGE_KINDS = new Set(['dispatch', 'submit', 'intervention', 'report']);
 
+// ---- 消息正文 Markdown 渲染管线：parse → sanitize → DOM 文本节点遍历 ----
+// 顺序有讲究：marked 先把 Markdown 编成 HTML，DOMPurify 再把脚本/事件属性/危险协议剥掉，
+// 最后才在模板 DOM 的文本节点上插提及/任务号元素（createElement + textContent 构造，
+// 不再走"正则打整段 HTML"的老路——那会误伤标签与实体，且必须先 esc 再二次替换）。
+// 例外（允许原样 HTML 直出）：Markdown 语法不存在时 marked 仅包 <p>/<br>，视觉与纯文本一致。
+
+// @提及：中文/字母数字开头，允许中划线（与旧版正则语义一致）
+// 任务号：大写字母开头的编号（T42 / ABC-12），仅在等于消息自身 taskRef 时转为可点链接
+const INLINE_TOKEN_RE = /(@[\w\u4e00-\u9fa5][\w\u4e00-\u9fa5-]*)|(\b[A-Z][A-Z0-9]*-?\d+\b)/g;
+
+/**
+ * 单个文本节点的提及/任务号内联替换：把命中片段切成"文字 + 元素"序列重建该节点。
+ * 只处理文本节点（父链上无 pre/code/a），绝不接触标签结构——天然不会误伤 HTML。
+ */
+function linkifyTextNode(node: Text, taskRef: string | null): void {
+  const text = node.nodeValue ?? '';
+  if (!text) return;
+  // 快速短路：既无 @ 也无大写字母序列的文本节点（绝大多数）零成本跳过
+  if (!text.includes('@') && !/[A-Z]/.test(text)) return;
+
+  const frag = document.createDocumentFragment();
+  let last = 0;
+  let changed = false;
+  INLINE_TOKEN_RE.lastIndex = 0;
+  for (let m = INLINE_TOKEN_RE.exec(text); m; m = INLINE_TOKEN_RE.exec(text)) {
+    if (m[1]) {
+      // @提及 → <span class="mention">
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const span = document.createElement('span');
+      span.className = 'mention';
+      span.textContent = m[1];
+      frag.appendChild(span);
+      last = m.index + m[1].length;
+      changed = true;
+    } else {
+      // 任务号 → <a class="taskref" data-task>，仅消息自身 taskRef 命中才转（沿用旧版语义），
+      // 点击交给消息列表上的事件委托（closest('a.taskref') → opts.onTaskClick）
+      const id = m[2];
+      if (taskRef && id === taskRef) {
+        if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const a = document.createElement('a');
+        a.className = 'taskref';
+        a.dataset.task = id;
+        a.textContent = id;
+        frag.appendChild(a);
+        last = m.index + id.length;
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return; // 有命中但都未转换（如任务号与 taskRef 不符）：保持原节点不动
+  if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+  node.parentNode?.replaceChild(frag, node);
+}
+
+/**
+ * 消息正文渲染：Markdown → 消毒后的 HTML，提及/任务号已内联成元素。
+ * @param raw 原始消息文本（任意作者输入，一律视为不可信）
+ * @param taskRef 消息关联的任务号：正文里出现相同编号时转为可点链接；不传则不链接
+ */
+export function renderMarkdown(raw: string, taskRef?: string | null): string {
+  // 1) marked 解析：GFM + breaks（单换行→<br>，纯文本消息的多行观感与旧版 pre-wrap 一致）
+  const html = marked.parse(raw ?? '', { gfm: true, breaks: true, async: false });
+  // 2) DOMPurify 消毒：消息来自任意作者，script/事件属性/javascript: 等一律剥除
+  const clean = DOMPurify.sanitize(html);
+  // 3) 模板 DOM 上遍历文本节点：代码区（pre/code）与既有链接内的文字不做提及/任务号替换
+  const tpl = document.createElement('template');
+  tpl.innerHTML = clean;
+  const walker = document.createTreeWalker(tpl.content, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const el = node.parentElement;
+      if (el && (el.closest('pre') || el.closest('code') || el.closest('a'))) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  // 先收集再替换：replaceChild 会改变树结构，边走边换会打乱遍历
+  const texts: Text[] = [];
+  while (walker.nextNode()) texts.push(walker.currentNode as Text);
+  for (const t of texts) linkifyTextNode(t, taskRef ?? null);
+  return tpl.innerHTML;
+}
+
 function messageHtml(m: Message, agents: Awaited<ReturnType<typeof agentsCached>>): string {
   const role = roleOf(m.author, agents);
   const name = esc(displayAuthor(m.author, agents));
-  const content = esc(m.content)
-    .replace(/@([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5-]*)/g, '<span class="mention">@$1</span>')
-    .replace(/\b([A-Z][A-Z0-9]*-?\d+)\b/g, (full) => {
-      if (m.taskRef && full === m.taskRef) {
-        // 不再跳路由：交给事件委托调 opts.onTaskClick（见下方 list 绑定）
-        return `<a class="taskref" data-task="${esc(full)}">${esc(full)}</a>`;
-      }
-      return full;
-    });
+  // 正文统一走 Markdown 管线（含消毒与提及/任务号内联）；taskRef 传入使该编号可点
+  const content = renderMarkdown(m.content, m.taskRef);
   const kindBadge = BADGE_KINDS.has(m.kind) ? `<span class="kind-badge">${KIND_LABELS[m.kind] ?? m.kind}</span>` : '';
   // 我的消息：右对齐气泡（accent 描边、右下 2px 圆角），不带头像
   if (m.author === 'user') {
@@ -190,7 +271,8 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     };
 
     // ---- 功能B：主脑流式回复气泡 ----
-    // 生命周期：brain.stream phase='streaming' 创建/更新全文（textContent 替换渲染，免乱序）；
+    // 生命周期：brain.stream phase='streaming' 创建/更新全文（每次以最新全文整体重渲
+    // renderMarkdown，免乱序；服务端 300ms 尾随节流已限频，重渲代价可接受）；
     // phase='end' 或主脑正式消息（message.created）到达 → 撤除，正式消息由既有流程照常插入。
     let streamRow: HTMLElement | null = null;
     let streamContent: HTMLElement | null = null;
@@ -210,7 +292,9 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         streamContent = row.querySelector('.stream-content') as HTMLElement;
         list.appendChild(row);
       }
-      if (streamContent) streamContent.textContent = text;
+      // 全文重渲 Markdown（parse→消毒→DOM 遍历）：流式期间无 taskRef，任务号暂不链接，
+      // 正式消息插入时由 messageHtml 补上
+      if (streamContent) streamContent.innerHTML = renderMarkdown(text);
       scrollToBottom();
     };
 

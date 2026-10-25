@@ -1,8 +1,8 @@
-// 应用外壳：侧栏导航（含项目子导航）+ hash 路由 + 视图挂载（每个视图自带挂载与清理）
+// 应用外壳：侧栏导航（含项目 / Agent 总览两组子导航）+ hash 路由 + 视图挂载（每个视图自带挂载与清理）
 import { startSse, subscribe, onConnectionState } from './sse.ts';
-import { esc, toast } from './ui.ts';
+import { esc } from './ui.ts';
 import { icon } from './icons.ts';
-import { api, refreshUserCache, type Board } from './api.ts';
+import { api, refreshUserCache, type Board, type Overview, type AgentOverview } from './api.ts';
 
 export interface View {
   label: string;
@@ -71,12 +71,22 @@ async function mount(): Promise<void> {
       if (fn) fn();
     };
   } catch (err) {
-    viewHost.innerHTML = `<div class="empty">视图加载失败：${esc(err instanceof Error ? err.message : String(err))}</div>`;
+    // 部署后旧 index.html 引用已不存在的 chunk → 动态导入 404：自动整页重载拿最新壳
+    // （sessionStorage 防死循环：一次会话只自动重载一次，再失败就真报错）
+    const stale = err instanceof Error && /fetch|import|dynamically|404|Failed/i.test(err.message);
+    const key = 'asterhive.chunk-reloaded';
+    if (stale && !sessionStorage.getItem(key)) {
+      sessionStorage.setItem(key, '1');
+      location.reload();
+      return;
+    }
+    viewHost.innerHTML = `<div class="empty">视图加载失败：${esc(err instanceof Error ? err.message : String(err))}${
+      stale ? '<br/>提示：服务可能刚更新过，请 Ctrl+F5 强制刷新。' : ''
+    }</div>`;
   }
 }
 
 function renderShell(): void {
-  teardownFleetDrawer(); // 壳重建会连带重建抽屉挂点：先退订 SSE/清计时器，防止泄漏
   const app = document.getElementById('app')!;
   app.innerHTML = `
     <aside class="sidebar">
@@ -85,81 +95,48 @@ function renderShell(): void {
       <div class="conn" id="conn-state"><span class="dot"></span>连接中</div>
     </aside>
     <main class="main" id="view-host"></main>
-    <div id="fleet-drawer-host"></div>
   `;
   viewHost = document.getElementById('view-host');
   renderNav();
 }
 
-// ---- Agent 总览抽屉：全局浮层，从侧栏「Agent 总览」直接唤出，不占路由 ----
-// 内容复用 fleet 视图的 renderFleetInto（数据拉取 + SSE 刷新 + 30s 兜底轮询），
-// 关闭时 destroy 退订；当前页面（通常是聊天工作台）与其 SSE 订阅完全不受影响。
-// 挂点 #fleet-drawer-host 与 board.ts 的 #drawer-host 同模式，但挂在 app 级（跨视图常驻）。
-
-let fleetDrawerOpen = false;                                  // 抽屉开关态（含打开中：防重复点击 + 导航高亮）
-let fleetDrawerHandle: { destroy: () => void } | null = null; // 内容句柄（renderFleetInto 返回）
-let fleetEscHandler: ((ev: KeyboardEvent) => void) | null = null;
-let fleetDrawerSeq = 0; // 打开序号：快速 关闭→重开 时丢弃在途旧打开的续体，防旧句柄覆盖新句柄导致订阅泄漏
-
-/** 仅拆订阅与监听，不动 DOM / 导航（renderShell 重建壳前调用，防泄漏） */
-function teardownFleetDrawer(): void {
-  fleetDrawerOpen = false;
-  fleetDrawerHandle?.destroy(); // 退订 SSE / 清刷新计时器
-  fleetDrawerHandle = null;
-  if (fleetEscHandler) {
-    window.removeEventListener('keydown', fleetEscHandler);
-    fleetEscHandler = null;
-  }
-}
-
-/** 关闭抽屉：销毁内容 + 清空挂点 + 导航高亮恢复当前路由项 */
-function closeFleetDrawer(): void {
-  if (!fleetDrawerOpen) return;
-  teardownFleetDrawer();
-  const host = document.getElementById('fleet-drawer-host');
-  if (host) host.innerHTML = '';
-  renderNav();
-}
-
-/** 唤出抽屉：写入 mask + aside 壳并绑好关闭途径（mask / 关闭按钮 / ESC），内容异步补齐 */
-async function openFleetDrawer(): Promise<void> {
-  if (fleetDrawerOpen) return; // 已开（含打开中）：忽略重复点击
-  const host = document.getElementById('fleet-drawer-host');
-  if (!host) return;
-  const seq = ++fleetDrawerSeq;
-  fleetDrawerOpen = true;
-  // 先同步铺壳，内容区交给 fleet 视图的 renderFleetInto（懒加载，与 #/fleet 路由共用同一 chunk）
-  host.innerHTML = `
-    <div class="drawer-mask" id="fleet-mask"></div>
-    <aside class="drawer fleet-drawer" aria-label="Agent 总览">
-      <div class="drawer-head">
-        <h3>${icon.hive} Agent 总览</h3>
-        <button class="icon-btn" id="fleet-drawer-close" title="关闭">${icon.x}</button>
-      </div>
-      <div class="fleet-drawer-body" id="fleet-drawer-body"></div>
-    </aside>`;
-  host.querySelector('#fleet-mask')!.addEventListener('click', closeFleetDrawer);
-  host.querySelector('#fleet-drawer-close')!.addEventListener('click', closeFleetDrawer);
-  fleetEscHandler = (ev: KeyboardEvent) => {
-    if (ev.key === 'Escape') closeFleetDrawer();
-  };
-  window.addEventListener('keydown', fleetEscHandler);
-  renderNav(); // 「Agent 总览」立即高亮
-  try {
-    const mod = await import('./views/fleet.ts');
-    // 打开在途期间已被关闭或又被重开：这次续体作废（新打开会自己装配内容）
-    if (!fleetDrawerOpen || seq !== fleetDrawerSeq) return;
-    fleetDrawerHandle = mod.renderFleetInto(document.getElementById('fleet-drawer-body')!);
-  } catch (err) {
-    toast(`Agent 总览加载失败：${err instanceof Error ? err.message : String(err)}`, true);
-    closeFleetDrawer();
-  }
-}
-
-// ---- 项目化导航：「项目」下缩进列出各项目（看板=项目），聊天室已并入项目工作台 ----
+// ---- 项目化导航：「项目」下缩进列出各项目（看板=项目），聊天室已并入项目工作台；
+// 「Agent 总览」同为可展开组：主项只切换展开态不进路由，展开后缩进列出各 agent
+//（状态点 + 名字），点击子项进 fleet 整页并 ?agent= 定位高亮 ----
 
 // 看板列表缓存：启动拉取，board.* 事件后重拉；renderNav 只依赖此缓存与路由/当前板
 let boardsCache: Board[] = [];
+
+// Agent 列表缓存：启动拉取，状态相关 SSE 事件 debounce 500ms 重拉 + 30s 兜底轮询；
+// 事件刷新走轻量路径只重写子项区（#nav-agents-sub），不整栏重渲，防状态点/文字闪烁
+let agentsCache: AgentOverview[] = [];
+
+// 「Agent 总览」组展开态记忆：默认展开（localStorage 只在收起时存 '0'）
+function agentsNavOpen(): boolean {
+  return localStorage.getItem('asterhive.navAgentsOpen') !== '0';
+}
+
+// Agent 子项行：状态点 + 名字（语义色沿用 fleet 卡片的 .status-dot：working/stale=warn、
+// idle=ok、disabled/offline=dot-idle）；title 悬停给 @handle · host · 当前任务
+function agentSubsHtml(route: string, curAgent: string): string {
+  return agentsCache
+    .map((a) => {
+      const taskTitle = a.currentTask ? a.currentTask.title : '空闲——未占用任务';
+      const title = `@${a.handle}${a.host ? ` · ${a.host}` : ''} · ${taskTitle}`;
+      return `<a class="nav-sub-item nav-agent-item${route === '#/fleet' && a.id === curAgent ? ' active' : ''}" data-agent="${esc(a.id)}" title="${esc(title)}"><span class="status-dot ${a.status}"></span><span class="nav-agent-name">${esc(a.name)}</span></a>`;
+    })
+    .join('');
+}
+
+// Agent 子项点击：进 fleet 整页并带 ?agent=（fleet 视图读参定位高亮对应卡片）
+function bindAgentSubs(scope: ParentNode): void {
+  scope.querySelectorAll<HTMLAnchorElement>('.nav-agent-item').forEach((a) => {
+    a.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      location.hash = `#/fleet?agent=${a.dataset.agent!}`;
+    });
+  });
+}
 
 // 可重入的 nav 渲染：事件/路由/当前板变化时只重建侧栏 nav 区，
 // 不整壳重建（避免打断当前视图的消息流与 SSE 订阅）
@@ -167,18 +144,26 @@ function renderNav(): void {
   const nav = document.querySelector('.sidebar nav');
   if (!nav) return;
   const route = currentRoute();
-  // 抽屉开着时，导航语境整体切到「Agent 总览」；关闭后恢复按当前路由高亮
-  const activeRoute = fleetDrawerOpen ? '#/fleet' : route;
   const curBoard = localStorage.getItem('asterhive.board') ?? '';
+  const curAgent = currentQuery().get('agent') ?? '';
+  const open = agentsNavOpen();
   const top = Object.entries(ROUTES)
     .map(([hash, def]) => {
-      const item = `<a class="nav-item${hash === activeRoute ? ' active' : ''}" data-nav="${hash}" href="${hash}"><span class="icon">${def.icon}</span>${def.label}</a>`;
+      // 仅「Agent 总览」主项 = 可展开组开关：无 href，点击只切换展开态不进路由
+      //（fleet 整页改由子项深链进入，#/fleet 直链仍可收藏）
+      if (hash === '#/fleet') {
+        const item = `<a class="nav-item${hash === route ? ' active' : ''}" data-agents-toggle title="展开/收起 Agent 列表"><span class="icon">${def.icon}</span>${def.label}<span class="chev${open ? ' open' : ''}">${icon.chevron}</span></a>`;
+        if (!open) return item;
+        const subs = agentSubsHtml(route, curAgent) || '<div class="nav-agents-empty">尚无 agent 注册</div>';
+        return `${item}<div class="nav-sub" id="nav-agents-sub">${subs}</div>`;
+      }
+      const item = `<a class="nav-item${hash === route ? ' active' : ''}" data-nav="${hash}" href="${hash}"><span class="icon">${def.icon}</span>${def.label}</a>`;
       // 仅「项目」入口下挂项目子列表；高亮 = 路由落在项目工作台 且 子项=当前板
       if (hash === '#/board') {
         const subs = boardsCache
           .map(
             (b) =>
-              `<a class="nav-sub-item${activeRoute === hash && b.id === curBoard ? ' active' : ''}" data-board="${esc(b.id)}" href="#/board?board=${esc(b.id)}" title="${esc(b.name)}">${esc(b.name)}</a>`,
+              `<a class="nav-sub-item${route === hash && b.id === curBoard ? ' active' : ''}" data-board="${esc(b.id)}" href="#/board?board=${esc(b.id)}" title="${esc(b.name)}">${esc(b.name)}</a>`,
           )
           .join('');
         return `${item}<div class="nav-sub">${subs}</div>`;
@@ -187,19 +172,52 @@ function renderNav(): void {
     })
     .join('');
   nav.innerHTML = top;
-  // 子项点击：直达项目工作台并带 ?board=（board 视图读参写入 localStorage，链接可直接分享）
-  nav.querySelectorAll<HTMLAnchorElement>('.nav-sub-item').forEach((a) => {
+  // 项目子项点击：直达项目工作台并带 ?board=（board 视图读参写入 localStorage，链接可直接分享）
+  //（只绑 data-board：Agent 子项同为 .nav-sub-item 变体，走上方 bindAgentSubs）
+  nav.querySelectorAll<HTMLAnchorElement>('.nav-sub-item[data-board]').forEach((a) => {
     a.addEventListener('click', (ev) => {
       ev.preventDefault();
       navigate(`#/board?board=${a.dataset.board!}`);
     });
   });
-  // 「Agent 总览」不走 hash 路由：点击唤出全局抽屉，当前页面不被打断
-  //（#/fleet 深链仍走整页视图，见下方 ROUTES/mount）
-  nav.querySelector<HTMLAnchorElement>('a[data-nav="#/fleet"]')?.addEventListener('click', (ev) => {
+  // 「Agent 总览」主项点击：切换展开态并记忆（不进路由）
+  nav.querySelector<HTMLAnchorElement>('a[data-agents-toggle]')?.addEventListener('click', (ev) => {
     ev.preventDefault();
-    void openFleetDrawer();
+    localStorage.setItem('asterhive.navAgentsOpen', agentsNavOpen() ? '0' : '1');
+    renderNav();
   });
+  bindAgentSubs(nav);
+}
+
+// 拉取 Agent 列表并只更新子项区；失败静默（保留上次缓存，整页 fleet 视图有自己的错误提示）
+async function loadAgents(): Promise<void> {
+  try {
+    agentsCache = (await api.get<Overview>('/overview')).agents;
+  } catch {
+    return;
+  }
+  renderAgentSubs();
+}
+
+// 轻量刷新：只重写 Agent 子项区（不整栏重渲，防闪烁）；
+// 组收起或壳未就绪时跳过 DOM——缓存已更新，下次 renderNav 自然带上
+function renderAgentSubs(): void {
+  const box = document.getElementById('nav-agents-sub');
+  if (!box) return;
+  const route = currentRoute();
+  const curAgent = currentQuery().get('agent') ?? '';
+  box.innerHTML = agentSubsHtml(route, curAgent) || '<div class="nav-agents-empty">尚无 agent 注册</div>';
+  bindAgentSubs(box);
+}
+
+// 状态事件 → 重拉 /overview：debounce 500ms 合并突发（一次任务流转会连发多条事件）
+let agentsReloadTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleAgentsReload(): void {
+  if (agentsReloadTimer !== null) clearTimeout(agentsReloadTimer);
+  agentsReloadTimer = setTimeout(() => {
+    agentsReloadTimer = null;
+    void loadAgents();
+  }, 500);
 }
 
 /** 供视图在切换当前板后同步侧栏高亮（board 的 ?board= 与切板下拉） */
@@ -229,9 +247,12 @@ async function loadBoards(): Promise<void> {
 function main(): void {
   renderShell();
   void loadBoards(); // 项目子导航数据异步补齐（首帧不阻塞）
+  void loadAgents(); // Agent 子导航数据异步补齐（首帧不阻塞）
   startSse();
   // 单用户模型：启动即拉取并缓存"用户名"（displayAuthor 显示 我（用户名） 用）
   void refreshUserCache();
+  // Agent 子导航兜底轮询：SSE 漏事件（断线窗口期）也能最终一致；nav 常驻，计时器随壳存活
+  setInterval(() => void loadAgents(), 30_000);
   onConnectionState((connected) => {
     const el = document.getElementById('conn-state');
     if (el) {
@@ -244,9 +265,13 @@ function main(): void {
     if (type === 'board.created' || type === 'board.updated' || type === 'board.deleted') {
       void loadBoards();
     }
+    // Agent 子导航跟随状态事件（任务流转 / agent 上下线 / 主脑回合起止）：
+    // debounce 500ms 重拉 /overview，只更新子项区不整栏重渲
+    if (type.startsWith('task.') || type.startsWith('agent.') || type.startsWith('brain.turn_')) {
+      scheduleAgentsReload();
+    }
   });
   window.addEventListener('hashchange', () => {
-    closeFleetDrawer(); // 路由切换先收起抽屉（内部会 renderNav，恢复路由项高亮）
     if (!document.getElementById('view-host')) renderShell();
     renderNav();
     void mount();

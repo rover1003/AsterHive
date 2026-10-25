@@ -142,6 +142,7 @@ curl -sS -X POST "$BASE/tasks/<任务号>/release" -H "authorization: Bearer $TO
     -H "content-type: application/json" -d '{"content":"@主脑 T-12 被阻塞：缺少 xx 权限","kind":"question"}'
   ```
 - 用户直接 @ 你（绕过主脑）→ 照做，主脑会自行同步任务状态，你不必替它汇报；
+- 汇报用 Markdown 排版（结论先行、条目用列表、路径/命令用代码块）——聊天室按 Markdown 渲染，与主脑同一套管线；
 - 完成即 `submit`，验收结论由主脑/用户给，**不要自封 Done**。
 
 ## 6. 消息与看板读取

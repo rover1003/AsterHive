@@ -136,6 +136,23 @@ svg.i { flex-shrink: 0; }
 .nav-sub-item.active { background: var(--accent); color: var(--foreground); }
 .nav-sub-item.active::before { border-color: var(--primary); background: var(--primary); }
 
+/* 「Agent 总览」主项 = 可展开组开关（无 href 的 a）：指针手型 + 右侧展开/收起指示 */
+.nav-item[data-agents-toggle] { cursor: pointer; }
+.nav-item .chev { margin-left: auto; display: flex; color: var(--subtle-foreground); transition: transform 0.15s ease; }
+.nav-item .chev svg.i { width: 12px; height: 12px; }
+.nav-item .chev.open { transform: rotate(90deg); } /* icon.chevron 默认朝右：展开转朝下 */
+
+/* Agent 子项：复用 .nav-sub-item 基调（缩进/字号/悬停/active），
+   空心圆点换成实时状态点（语义色沿用 fleet 卡片：working/stale=warn、idle=ok、disabled=dot-idle） */
+.nav-agent-item { display: flex; align-items: center; }
+.nav-agent-item::before { display: none; } /* 项目子项的空心圆点由状态点替代 */
+.nav-agent-item .status-dot {
+  position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+  width: 6px; height: 6px; margin: 0;
+}
+.nav-agent-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.nav-agents-empty { margin-left: 14px; padding: 0 8px 0 22px; height: 26px; line-height: 26px; font-size: 12px; color: var(--subtle-foreground); }
+
 /* 底部在线行：12px 三级字 + 6px 状态点 */
 .conn { padding: 8px; font-size: 12px; color: var(--subtle-foreground); }
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; background: var(--dot-idle); }
@@ -306,7 +323,9 @@ code { background: var(--secondary); padding: 1px 6px; border-radius: 4px; font-
   border-color: rgba(232, 163, 61, 0.28);
   border-radius: 10px 10px 3px 10px; /* 右下 3 */
 }
-.msg .content { font-size: 14px; line-height: 1.5; word-break: break-word; overflow-wrap: anywhere; white-space: pre-wrap; }
+/* 正文换行交给 Markdown 管线（breaks:true 单换行→<br>），不再用 pre-wrap——
+   否则 marked 输出的块间空白会渲染成多余空行 */
+.msg .content { font-size: 14px; line-height: 1.5; word-break: break-word; overflow-wrap: anywhere; }
 /* meta 行：名字 + kind 标签 + 时间，可换行不挤压 */
 .msg .meta { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; color: var(--muted-foreground); }
 .msg .meta b { font-size: 12px; font-weight: 600; color: var(--muted-foreground); }
@@ -350,7 +369,9 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 
 /* 流式气泡：复用 .msg/.avatar/.bubble/.meta 配方，仅补"正在回复…"提示与闪烁光标 */
 .stream-hint { font-size: 11px; color: var(--subtle-foreground); }
-.stream-content::after {
+/* 光标挂在最后一个 MD 块的末尾（renderMarkdown 输出块级元素），跟随文字而非独占一行；
+   内容为空的一帧无光标（瞬态，可忽略） */
+.stream-content > :last-child::after {
   content: '▍';
   color: var(--primary);
   animation: stream-cursor 1s steps(1) infinite;
@@ -359,6 +380,56 @@ time { font-size: 11px; color: var(--subtle-foreground); }
   0%, 49% { opacity: 1; }
   50%, 100% { opacity: 0; }
 }
+
+/* ---------- 消息正文 Markdown 元素（renderMarkdown 输出） ---------- */
+/* 全部限定 .msg .content 后代，不外溢；颜色/圆角只用上方令牌。
+   单段纯文本（marked 仅包一个 <p>）视觉与旧版一致：p 无默认边距 */
+.msg .content p { margin: 0; }
+.msg .content p + p { margin-top: 8px; } /* 段间距只在多段之间出现 */
+/* 小标题：16/15/14/13 递减，上 8 下 4 */
+.msg .content h1, .msg .content h2, .msg .content h3, .msg .content h4 {
+  margin: 8px 0 4px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.msg .content h1 { font-size: 16px; }
+.msg .content h2 { font-size: 15px; }
+.msg .content h3 { font-size: 14px; }
+.msg .content h4 { font-size: 13px; }
+/* 首尾块去外边距：贴气泡 padding，不产生悬空空隙 */
+.msg .content > :first-child { margin-top: 0; }
+.msg .content > :last-child { margin-bottom: 0; }
+/* 列表：缩进 20、行距 1.6 */
+.msg .content ul, .msg .content ol { margin: 8px 0 4px; padding-left: 20px; line-height: 1.6; }
+/* 行内代码：次级表面 + 4px 圆角 + 紧凑内边距（覆盖全局 code 的 1px 6px） */
+.msg .content code { background: var(--secondary); border-radius: 4px; padding: 1px 3px; font-size: 12px; }
+/* 代码块：次级表面整块铺底，横向滚动防撑破气泡 */
+.msg .content pre {
+  background: var(--secondary);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 8px 0 4px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.msg .content pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; }
+/* 引用：左 2px 强边框 + 二级灰 */
+.msg .content blockquote {
+  margin: 8px 0 4px;
+  padding: 0 12px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--muted-foreground);
+}
+/* 表格：边框令牌 + 表头次级表面底 */
+.msg .content table { border-collapse: collapse; margin: 8px 0 4px; max-width: 100%; }
+.msg .content th, .msg .content td { border: 1px solid var(--border); padding: 4px 10px; font-size: 13px; text-align: left; }
+.msg .content th { background: var(--secondary); font-weight: 500; }
+.msg .content hr { border: none; border-top: 1px solid var(--border-strong); margin: 12px 0; }
+/* 链接：信息蓝下划线（taskref 是可点任务号，恢复既有点线样式，不走下划线） */
+.msg .content a { color: var(--info); text-decoration: underline; }
+.msg .content a.taskref { text-decoration: none; border-bottom: 1px dotted var(--info); }
+.msg .content a.taskref:hover { border-bottom-style: solid; } /* 全局 .taskref:hover 特异度不够，此处就近覆盖 */
 
 /* ---------- composer：整行一张卡，贴底单行 ---------- */
 .composer { padding: 8px 16px 16px; }
@@ -555,7 +626,9 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 .agg.disabled b { color: var(--dot-idle); }
 .sep { flex: 0 0 1px; height: 20px; background: var(--border); }
 .fleet { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
-.fleet-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px; }
+.fleet-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px; transition: border-color 1.2s ease; }
+/* 深链 ?agent= 定位高亮：加 class 点亮 --primary 边框，2s 后移除、靠上面的 transition 渐隐回常态 */
+.fleet-card.fleet-card-focus { border-color: var(--primary); }
 /* 状态点 8px：在线 ok / 忙碌·预警 warn / 离线侧灰 */
 .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
 .status-dot.working { background: var(--warn); }  /* 忙碌 */
@@ -618,29 +691,3 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 }
 .toast.error { border-color: rgba(220, 38, 38, 0.6); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-
-/* ---------- Agent 总览抽屉（全局浮层：侧栏「Agent 总览」唤出，不占路由；挂点 #fleet-drawer-host） ---------- */
-/* 复用 .drawer 体系（popover 底 / border-left / shadow-lg / z-index mask 40 + drawer 41），
-   仅加宽并改为头部常驻：滚动收进内容区，聚合条随内容一起滚 */
-.fleet-drawer {
-  width: 560px;
-  display: flex; flex-direction: column;
-  overflow: hidden;              /* 覆盖 .drawer 的整体滚动：改由 .fleet-drawer-body 内滚 */
-  padding-bottom: 16px;
-  animation: fleet-slide-in 0.2s ease;
-}
-.fleet-drawer .drawer-head { flex-shrink: 0; }
-.fleet-drawer-body { flex: 1; min-height: 0; overflow-y: auto; }
-/* 抽屉内容宽 512（560 - 24×2）：单列卡片——auto-fill 320 也只会排出 1 列，固定单列意图更明确 */
-.fleet-drawer .fleet { grid-template-columns: 1fr; }
-/* 入场动画：遮罩淡入 + 抽屉右侧滑入（仅本抽屉，不动其他抽屉的瞬时出现） */
-#fleet-mask { animation: fleet-fade-in 0.2s ease; }
-@keyframes fleet-fade-in { from { opacity: 0; } to { opacity: 1; } }
-@keyframes fleet-slide-in {
-  from { opacity: 0; transform: translateX(24px); }
-  to { opacity: 1; transform: translateX(0); }
-}
-/* 窄屏（<1000px，与看板 overlay 同断点）：抽屉全宽 */
-@media (max-width: 999px) {
-  .fleet-drawer { width: 100vw; max-width: 100vw; }
-}
