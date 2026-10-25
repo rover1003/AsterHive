@@ -1,16 +1,29 @@
+import './_brain-env.ts'; // 必须第一条：先设 ASTERHIVE_BRAIN_* 再加载 brain.ts（经 http.ts 传递加载）
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkRig } from './helpers.ts';
 import { createApp } from '../src/http.ts';
 import { registerAgent } from '../src/agents.ts';
+import { createBoard } from '../src/tasks.ts';
 import { getOverview } from '../src/overview.ts';
-import { getOrchestratorSettings, putOrchestratorSettings, decryptApiKey, listOrchestratorModels, testOrchestratorModel } from '../src/settings.ts';
+import {
+  getOrchestratorSettings,
+  putOrchestratorSettings,
+  activeGroup,
+  createOrchestratorGroup,
+  updateOrchestratorGroup,
+  switchOrchestratorGroup,
+  listOrchestratorModels,
+  testOrchestratorModel,
+} from '../src/settings.ts';
 import { listEvents } from '../src/write.ts';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDb } from '../src/db.ts';
 import { makeCtx } from '../src/types.ts';
 import { createCipheriv, randomBytes, scryptSync } from 'node:crypto';
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function H(token?: string): Record<string, string> {
   const h: Record<string, string> = { 'content-type': 'application/json' };
@@ -60,62 +73,52 @@ test('T10: /overview——占用/进度/状态纯投影', async () => {
   }
 });
 
-test('T10: 主脑设置——apiKey 加密落库、读取掩码、运行时可解密；PUT 匿名（=user）可写，worker 403，无效 token 401', async () => {
+// ---- 2026-10-25 主脑多模型组：组 CRUD / 激活切换 / 迁移 / 按组 models·test / brain 消费 ----
+
+test('T10: 模型组——apiKey 加密落库、明文/密文永不回显；组接口匿名（=user）可写，worker 403，无效 token 401', async () => {
   const rig = mkRig();
   try {
     const app = createApp(rig.ctx);
     const worker = registerAgent(rig.ctx, { name: '工蜂', handle: 'bee' });
 
-    let res = await app.request('/settings/orchestrator', {
-      method: 'PUT',
-      headers: H('ah-invalid'),
-      body: JSON.stringify({ provider: 'openai', model: 'gpt-6', apiKey: 'sk-very-secret' }),
-    });
+    const createBody = JSON.stringify({ name: '主通道', baseURL: 'https://t10.example/v1', model: 'gpt-6', apiKey: 'sk-very-secret' });
+    let res = await app.request('/settings/orchestrator/groups', { method: 'POST', headers: H('ah-invalid'), body: createBody });
     assert.equal(res.status, 401, '无效 bearer 401（不静默降权）');
 
-    res = await app.request('/settings/orchestrator', {
-      method: 'PUT',
-      headers: H(worker.token),
-      body: JSON.stringify({ provider: 'openai', model: 'gpt-6', apiKey: 'sk-very-secret' }),
-    });
+    res = await app.request('/settings/orchestrator/groups', { method: 'POST', headers: H(worker.token), body: createBody });
     assert.equal(res.status, 403, 'worker 角色 403');
 
-    // 零令牌：无凭据即唯一用户（user 角色），可保存
-    res = await app.request('/settings/orchestrator', {
-      method: 'PUT',
-      headers: H(),
-      body: JSON.stringify({ provider: 'openai', model: 'gpt-6', apiKey: 'sk-very-secret' }),
-    });
-    assert.equal(res.status, 200);
-    let body = (await res.json()) as { apiKeySet?: boolean; apiKey?: string; model?: string };
-    assert.equal(body.apiKeySet, true);
-    assert.equal(body.apiKey, undefined, '明文永不回显');
-    assert.equal(body.model, 'gpt-6');
+    // 零令牌：无凭据即唯一用户（user 角色），可创建
+    res = await app.request('/settings/orchestrator/groups', { method: 'POST', headers: H(), body: createBody });
+    assert.equal(res.status, 201);
+    const { group } = (await res.json()) as { group: { id: string; name: string; apiKeySet?: boolean; model?: string } };
+    assert.ok(group.id.startsWith('g'), `组 id 为 g+随机短码：${group.id}`);
+    assert.equal(group.apiKeySet, true, 'apiKeySet=true（已加密落库）');
+    assert.equal(group.model, 'gpt-6');
+    assert.equal((group as Record<string, unknown>).apiKey, undefined, '明文不回显');
+    assert.equal((group as Record<string, unknown>).apiKeyCipher, undefined, '密文不回显');
 
     // 落库内容不含明文
     const dbText = readFileSync(join(rig.ctx.cfg.dataDir, 'asterhive.db'), 'utf8');
     assert.ok(!dbText.includes('sk-very-secret'), '数据库文件中无明文 apiKey');
 
-    // 运行时解密（内置主脑消费）
-    assert.equal(decryptApiKey(rig.ctx), 'sk-very-secret');
-
-    body = getOrchestratorSettings(rig.ctx);
-    assert.equal(body.model, 'gpt-6');
+    // 空组态创建的第一组自动激活：activeGroup 可解密（内置主脑消费）
+    assert.equal(getOrchestratorSettings(rig.ctx).activeGroupId, group.id);
+    assert.equal(activeGroup(rig.ctx)?.apiKey, 'sk-very-secret');
   } finally {
     rig.cleanup();
   }
 });
 
-test('T10: settings 密钥——无 env 时首次保存即生成 enc_secret，重启（新连接）后解密仍成功', () => {
+test('T10: settings 密钥——无 env 时首次保存组 apiKey 即生成 enc_secret，重启（新连接）后解密仍成功', () => {
   const rig = mkRig();
   const prevEnv = process.env.ASTERHIVE_SECRET;
   try {
     delete process.env.ASTERHIVE_SECRET; // 明确无 env 场景
     const ctx = rig.ctx;
 
-    // 无 ASTERHIVE_SECRET：保存 apiKey 自动生成 enc_secret（不再依赖 env/管理令牌）
-    const saved = putOrchestratorSettings(ctx, { provider: 'openai', model: 'gpt-6', apiKey: 'sk-no-env' });
-    assert.equal(saved.apiKeySet, true);
+    // 无 ASTERHIVE_SECRET：创建组带 apiKey 自动生成 enc_secret（不再依赖 env/管理令牌）
+    createOrchestratorGroup(ctx, { name: '主', baseURL: 'https://t10-key.example/v1', apiKey: 'sk-no-env' });
     const enc = ctx.holder.db.prepare("SELECT value FROM settings WHERE key = 'enc_secret'").get() as {
       value: string;
     };
@@ -125,7 +128,7 @@ test('T10: settings 密钥——无 env 时首次保存即生成 enc_secret，�
     const db2 = openDb(ctx.cfg.dataDir);
     const ctx2 = makeCtx(db2, { dataDir: ctx.cfg.dataDir, ttlMinutes: 240, keepSnapshots: 3 });
     try {
-      assert.equal(decryptApiKey(ctx2), 'sk-no-env', '新连接（重启语义）解密成功——密钥与 env 解耦');
+      assert.equal(activeGroup(ctx2)?.apiKey, 'sk-no-env', '新连接（重启语义）解密成功——密钥与 env 解耦');
     } finally {
       db2.close();
     }
@@ -151,28 +154,56 @@ function readRow(ctx: ReturnType<typeof mkRig>['ctx'], key: string): string | nu
   return row?.value ?? null;
 }
 
-test('T10: settings 密钥迁移——env 仍设且能解开旧密文：一次性迁移到 enc_secret，此后 env 可撤', () => {
+test('T10: 旧单配置迁移——顶层 provider/baseURL/model/apiKeyCipher 一次性包成 groups[0]（id=default）+ activeGroupId，事件 settings.groups_migrated', () => {
   const rig = mkRig();
   const prevEnv = process.env.ASTERHIVE_SECRET;
   try {
-    // 构造旧数据：apiKeyCipher 由 env 派生密钥加密，且没有 enc_secret
+    // 构造旧形状：顶层单配置（apiKeyCipher 由 env 派生密钥加密，无 enc_secret、无 groups）
     process.env.ASTERHIVE_SECRET = 'legacy-env-secret';
     rig.ctx.holder.db
       .prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
-      .run('orchestrator', JSON.stringify({ provider: 'openai', apiKeyCipher: legacyEncrypt('sk-legacy', 'legacy-env-secret') }), Date.now());
+      .run(
+        'orchestrator',
+        JSON.stringify({
+          provider: 'Xapi',
+          baseURL: 'https://legacy.example/v1',
+          model: 'gpt-legacy',
+          apiKeyCipher: legacyEncrypt('sk-legacy', 'legacy-env-secret'),
+          enabled: true,
+        }),
+        Date.now(),
+      );
 
-    // 升级后首次解密：env 在场 → 迁移成功并返回明文
-    assert.equal(decryptApiKey(rig.ctx), 'sk-legacy');
+    // 首次读设置即迁移
+    const view = getOrchestratorSettings(rig.ctx);
+    assert.equal(view.groups.length, 1);
+    assert.equal(view.groups[0].id, 'default');
+    assert.equal(view.groups[0].name, 'Xapi', '组名取旧 provider');
+    assert.equal(view.groups[0].baseURL, 'https://legacy.example/v1');
+    assert.equal(view.groups[0].model, 'gpt-legacy');
+    assert.equal(view.groups[0].apiKeySet, true, 'apiKeySet 保留');
+    assert.equal(view.activeGroupId, 'default');
+    assert.equal(view.enabled, true, 'enabled 保留');
+    assert.equal(listEvents(rig.ctx, { type: 'settings.groups_migrated', limit: 5 }).length, 1);
 
-    const enc = readRow(rig.ctx, 'enc_secret');
-    assert.ok(/^[0-9a-f]{64}$/.test(enc ?? ''), 'enc_secret 已建立');
-    const stored = JSON.parse(readRow(rig.ctx, 'orchestrator')!) as { apiKeyCipher: string };
-    assert.notEqual(stored.apiKeyCipher, legacyEncrypt('sk-legacy', 'legacy-env-secret'), '密文已重加密');
+    // 迁移一次性：再读不重复迁移/发事件
+    getOrchestratorSettings(rig.ctx);
+    assert.equal(listEvents(rig.ctx, { type: 'settings.groups_migrated', limit: 5 }).length, 1);
 
-    // env 撤掉后（重启且忘带 env 的最坏情形）解密依然成功——已迁移到 enc_secret
+    // 顶层旧字段不再存在于存储
+    const stored = JSON.parse(readRow(rig.ctx, 'orchestrator')!) as Record<string, unknown>;
+    assert.equal(stored.provider, undefined);
+    assert.equal(stored.baseURL, undefined);
+    assert.equal(stored.model, undefined);
+    assert.equal(stored.apiKeyCipher, undefined);
+    assert.ok(Array.isArray(stored.groups));
+
+    // env→enc_secret 密钥迁移仍生效：密文已随组迁移进 groups[0]，resolveSecret 在组内找到旧密文
+    assert.equal(activeGroup(rig.ctx)?.apiKey, 'sk-legacy', '升级后首次解密：env 在场 → 迁移成功');
     delete process.env.ASTERHIVE_SECRET;
-    assert.equal(decryptApiKey(rig.ctx), 'sk-legacy', '迁移后 env 不再被依赖');
-
+    assert.equal(activeGroup(rig.ctx)?.apiKey, 'sk-legacy', '迁移后 env 不再被依赖');
+    const after = JSON.parse(readRow(rig.ctx, 'orchestrator')!) as { groups: { apiKeyCipher?: string }[] };
+    assert.notEqual(after.groups[0].apiKeyCipher, legacyEncrypt('sk-legacy', 'legacy-env-secret'), '密文已原位重加密到组内');
     assert.equal(listEvents(rig.ctx, { type: 'settings.apiKey_migrated', limit: 5 }).length, 1);
   } finally {
     if (prevEnv === undefined) delete process.env.ASTERHIVE_SECRET;
@@ -181,7 +212,7 @@ test('T10: settings 密钥迁移——env 仍设且能解开旧密文：一次�
   }
 });
 
-test('T10: settings 密钥迁移失败路径——env 解不开旧密文：置空 apiKey 并记 settings.apiKey_reset，之后可用 enc_secret 重填', () => {
+test('T10: settings 密钥迁移失败路径——env 解不开旧密文（组内）：置空组 apiKey 并记 settings.apiKey_reset，之后可用 enc_secret 重填', () => {
   const rig = mkRig();
   const prevEnv = process.env.ASTERHIVE_SECRET;
   try {
@@ -191,17 +222,22 @@ test('T10: settings 密钥迁移失败路径——env 解不开旧密文：置�
       .prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
       .run('orchestrator', JSON.stringify({ provider: 'openai', apiKeyCipher: legacyEncrypt('sk-old', 'lost-old-secret') }), Date.now());
 
-    assert.equal(decryptApiKey(rig.ctx), null, '解不开 → 按未设置处理');
+    // 读设置触发组迁移；解密触发密钥迁移失败路径
+    const migrated = getOrchestratorSettings(rig.ctx);
+    assert.equal(migrated.groups[0]?.id, 'default');
+    const ag = activeGroup(rig.ctx);
+    assert.ok(ag, '组迁移后激活组在场');
+    assert.equal(ag!.apiKey, null, '解不开 → 按未设置处理');
 
-    const stored = JSON.parse(readRow(rig.ctx, 'orchestrator')!) as { apiKeyCipher?: string };
-    assert.equal(stored.apiKeyCipher, undefined, '坏密文已置空');
+    const stored = JSON.parse(readRow(rig.ctx, 'orchestrator')!) as { groups: { apiKeyCipher?: string }[] };
+    assert.equal(stored.groups[0].apiKeyCipher, undefined, '坏密文已置空');
     assert.ok(readRow(rig.ctx, 'enc_secret'), 'enc_secret 仍建立，部署回到可用状态');
-    assert.equal(getOrchestratorSettings(rig.ctx).apiKeySet, false, 'UI 显示未设置 → 提示重填');
+    assert.equal(getOrchestratorSettings(rig.ctx).groups[0].apiKeySet, false, 'UI 显示未设置 → 提示重填');
     assert.equal(listEvents(rig.ctx, { type: 'settings.apiKey_reset', limit: 5 }).length, 1);
 
     // 之后重填 apiKey 走 enc_secret，正常加解密
-    putOrchestratorSettings(rig.ctx, { apiKey: 'sk-refilled' });
-    assert.equal(decryptApiKey(rig.ctx), 'sk-refilled');
+    updateOrchestratorGroup(rig.ctx, 'default', { apiKey: 'sk-refilled' });
+    assert.equal(activeGroup(rig.ctx)?.apiKey, 'sk-refilled');
   } finally {
     if (prevEnv === undefined) delete process.env.ASTERHIVE_SECRET;
     else process.env.ASTERHIVE_SECRET = prevEnv;
@@ -209,43 +245,51 @@ test('T10: settings 密钥迁移失败路径——env 解不开旧密文：置�
   }
 });
 
-// ---- 2026-10-25 追加：局部 PUT 回归 + 模型清单/连通测试（设置页下拉的数据源）----
-
-test('T10: 局部 PUT 不清空未传字段（回归：曾把 enabled/provider/baseURL 覆盖成 undefined 后被 JSON 丢弃）', () => {
+test('T10: 局部更新回归——组字段 undefined 键不覆盖（曾把存量字段覆盖成 undefined 后被 JSON 丢弃）；全局 PUT 只动 enabled/wakeOn', () => {
   const rig = mkRig();
   try {
-    putOrchestratorSettings(rig.ctx, {
-      enabled: true,
-      provider: 'Xapi',
+    const g = createOrchestratorGroup(rig.ctx, {
+      name: '主',
       baseURL: 'https://t10-keep.example/v1',
       model: 'm1',
       apiKey: 'sk-keep',
     });
     // http 层对未传字段会显式构造 undefined 键——这里原样复现
-    putOrchestratorSettings(rig.ctx, {
-      enabled: undefined,
-      provider: undefined,
+    updateOrchestratorGroup(rig.ctx, g.id, {
+      name: undefined,
       baseURL: undefined,
       model: 'm2',
       apiKey: undefined,
-      wakeOn: undefined,
-    } as Parameters<typeof putOrchestratorSettings>[1]);
+    } as Parameters<typeof updateOrchestratorGroup>[2]);
 
+    const view = getOrchestratorSettings(rig.ctx).groups.find((x) => x.id === g.id)!;
+    assert.equal(view.name, '主', 'name 保留');
+    assert.equal(view.baseURL, 'https://t10-keep.example/v1', 'baseURL 保留');
+    assert.equal(view.model, 'm2', 'model 已更新');
+    assert.equal(view.apiKeySet, true, 'apiKey 未被清空');
+    assert.equal(activeGroup(rig.ctx)?.apiKey, 'sk-keep', '解密后 KEY 不变');
+
+    // 全局 PUT：enabled/wakeOn 局部语义（undefined 键不覆盖）
+    putOrchestratorSettings(rig.ctx, { enabled: true, wakeOn: { userMessage: false } });
+    putOrchestratorSettings(rig.ctx, { enabled: false, wakeOn: undefined });
     const s = getOrchestratorSettings(rig.ctx);
-    assert.equal(s.enabled, true, 'enabled 保留');
-    assert.equal(s.provider, 'Xapi', 'provider 保留');
-    assert.equal(s.baseURL, 'https://t10-keep.example/v1', 'baseURL 保留');
-    assert.equal(s.model, 'm2', 'model 已更新');
-    assert.equal(s.apiKeySet, true, 'apiKey 未被清空');
+    assert.equal(s.enabled, false, 'enabled 已更新');
+    assert.equal(s.wakeOn?.userMessage, false, 'wakeOn 保留（undefined 键不覆盖）');
+
+    // 空更新不落库不发事件（避免惊动主脑重建会话）
+    const before = listEvents(rig.ctx, { type: 'settings.orchestrator_updated', limit: 50 }).length;
+    putOrchestratorSettings(rig.ctx, { enabled: undefined, wakeOn: undefined });
+    assert.equal(listEvents(rig.ctx, { type: 'settings.orchestrator_updated', limit: 50 }).length, before, '空更新无事件');
   } finally {
     rig.cleanup();
   }
 });
 
-test('T10: listOrchestratorModels 拉取上游 /models 并按 baseURL 缓存 60s', async () => {
+test('T10: listOrchestratorModels 拉取上游 /models 并按 baseURL 缓存 60s（缺省 = 激活组）', async () => {
   const rig = mkRig();
   try {
-    putOrchestratorSettings(rig.ctx, {
+    createOrchestratorGroup(rig.ctx, {
+      name: 'M',
       baseURL: 'https://t10-models.example/v1',
       model: 'gemini-x',
       apiKey: 'sk-models',
@@ -255,10 +299,10 @@ test('T10: listOrchestratorModels 拉取上游 /models 并按 baseURL 缓存 60s
       fetchCount += 1;
       return new Response(JSON.stringify({ data: [{ id: 'beta' }, { id: 'alpha' }] }), { status: 200 });
     }) as unknown as typeof fetch;
-    const r1 = await listOrchestratorModels(rig.ctx, stub);
+    const r1 = await listOrchestratorModels(rig.ctx, {}, stub);
     assert.deepEqual(r1.models, ['alpha', 'beta'], '排序去重输出');
     assert.equal(r1.cached, false);
-    const r2 = await listOrchestratorModels(rig.ctx, stub);
+    const r2 = await listOrchestratorModels(rig.ctx, {}, stub);
     assert.equal(r2.cached, true, 'TTL 内命中缓存');
     assert.equal(fetchCount, 1, '上游只打了一次');
   } finally {
@@ -269,14 +313,15 @@ test('T10: listOrchestratorModels 拉取上游 /models 并按 baseURL 缓存 60s
 test('T10: testOrchestratorModel 成功/失败都不抛异常，带状态与延迟', async () => {
   const rig = mkRig();
   try {
-    putOrchestratorSettings(rig.ctx, {
+    createOrchestratorGroup(rig.ctx, {
+      name: 'P',
       baseURL: 'https://t10-probe.example/v1',
       model: 'm-ok',
       apiKey: 'sk-probe',
     });
     const ok = await testOrchestratorModel(
       rig.ctx,
-      undefined,
+      {},
       (async () => new Response('{"choices":[{"message":{"content":"ok"}}]}', { status: 200 })) as unknown as typeof fetch,
     );
     assert.equal(ok.ok, true);
@@ -285,7 +330,7 @@ test('T10: testOrchestratorModel 成功/失败都不抛异常，带状态与延�
 
     const bad = await testOrchestratorModel(
       rig.ctx,
-      'm-bad',
+      { model: 'm-bad' },
       (async () =>
         new Response('{"error":{"message":"No available accounts"}}', {
           status: 503,
@@ -295,6 +340,237 @@ test('T10: testOrchestratorModel 成功/失败都不抛异常，带状态与延�
     assert.equal(bad.ok, false);
     assert.equal(bad.status, 503);
     assert.match(bad.error ?? '', /No available accounts/, '上游错误透传给 UI');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('T10: models/test 按组路由——stub fetch 区分 baseURL，缓存键=baseURL，缺省 = 激活组，组不存在 404', async () => {
+  const rig = mkRig();
+  try {
+    const a = createOrchestratorGroup(rig.ctx, { name: 'A', baseURL: 'https://t10-a.example/v1', model: 'm-a', apiKey: 'sk-a' });
+    const b = createOrchestratorGroup(rig.ctx, { name: 'B', baseURL: 'https://t10-b.example/v1', model: 'm-b', apiKey: 'sk-b' });
+    const seen: { url: string; auth: string; body: string }[] = [];
+    const recording = (resp: () => Response) =>
+      (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        seen.push({
+          url: String(input),
+          auth: headers.authorization ?? '',
+          body: typeof init?.body === 'string' ? init.body : '',
+        });
+        return resp();
+      }) as unknown as typeof fetch;
+    const stub = recording(() => {
+      // 上一条请求的 URL 决定响应（A/B 清单内容不同，用于区分缓存）
+      const url = seen[seen.length - 1]?.url ?? '';
+      if (url.startsWith('https://t10-a.example')) {
+        return new Response(JSON.stringify({ data: [{ id: 'a2' }, { id: 'a1' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ data: [{ id: 'b1' }] }), { status: 200 });
+    });
+
+    // 按组拉取：URL/KEY 都来自组本身
+    const ra = await listOrchestratorModels(rig.ctx, { groupId: a.id }, stub);
+    assert.deepEqual(ra.models, ['a1', 'a2']);
+    assert.equal(seen[0].url, 'https://t10-a.example/v1/models', '按组 baseURL 路由');
+    assert.equal(seen[0].auth, 'Bearer sk-a', '按组 apiKey');
+    const rb = await listOrchestratorModels(rig.ctx, { groupId: b.id }, stub);
+    assert.deepEqual(rb.models, ['b1']);
+    assert.equal(seen[1].auth, 'Bearer sk-b');
+    assert.equal(seen.length, 2);
+
+    // 缓存键 = baseURL：再拉 A 命中缓存，上游不再被打
+    const ra2 = await listOrchestratorModels(rig.ctx, { groupId: a.id }, stub);
+    assert.equal(ra2.cached, true);
+    assert.equal(seen.length, 2);
+
+    // 缺省 = 激活组：切到 B 后缺省走 B（A/B 清单内容不同，结果可区分）
+    switchOrchestratorGroup(rig.ctx, b.id);
+    const rd = await listOrchestratorModels(rig.ctx, {}, stub);
+    assert.deepEqual(rd.models, ['b1'], '缺省走激活组 B');
+    assert.equal(rd.cached, true);
+    assert.equal(seen.length, 2, '复用 B 的 baseURL 缓存');
+
+    // 组不存在 → 404
+    await assert.rejects(
+      () => listOrchestratorModels(rig.ctx, { groupId: 'g-nope' }, stub),
+      (err: unknown) => (err as { status?: number }).status === 404,
+      '组不存在 404',
+    );
+
+    // test 按组探测：model 缺省取组配置
+    seen.length = 0;
+    const probe = await testOrchestratorModel(
+      rig.ctx,
+      { groupId: b.id },
+      recording(() => new Response('{"choices":[{"message":{"content":"ok"}}]}', { status: 200 })),
+    );
+    assert.equal(probe.ok, true);
+    assert.equal(seen[0].url, 'https://t10-b.example/v1/chat/completions');
+    assert.ok(seen[0].body.includes('"model":"m-b"'), 'model 缺省取组配置');
+
+    // 缺省探测 = 激活组
+    seen.length = 0;
+    await testOrchestratorModel(
+      rig.ctx,
+      {},
+      recording(() => new Response('{}', { status: 200 })),
+    );
+    assert.ok(seen[0].url.startsWith('https://t10-b.example'), '缺省探测走激活组 B');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('T10: 组 CRUD over HTTP——局部更新、删除激活组 422、删空允许（未配置态）、active 切换事件必发、GET 投影无密文', async () => {
+  const rig = mkRig();
+  try {
+    const app = createApp(rig.ctx);
+
+    // 创建两组（首组自动激活）
+    const r1 = await app.request('/settings/orchestrator/groups', {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({ name: '主通道', baseURL: 'https://c1.example/v1', apiKey: 'sk-1' }),
+    });
+    assert.equal(r1.status, 201);
+    const g1 = ((await r1.json()) as { group: { id: string } }).group;
+    const r2 = await app.request('/settings/orchestrator/groups', {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({ name: '备用', baseURL: 'https://c2.example/v1', model: 'm2' }),
+    });
+    assert.equal(r2.status, 201);
+    const g2 = ((await r2.json()) as { group: { id: string; apiKeySet: boolean } }).group;
+    assert.equal(g2.apiKeySet, false, '未传 KEY 的组 apiKeySet=false');
+
+    let view = (await (await app.request('/settings/orchestrator')).json()) as {
+      enabled?: boolean;
+      activeGroupId?: string | null;
+      groups?: { id: string; name: string; baseURL: string; model?: string; apiKeySet?: boolean }[];
+    };
+    assert.equal(view.activeGroupId, g1.id, '首组自动激活');
+    assert.equal(view.groups?.length, 2);
+
+    // GET 投影：永不含密文/明文；旧单配置顶层字段不再输出
+    const raw = (await (await app.request('/settings/orchestrator')).json()) as Record<string, unknown>;
+    assert.equal(raw.provider, undefined);
+    assert.equal(raw.baseURL, undefined);
+    assert.equal(raw.model, undefined);
+    assert.equal(raw.apiKey, undefined);
+    assert.equal(raw.apiKeyCipher, undefined);
+    for (const g of (raw.groups ?? []) as Record<string, unknown>[]) {
+      assert.equal(g.apiKeyCipher, undefined, '组投影无密文');
+      assert.equal(g.apiKey, undefined, '组投影无明文');
+    }
+
+    // 局部更新（apiKey 缺省保留）
+    const ru = await app.request(`/settings/orchestrator/groups/${g2.id}`, {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ model: 'm2x' }),
+    });
+    assert.equal(ru.status, 200);
+    const updated = ((await ru.json()) as { group: { model?: string; name: string; baseURL: string; apiKeySet?: boolean } }).group;
+    assert.equal(updated.model, 'm2x');
+    assert.equal(updated.name, '备用', '未传字段保留');
+    assert.equal(updated.baseURL, 'https://c2.example/v1', '未传字段保留');
+
+    // 更新不存在的组 → 404
+    const r404 = await app.request('/settings/orchestrator/groups/g-nope', {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ model: 'x' }),
+    });
+    assert.equal(r404.status, 404);
+
+    // 删除激活组 → 422
+    const rdActive = await app.request(`/settings/orchestrator/groups/${g1.id}`, { method: 'DELETE', headers: H() });
+    assert.equal(rdActive.status, 422, '激活组不可删——先启用其他组');
+
+    // 切换激活：组不存在 404；成功后 orchestrator_updated 事件必发（brain disposeSession 闭环）
+    const badSwitch = await app.request('/settings/orchestrator/active', {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ groupId: 'g-nope' }),
+    });
+    assert.equal(badSwitch.status, 404);
+    const sw = await app.request('/settings/orchestrator/active', {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ groupId: g2.id }),
+    });
+    assert.equal(sw.status, 200);
+    view = (await sw.json()) as typeof view;
+    assert.equal(view.activeGroupId, g2.id);
+    const evs = listEvents(rig.ctx, { type: 'settings.orchestrator_updated', limit: 50 });
+    assert.ok(
+      evs.some((e) => e.payload.groupId === g2.id && (e.payload.fields as string[]).includes('activeGroupId')),
+      'active 切换事件必发（带 groupId 与 fields）',
+    );
+
+    // 切换后原激活组可删；删最后一组（即激活组）也允许——删空 = 主脑未配置态（"清空重配"的合法路径）
+    const rd1 = await app.request(`/settings/orchestrator/groups/${g1.id}`, { method: 'DELETE', headers: H() });
+    assert.equal(rd1.status, 200);
+    const rd2 = await app.request(`/settings/orchestrator/groups/${g2.id}`, { method: 'DELETE', headers: H() });
+    assert.equal(rd2.status, 200, '删最后一组（激活组）允许');
+    const empty = (await (await app.request('/settings/orchestrator')).json()) as {
+      groups: unknown[];
+      activeGroupId: string | null;
+    };
+    assert.deepEqual(empty.groups, []);
+    assert.equal(empty.activeGroupId, null, 'activeGroupId 悬空 → null');
+    assert.equal(activeGroup(rig.ctx), null, '删空 = 主脑未配置态');
+    assert.ok(
+      listEvents(rig.ctx, { type: 'settings.orchestrator_updated', limit: 50 }).some((e) => e.payload.groupId === g2.id),
+      '删除激活组（最后一组）必发 orchestrator_updated（brain disposeSession 闭环）',
+    );
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('T10: brain 消费 activeGroup——无组/组缺 KEY 不启动轮次（唤醒原因丢弃），配置补全前不会误发轮次', async () => {
+  const rig = mkRig();
+  try {
+    const app = createApp(rig.ctx);
+    createBoard(rig.ctx, { id: 'b', name: '板' });
+
+    // 启用主脑但无任何模型组
+    const put = await app.request('/settings/orchestrator', {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ enabled: true }),
+    });
+    assert.equal(put.status, 200);
+    await app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({ content: '@主脑 试试' }),
+    });
+    await sleep(800); // 越过去抖窗口（_brain-env 200ms）
+    let types = listEvents(rig.ctx, { limit: 100 }).map((e) => e.type);
+    assert.ok(types.includes('brain.started'), '主脑激活（身份注册）照常');
+    assert.ok(!types.includes('brain.turn_started'), '无激活组不应有轮次');
+
+    // 组缺 apiKey：同样不启动（创建首组自动激活 → orchestrator_updated → markDirty → 仍不启动）
+    createOrchestratorGroup(rig.ctx, { name: '缺KEY组', baseURL: 'https://t10-nokey.example/v1', model: 'm1' });
+    await sleep(800);
+    types = listEvents(rig.ctx, { limit: 200 }).map((e) => e.type);
+    assert.ok(!types.includes('brain.turn_started'), '组缺 apiKey 不应有轮次');
+
+    // 收尾：关闭主脑，清掉去抖计时器，避免清理数据目录后计时器触碰已关闭的库
+    const off = await app.request('/settings/orchestrator', {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ enabled: false }),
+    });
+    assert.equal(off.status, 200);
+    await sleep(300);
+    types = listEvents(rig.ctx, { limit: 200 }).map((e) => e.type);
+    assert.ok(types.includes('brain.stopped'), '关闭后应有 brain.stopped');
+    assert.ok(!types.includes('brain.turn_started'), '全程未产生轮次');
   } finally {
     rig.cleanup();
   }

@@ -112,11 +112,17 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
 
     await new Promise<void>((r) => mock.server.listen(0, '127.0.0.1', r));
 
-    // 启用主脑（model/baseURL 指向 mock；零令牌：无 Authorization 即 user 身份）
+    // 建主脑模型组（多模型组 API：每组独立 baseURL/apiKey/model），再启用主脑（零令牌：无 Authorization 即 user 身份）
+    const grp = await app.request('/settings/orchestrator/groups', {
+      method: 'POST',
+      headers: httpHeaders(),
+      body: JSON.stringify({ name: 'mock 通道', baseURL: `http://127.0.0.1:${mock.port()}/v1`, apiKey: 'sk-mock', model: 'mock-1' }),
+    });
+    assert.equal(grp.status, 201);
     const put = await app.request('/settings/orchestrator', {
       method: 'PUT',
       headers: httpHeaders(),
-      body: JSON.stringify({ enabled: true, baseURL: `http://127.0.0.1:${mock.port()}/v1`, model: 'mock-1' }),
+      body: JSON.stringify({ enabled: true }),
     });
     assert.equal(put.status, 200);
     const settings = (await put.json()) as { enabled?: boolean };
@@ -167,6 +173,11 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
     assert.ok(types.includes('task.created'));
     assert.equal(mock.calls(), 4, `mock 应被调 4 次，实际 ${mock.calls()}`);
 
+    // turn_started 标注本次通道（多模型组：排查"这次用的哪条通道"）
+    const started = listEvents(rig.ctx, { type: 'brain.turn_started', limit: 1 })[0];
+    assert.equal(started.payload.groupName, 'mock 通道');
+    assert.ok(typeof started.payload.groupId === 'string' && started.payload.groupId.startsWith('g'));
+
     // ---- worker 语义不受影响：领卡/交活动词照常 ----
     const bee = registerAgent(rig.ctx, { name: '工蜂', handle: 'bee' });
     createTask(rig.ctx, 'b', { id: 'T1', title: '执行卡', lane: 'Ready' });
@@ -192,7 +203,7 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
   }
 });
 
-test('主脑：未配置 model/baseURL 时唤醒不产生轮次', async () => {
+test('主脑：未配置模型组（无激活组）时唤醒不产生轮次', async () => {
   const rig = mkRig();
   try {
     const app = createApp(rig.ctx);
@@ -201,7 +212,7 @@ test('主脑：未配置 model/baseURL 时唤醒不产生轮次', async () => {
     const put = await app.request('/settings/orchestrator', {
       method: 'PUT',
       headers: httpHeaders({ authorization: `Bearer ${boss.token}` }),
-      body: JSON.stringify({ enabled: true }), // 没有 model/baseURL
+      body: JSON.stringify({ enabled: true }), // 没有任何模型组
     });
     assert.equal(put.status, 200);
     await app.request('/boards/b/messages', {

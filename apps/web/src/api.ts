@@ -97,14 +97,35 @@ export interface AuditEntry {
   result: string;
   detail?: string;
 }
-export interface OrchestratorSettings {
-  provider?: string;
-  baseURL?: string;
+/** 模型组（主脑多模型组）：GET /settings/orchestrator 的 groups 投影，cipher/明文永不回显 */
+export interface OrchestratorGroup {
+  id: string;
+  name: string;
+  baseURL: string;
   model?: string;
+  /** 该组是否已设置 apiKey（加密存储，界面只显示"已设置"布尔） */
   apiKeySet?: boolean;
+}
+export interface OrchestratorSettings {
   /** 内置主脑总开关（T14，默认关） */
   enabled?: boolean;
   wakeOn?: Record<string, boolean>;
+  /** 激活组 id；无组或悬空 → null（主脑未配置态） */
+  activeGroupId?: string | null;
+  groups?: OrchestratorGroup[];
+}
+/** GET /settings/orchestrator/models（60s 缓存，按 baseURL） */
+export interface OrchestratorModelsResult {
+  models: string[];
+  fetchedAt: number;
+  cached: boolean;
+}
+/** POST /settings/orchestrator/test（一键连通探测） */
+export interface OrchestratorTestResult {
+  ok: boolean;
+  status: number;
+  latencyMs: number;
+  error?: string;
 }
 /** Pi 运行时状态（T14：GET /settings/runtime） */
 export interface RuntimeStatus {

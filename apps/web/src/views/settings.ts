@@ -1,11 +1,36 @@
-// 设置页：用户名（显示名）+ 内置主脑设置（启用/模型/运行状态）+ Pi 运行时卡片
+// 设置页：用户名（显示名）+ 内置主脑设置（启用开关/运行状态）+ 模型组（多模型组）+ Pi 运行时卡片
 // 零令牌终态（2026-10-25 用户终裁）：浏览器不携带任何凭据，服务器把请求视为唯一用户——
 // 用户名只是聊天室里的显示名，不存在 token 的签发/保存/轮换。
-import { api, setCachedUserName, type OrchestratorSettings, type RuntimeStatus, type UserStatus } from '../api.ts';
+//
+// 主脑多模型组（2026-10-25）：主脑的模型通道（Base URL + API Key + 模型）按「组」管理——
+// 每组可独立刷新模型列表 / 测试连通 / 一键启用；启用组即主脑下一轮使用的通道。
+// 背景痛点：上游账号池瞬时 503 时，切到备用组立刻恢复（服务端经 settings.orchestrator_updated
+// 弃旧会话重建，见 brain.ts）。全局面板只管 enabled 开关；组数据走组接口（CRUD/active/models/test）。
+import {
+  api,
+  setCachedUserName,
+  type OrchestratorModelsResult,
+  type OrchestratorSettings,
+  type OrchestratorTestResult,
+  type RuntimeStatus,
+  type UserStatus,
+} from '../api.ts';
 import { esc, fmtTime } from '../ui.ts';
 import { icon } from '../icons.ts';
 
 let modelsTimer: ReturnType<typeof setInterval> | null = null; // 模型列表 60s 自动刷新（视图重渲染时清理）
+
+// 模型下拉的「自定义…」兜底：列表滞后/私货模型时手填（沿用旧单配置时代的模式）
+const CUSTOM_OPT = '__custom__';
+
+// 组卡的本地视图模型（apiKey 永不回显，只有 apiKeySet 布尔）
+interface GroupVm {
+  id: string;
+  name: string;
+  baseURL: string;
+  model?: string;
+  apiKeySet: boolean;
+}
 
 export async function render(el: HTMLElement): Promise<void> {
   el.innerHTML = `
@@ -24,29 +49,26 @@ export async function render(el: HTMLElement): Promise<void> {
     </div>
     <div class="panel">
       <h3>主脑设置（内置主脑，模式 B）</h3>
-      <p class="muted">内置主脑是服务器常驻的分派者：拆解建卡 / 分派 / 验收 / 汇报，绝不执行任务。启用前需先填好模型与 Base URL，否则即使开启也不会产生轮次。apiKey 加密存储，界面永不回显。保存授权：你的身份（user/orchestrator）即可。</p>
+      <p class="muted">内置主脑是服务器常驻的分派者：拆解建卡 / 分派 / 验收 / 汇报，绝不执行任务。模型通道（Base URL + API Key + 模型）在下方「模型组」按组管理，这里只管总开关。</p>
       <div class="grid-form">
         <div class="field"><label for="oc-enabled">启用主脑</label>
           <select id="oc-enabled"><option value="off">关闭（默认）</option><option value="on">启用</option></select>
         </div>
-        <div class="field"><label for="oc-provider">Provider</label><input id="oc-provider" placeholder="openai" /></div>
-        <div class="field"><label for="oc-baseurl">Base URL</label><input id="oc-baseurl" placeholder="https://api.openai.com/v1" /></div>
-        <div class="field"><label for="oc-model">模型</label>
-          <select id="oc-model" title="列表来自上游 /models 接口，每 60 秒自动刷新"></select>
-          <input id="oc-model-custom" placeholder="自定义模型名" style="display:none; margin-top:6px" />
-          <div class="inline-form" style="margin-top:6px">
-            <button id="oc-model-refresh" title="立即从上游重新拉取模型列表">刷新列表</button>
-            <button id="oc-model-test" title="向上游发一条极短的测试消息，确认当前选中模型真实可用">测试连通</button>
-            <span id="oc-model-hint" class="muted small"></span>
-          </div>
-        </div>
-        <div class="field"><label for="oc-key">API Key</label><input id="oc-key" type="password" placeholder="仅提交，不回显" /></div>
       </div>
       <div class="inline-form">
         <button class="primary" id="oc-save">保存</button>
+        <span id="oc-status" class="muted small">加载中…</span>
       </div>
-      <div id="oc-status" class="muted small">加载中…</div>
       <div id="oc-runtime-line" class="muted small" style="margin-top:8px"></div>
+    </div>
+    <div class="panel">
+      <h3>模型组</h3>
+      <p class="muted">主脑的模型通道按组管理：每组 = 名称 + Base URL + API Key（加密存储，界面永不回显）+ 模型。各组可独立刷新模型列表、测试连通、一键启用——上游账号池瞬时 503 时切到备用组，主脑下一轮即走新通道。</p>
+      <div id="oc-groups"></div>
+      <div class="inline-form">
+        <button class="primary" id="oc-group-add">＋ 添加模型组</button>
+        <span id="oc-groups-status" class="muted small"></span>
+      </div>
     </div>
     <div class="panel">
       <h3>Pi 运行时</h3>
@@ -88,121 +110,354 @@ export async function render(el: HTMLElement): Promise<void> {
     }
   });
 
-  // ---- 主脑设置：有身份即直接保存（服务器接受 user/orchestrator 身份）----
+  // ---- 主脑全局开关：保存只管 enabled（wakeOn 无界面字段，走同一接口透传）----
   const ocStatus = el.querySelector('#oc-status') as HTMLElement;
-  // 模型下拉：列表来自上游 /models（60s 缓存 + 页面停留期间每 60s 自动刷新），
-  // 「自定义…」兜底列表滞后/私货模型；「测试连通」一键探测选中模型此刻是否真能用
-  // （上游账号池瞬时耗尽时列表看着正常、实际 503，探测过才算数）。
-  const modelSelect = el.querySelector('#oc-model') as HTMLSelectElement;
-  const modelCustom = el.querySelector('#oc-model-custom') as HTMLInputElement;
-  const modelHint = el.querySelector('#oc-model-hint') as HTMLElement;
-  const CUSTOM_OPT = '__custom__';
-  let currentModel = '';
-  if (modelsTimer) clearInterval(modelsTimer); // 视图重渲染时清掉旧轮询
-  function selectedModel(): string {
-    return modelSelect.value === CUSTOM_OPT ? modelCustom.value.trim() : modelSelect.value;
+  const groupsStatus = el.querySelector('#oc-groups-status') as HTMLElement;
+  const groupsBox = el.querySelector('#oc-groups') as HTMLElement;
+  let brainEnabled = false;
+
+  // ---- 模型组：本地状态 + 事件委托（innerHTML 重渲染不重复绑监听）----
+  let groups: GroupVm[] = [];
+  let activeGroupId: string | null = null;
+  let editingId: string | null = null; // 内联编辑中的组（null = 无；显示下拉被编辑表单取代）
+  let creating = false; // 「＋ 添加模型组」的空白内联表单
+  const modelCache = new Map<string, { models: string[]; fetchedAt: number }>(); // groupId → 上游清单
+  const hints = new Map<string, string>(); // groupId → 模型区反馈（重渲染后保留）
+
+  const cssId = (id: string): string => id.replace(/[^a-zA-Z0-9_-]/g, ''); // 组 id 恒为 g+hex，无损
+
+  function setHint(id: string, html: string): void {
+    hints.set(id, html);
+    const span = groupsBox.querySelector(`[data-id="${cssId(id)}"] span[data-role="hint"]`) as HTMLElement | null;
+    if (span) span.innerHTML = html;
   }
-  function fillModelSelect(models: string[]): void {
-    const cur = currentModel || selectedModel();
-    const inList = models.includes(cur);
-    modelSelect.innerHTML = '';
-    for (const m of models) {
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = m;
-      modelSelect.appendChild(opt);
+
+  // 下拉选项：cur 未设且有清单 → 占位项；cur 不在清单 → 「（当前，未见于上游列表）」；末尾恒有自定义兜底
+  function modelOptionsHtml(models: string[], cur: string): string {
+    const opts: string[] = [];
+    if (!cur && models.length > 0) opts.push('<option value="">（未设置——选择或自定义）</option>');
+    for (const m of models) opts.push(`<option value="${esc(m)}"${m === cur ? ' selected' : ''}>${esc(m)}</option>`);
+    if (cur && !models.includes(cur)) {
+      opts.push(`<option value="${esc(cur)}" selected>${esc(cur)}（当前，未见于上游列表）</option>`);
     }
-    if (cur && !inList) {
-      const opt = document.createElement('option');
-      opt.value = cur;
-      opt.textContent = `${cur}（当前，未见于上游列表）`;
-      modelSelect.appendChild(opt);
-    }
-    const custom = document.createElement('option');
-    custom.value = CUSTOM_OPT;
-    custom.textContent = '自定义…';
-    modelSelect.appendChild(custom);
-    modelSelect.value = cur || (models[0] ?? CUSTOM_OPT);
-    modelCustom.style.display = modelSelect.value === CUSTOM_OPT ? '' : 'none';
-    if (modelSelect.value === CUSTOM_OPT) modelCustom.value = cur;
+    opts.push(`<option value="${CUSTOM_OPT}"${!cur && models.length === 0 ? ' selected' : ''}>自定义…</option>`);
+    return opts.join('');
   }
-  async function loadModels(silent = false): Promise<void> {
-    if (!silent) modelHint.textContent = '拉取模型列表…';
-    try {
-      const r = await api.get<{ models: string[]; fetchedAt: number; cached: boolean }>(
-        '/settings/orchestrator/models',
-      );
-      fillModelSelect(r.models);
-      modelHint.textContent = `共 ${r.models.length} 个模型 · 更新于 ${new Date(r.fetchedAt).toLocaleTimeString()}`;
-    } catch (err) {
-      if (!silent) modelHint.textContent = `列表拉取失败：${err instanceof Error ? err.message : ''}`;
-      if (modelSelect.options.length === 0) fillModelSelect([]);
+
+  function fillSelect(sel: HTMLSelectElement, custom: HTMLInputElement | null, models: string[], cur: string): void {
+    sel.innerHTML = modelOptionsHtml(models, cur);
+    if (custom) custom.style.display = sel.value === CUSTOM_OPT ? '' : 'none';
+  }
+
+  // 读取某容器内「下拉 + 自定义兜底」的最终模型值
+  function readModelField(card: HTMLElement, selRole: string, customRole: string): string {
+    const sel = card.querySelector(`select[data-role="${selRole}"]`) as HTMLSelectElement | null;
+    if (!sel) return '';
+    if (sel.value === CUSTOM_OPT) {
+      const custom = card.querySelector(`input[data-role="${customRole}"]`) as HTMLInputElement | null;
+      return custom?.value.trim() ?? '';
+    }
+    return sel.value;
+  }
+
+  // 用缓存清单回填某组的所有模型下拉（显示 + 编辑表单）；用户正选「自定义…」时不打断
+  function hydrateGroupSelects(id: string): void {
+    const card = groupsBox.querySelector(`[data-id="${cssId(id)}"]`);
+    const g = groups.find((x) => x.id === id);
+    if (!card || !g) return;
+    const models = modelCache.get(id)?.models ?? [];
+    for (const [selRole, customRole] of [['model', 'model-custom'], ['f-model', 'f-model-custom']] as const) {
+      const sel = card.querySelector(`select[data-role="${selRole}"]`) as HTMLSelectElement | null;
+      if (!sel || sel.value === CUSTOM_OPT) continue;
+      const custom = card.querySelector(`input[data-role="${customRole}"]`) as HTMLInputElement | null;
+      fillSelect(sel, custom, models, sel.value !== '' ? sel.value : (g.model ?? ''));
     }
   }
-  modelSelect.addEventListener('change', () => {
-    modelCustom.style.display = modelSelect.value === CUSTOM_OPT ? '' : 'none';
-    if (modelSelect.value === CUSTOM_OPT) modelCustom.focus();
-  });
-  (el.querySelector('#oc-model-refresh') as HTMLElement).addEventListener('click', () => void loadModels());
-  (el.querySelector('#oc-model-test') as HTMLElement).addEventListener('click', async () => {
-    const m = selectedModel();
-    if (!m) {
-      modelHint.textContent = '请先选择或填写模型';
+
+  // 编辑/新建内联表单（g=null 即新建空白表单；apiKey 仅提交不回显）
+  function groupFormHtml(g: GroupVm | null): string {
+    const models = g ? (modelCache.get(g.id)?.models ?? []) : [];
+    const cur = g?.model ?? '';
+    return `
+    <div class="oc-group-form grid-form" style="margin-top:14px">
+      <div class="field"><label>名称</label><input data-role="f-name" value="${g ? esc(g.name) : ''}" placeholder="如 主通道 / 备用池" /></div>
+      <div class="field"><label>Base URL</label><input data-role="f-baseurl" value="${g ? esc(g.baseURL) : ''}" placeholder="https://api.openai.com/v1" /></div>
+      <div class="field"><label>API Key</label><input data-role="f-key" type="password" autocomplete="new-password" placeholder="${g ? (g.apiKeySet ? '留空保留原 KEY' : '输入 API Key') : 'API Key（加密存储，仅提交不回显）'}" /></div>
+      <div class="field"><label>模型</label>
+        <select data-role="f-model" title="列表来自该组上游 /models 接口；列表缺失时选「自定义…」手填">${modelOptionsHtml(models, cur)}</select>
+        <input data-role="f-model-custom" placeholder="自定义模型名" style="display:none; margin-top:6px" />
+      </div>
+    </div>
+    <div class="inline-form">
+      <button class="primary" data-act="${g ? 'save-edit' : 'save-new'}">${g ? '保存修改' : '创建模型组'}</button>
+      <button data-act="cancel">取消</button>
+    </div>`;
+  }
+
+  function groupCardHtml(g: GroupVm): string {
+    const isActive = g.id === activeGroupId;
+    return `
+    <div class="oc-group${isActive ? ' oc-group-active' : ''}" data-id="${esc(g.id)}">
+      <div class="oc-group-head">
+        <div class="oc-group-title">
+          <b>${esc(g.name)}</b>${isActive ? '<span class="oc-active-badge">当前使用</span>' : ''}
+          <div class="muted small">${esc(g.baseURL)}${g.apiKeySet ? ' · KEY 已设置' : ' · <span class="warn">未设 KEY</span>'}</div>
+        </div>
+        <div class="oc-group-actions">
+          <button data-act="refresh" title="立即从上游重新拉取该组的模型列表">刷新列表</button>
+          <button data-act="test" title="向上游发一条极短的测试消息，确认选中模型此刻真实可用">测试连通</button>
+          ${isActive
+            ? '<button disabled title="正在使用该组">当前使用</button>'
+            : '<button data-act="activate" class="primary" title="切换主脑到此通道，下一轮生效">启用此组</button>'}
+          <button data-act="edit" title="修改名称 / Base URL / KEY / 模型">编辑</button>
+          <button data-act="del" class="danger" title="删除该组（当前使用的组需先切换）">删除</button>
+        </div>
+      </div>
+      ${editingId === g.id
+        ? groupFormHtml(g)
+        : `<div class="grid-form" style="margin-top:12px; margin-bottom:0">
+            <div class="field"><label>模型</label>
+              <select data-role="model" title="列表来自该组上游 /models 接口，每 60 秒静默刷新；改动即保存"></select>
+              <input data-role="model-custom" placeholder="自定义模型名" style="display:none; margin-top:6px" />
+              <div class="inline-form" style="margin-top:6px"><span data-role="hint" class="muted small">${hints.get(g.id) ?? '拉取模型列表…'}</span></div>
+            </div>
+          </div>`}
+    </div>`;
+  }
+
+  function renderGroups(): void {
+    const cards = groups.map(groupCardHtml).join('');
+    const newForm = creating
+      ? `<div class="oc-group" data-id="__new__">
+          <div class="oc-group-head"><div class="oc-group-title"><b>新模型组</b><div class="muted small">创建后即可刷新模型列表 / 测试连通 / 启用；空组态创建的第一组自动启用</div></div></div>
+          ${groupFormHtml(null)}
+        </div>`
+      : '';
+    groupsBox.innerHTML =
+      cards + newForm ||
+      '<p class="muted small">还没有模型组——添加第一组（名称 + Base URL + API KEY + 模型）后主脑才能开始轮次。</p>';
+    for (const g of groups) hydrateGroupSelects(g.id);
+  }
+
+  // 全局状态行：启用态与激活组配置是否齐全（与服务端 #turn 的启动条件一致）
+  function updateGlobalStatus(): void {
+    const active = groups.find((g) => g.id === activeGroupId);
+    if (!brainEnabled) {
+      ocStatus.textContent = `主脑关闭 · 模型组 ${groups.length} 个`;
       return;
     }
-    modelHint.textContent = `测试 ${m} 中…`;
+    if (!active) {
+      ocStatus.innerHTML = '<span class="warn">主脑已启用但没有任何模型组——添加并启用一组后主脑才会开始轮次。</span>';
+      return;
+    }
+    if (!active.model || !active.apiKeySet) {
+      const missing = [active.model ? '' : '模型', active.apiKeySet ? '' : 'API KEY'].filter(Boolean).join('和');
+      ocStatus.innerHTML = `<span class="warn">主脑已启用，当前通道「${esc(active.name)}」缺${missing}——补全后主脑才会开始轮次。</span>`;
+      return;
+    }
+    ocStatus.textContent = `运行中：通道「${active.name}」 · 模型 ${active.model}`;
+  }
+
+  async function reload(): Promise<void> {
     try {
-      const r = await api.post<{ ok: boolean; status: number; latencyMs: number; error?: string }>(
-        '/settings/orchestrator/test',
-        { model: m },
+      const s = await api.get<OrchestratorSettings>('/settings/orchestrator');
+      groups = (s.groups ?? []).map((g) => ({
+        id: g.id,
+        name: g.name,
+        baseURL: g.baseURL,
+        ...(g.model ? { model: g.model } : {}),
+        apiKeySet: !!g.apiKeySet,
+      }));
+      activeGroupId = s.activeGroupId ?? null;
+      brainEnabled = !!s.enabled;
+      (el.querySelector('#oc-enabled') as HTMLSelectElement).value = brainEnabled ? 'on' : 'off';
+      renderGroups();
+      updateGlobalStatus();
+      for (const g of groups) if (!modelCache.has(g.id)) void loadGroupModels(g);
+    } catch {
+      groupsStatus.innerHTML = '<span class="warn">模型组读取失败</span>';
+    }
+  }
+
+  // 按组拉取模型清单（60s 服务端缓存；成功后只回填下拉，不整卡重渲染——不打断编辑中的表单）
+  async function loadGroupModels(g: GroupVm, silent = true): Promise<void> {
+    setHint(g.id, silent ? '刷新模型列表…' : '拉取模型列表…');
+    try {
+      const r = await api.get<OrchestratorModelsResult>(
+        `/settings/orchestrator/models?group=${encodeURIComponent(g.id)}`,
       );
-      modelHint.innerHTML = r.ok
-        ? `<span class="ok">✓ ${esc(m)} 可用 · ${r.latencyMs}ms</span>`
-        : `<span class="warn">✗ ${esc(m)} 不可用（${r.status || '网络错误'}：${esc(r.error ?? '')}）</span>`;
+      modelCache.set(g.id, { models: r.models, fetchedAt: r.fetchedAt });
+      setHint(
+        g.id,
+        `共 ${r.models.length} 个模型 · 更新于 ${new Date(r.fetchedAt).toLocaleTimeString()}${r.cached ? '（缓存）' : ''}`,
+      );
+      hydrateGroupSelects(g.id);
     } catch (err) {
-      modelHint.innerHTML = `<span class="warn">测试失败：${esc(err instanceof Error ? err.message : '')}</span>`;
+      setHint(g.id, `列表拉取失败：${esc(err instanceof Error ? err.message : '')}`);
+      if (!modelCache.has(g.id)) hydrateGroupSelects(g.id); // 空清单 → 下拉只剩「自定义…」兜底
+    }
+  }
+
+  // 展示下拉改动即保存（激活组改模型 → 服务端 orchestrator_updated → 主脑重建会话走新模型）
+  async function saveGroupModel(id: string, card: HTMLElement): Promise<void> {
+    const g = groups.find((x) => x.id === id);
+    if (!g) return;
+    const m = readModelField(card, 'model', 'model-custom');
+    if (!m) return; // 占位项（未设置）不保存
+    try {
+      await api.put(`/settings/orchestrator/groups/${encodeURIComponent(id)}`, { model: m });
+      g.model = m;
+      setHint(id, `<span class="ok">模型已保存：${esc(m)}${id === activeGroupId ? '（当前通道，下一轮生效）' : ''}</span>`);
+      updateGlobalStatus();
+    } catch (err) {
+      setHint(id, `<span class="warn">模型保存失败：${esc(err instanceof Error ? err.message : '')}</span>`);
+    }
+  }
+
+  // 收集编辑/新建表单字段：apiKey 仅在非空时提交（服务端缺省 = 保留原 KEY）
+  function readFormFields(card: HTMLElement): { name?: string; baseURL?: string; apiKey?: string; model?: string } {
+    const val = (role: string): string =>
+      (card.querySelector(`input[data-role="${role}"]`) as HTMLInputElement | null)?.value.trim() ?? '';
+    const body: { name?: string; baseURL?: string; apiKey?: string; model?: string } = {
+      name: val('f-name') || undefined,
+      baseURL: val('f-baseurl') || undefined,
+      model: readModelField(card, 'f-model', 'f-model-custom') || undefined,
+    };
+    const key = val('f-key');
+    if (key) body.apiKey = key;
+    return body;
+  }
+
+  async function handleGroupAction(act: string, id: string, card: HTMLElement | null): Promise<void> {
+    const g = groups.find((x) => x.id === id);
+    const fail = (err: unknown): void => {
+      groupsStatus.innerHTML = `<span class="warn">操作失败：${esc(err instanceof Error ? err.message : '')}</span>`;
+    };
+    try {
+      switch (act) {
+        case 'refresh': {
+          if (g) await loadGroupModels(g, false);
+          return;
+        }
+        case 'test': {
+          if (!g || !card) return;
+          const m = readModelField(card, 'model', 'model-custom');
+          if (!m) {
+            setHint(g.id, '<span class="warn">请先选择或填写模型</span>');
+            return;
+          }
+          setHint(g.id, `测试 ${esc(m)} 中…`);
+          const r = await api.post<OrchestratorTestResult>('/settings/orchestrator/test', { groupId: g.id, model: m });
+          setHint(
+            g.id,
+            r.ok
+              ? `<span class="ok">✓ ${esc(m)} 可用 · ${r.latencyMs}ms</span>`
+              : `<span class="warn">✗ ${esc(m)} 不可用（${r.status || '网络错误'}：${esc(r.error ?? '')}）</span>`,
+          );
+          return;
+        }
+        case 'activate': {
+          if (!g) return;
+          await api.put('/settings/orchestrator/active', { groupId: g.id });
+          await reload();
+          groupsStatus.innerHTML = `<span class="ok">已切换到 ${esc(g.name)}，主脑下一轮使用新通道</span>`;
+          return;
+        }
+        case 'edit': {
+          creating = false;
+          editingId = editingId === id ? null : id;
+          renderGroups();
+          return;
+        }
+        case 'del': {
+          if (!g) return;
+          if (!confirm(`删除模型组「${g.name}」？该组配置不可恢复。`)) return;
+          await api.del(`/settings/orchestrator/groups/${encodeURIComponent(g.id)}`);
+          groupsStatus.innerHTML = `已删除「${esc(g.name)}」`;
+          await reload();
+          return;
+        }
+        case 'save-edit': {
+          if (!g || !card) return;
+          await api.put(`/settings/orchestrator/groups/${encodeURIComponent(g.id)}`, readFormFields(card));
+          editingId = null;
+          await reload();
+          groupsStatus.innerHTML = `<span class="ok">已保存「${esc(g.name)}」</span>`;
+          return;
+        }
+        case 'save-new': {
+          if (!card) return;
+          const body = readFormFields(card);
+          if (!body.name || !body.baseURL) {
+            groupsStatus.innerHTML = '<span class="warn">名称与 Base URL 必填</span>';
+            return;
+          }
+          await api.post('/settings/orchestrator/groups', body);
+          creating = false;
+          await reload();
+          groupsStatus.innerHTML = '<span class="ok">模型组已创建</span>';
+          return;
+        }
+        case 'cancel': {
+          editingId = null;
+          creating = false;
+          renderGroups();
+          return;
+        }
+      }
+    } catch (err) {
+      fail(err);
+    }
+  }
+
+  groupsBox.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
+    if (!btn || btn.disabled) return;
+    const card = btn.closest('[data-id]') as HTMLElement | null;
+    void handleGroupAction(btn.dataset.act ?? '', card?.dataset.id ?? '', card);
+  });
+
+  groupsBox.addEventListener('change', (e) => {
+    const sel = (e.target as HTMLElement).closest('select[data-role]') as HTMLSelectElement | null;
+    if (!sel) return;
+    const card = sel.closest('[data-id]') as HTMLElement | null;
+    if (!card) return;
+    const customRole = sel.dataset.role === 'model' ? 'model-custom' : 'f-model-custom';
+    const custom = card.querySelector(`input[data-role="${customRole}"]`) as HTMLInputElement | null;
+    if (custom) {
+      custom.style.display = sel.value === CUSTOM_OPT ? '' : 'none';
+      if (sel.value === CUSTOM_OPT) custom.focus();
+    }
+    // 展示下拉（非编辑态）改动即保存；编辑表单的下拉只改表单值，保存时统一提交
+    if (sel.dataset.role === 'model' && card.dataset.id && card.dataset.id !== '__new__') {
+      void saveGroupModel(card.dataset.id, card);
     }
   });
-  try {
-    const s = await api.get<OrchestratorSettings>('/settings/orchestrator');
-    (el.querySelector('#oc-enabled') as HTMLSelectElement).value = s.enabled ? 'on' : 'off';
-    (el.querySelector('#oc-provider') as HTMLInputElement).value = s.provider ?? '';
-    (el.querySelector('#oc-baseurl') as HTMLInputElement).value = s.baseURL ?? '';
-    currentModel = s.model ?? '';
-    void loadModels();
-    modelsTimer = setInterval(() => void loadModels(true), 60_000);
-    const cfgOk = !s.enabled || (s.baseURL && s.model);
-    ocStatus.textContent = s.apiKeySet
-      ? `已保存：enabled=${s.enabled ? '开' : '关'} model=${s.model ?? '—'} apiKey=已设置（加密）`
-      : `已保存：enabled=${s.enabled ? '开' : '关'} model=${s.model ?? '—'}（未设 apiKey）`;
-    if (s.enabled && !cfgOk) {
-      ocStatus.innerHTML = '<span class="warn">主脑已启用但模型/Base URL 未配置——补全后主脑才会开始轮次。</span>';
-    }
-  } catch {
-    ocStatus.textContent = '读取失败';
-  }
+
+  (el.querySelector('#oc-group-add') as HTMLElement).addEventListener('click', () => {
+    editingId = null;
+    creating = true;
+    renderGroups();
+    (groupsBox.querySelector('[data-id="__new__"] input[data-role="f-name"]') as HTMLInputElement | null)?.focus();
+  });
+
   (el.querySelector('#oc-save') as HTMLElement).addEventListener('click', async () => {
-    const body: Record<string, unknown> = {
-      enabled: (el.querySelector('#oc-enabled') as HTMLSelectElement).value === 'on',
-    };
-    const provider = (el.querySelector('#oc-provider') as HTMLInputElement).value.trim();
-    const baseURL = (el.querySelector('#oc-baseurl') as HTMLInputElement).value.trim();
-    const model = selectedModel();
-    const key = (el.querySelector('#oc-key') as HTMLInputElement).value.trim();
-    if (provider) body.provider = provider;
-    if (baseURL) body.baseURL = baseURL;
-    if (model) body.model = model;
-    if (key) body.apiKey = key;
+    const enabled = (el.querySelector('#oc-enabled') as HTMLSelectElement).value === 'on';
     try {
-      const s = await api.put<OrchestratorSettings>('/settings/orchestrator', body);
-      ocStatus.textContent = s.enabled
-        ? `已保存并启用：model=${s.model ?? '—'}${s.apiKeySet ? '，apiKey=已设置' : ''}`
-        : '已保存（主脑关闭）';
-      refreshBrainRuntimeLine();
+      await api.put<OrchestratorSettings>('/settings/orchestrator', { enabled });
+      brainEnabled = enabled;
+      updateGlobalStatus();
     } catch (err) {
       ocStatus.textContent = `保存失败：${err instanceof Error ? err.message : ''}`;
     }
   });
+
+  // 初始加载 + 60s 静默刷新各组模型清单（视图重渲染时清掉旧轮询）
+  if (modelsTimer) clearInterval(modelsTimer);
+  await reload();
+  modelsTimer = setInterval(() => {
+    for (const g of groups) void loadGroupModels(g, true);
+  }, 60_000);
 
   // ---- 主脑运行状态行：从事件台账尾部取最新 brain.* ----
   const runtimeLine = el.querySelector('#oc-runtime-line') as HTMLElement;
@@ -221,7 +476,9 @@ export async function render(el: HTMLElement): Promise<void> {
           ? `上轮耗时 ${Math.round(Number(latest.payload.turnMs ?? 0) / 1000)}s`
           : latest.type === 'brain.error' || latest.type === 'brain.turn_timeout'
             ? String(latest.payload.reason ?? '')
-            : '';
+            : latest.type === 'brain.turn_started' && typeof latest.payload.groupName === 'string'
+              ? `通道「${latest.payload.groupName}」`
+              : '';
       runtimeLine.textContent = `主脑运行状态：${latest.type}${detail ? `（${detail}）` : ''} · ${fmtTime(latest.time_created)}`;
     } catch {
       runtimeLine.textContent = '主脑运行状态：读取失败';

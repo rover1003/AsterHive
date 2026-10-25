@@ -40,7 +40,7 @@ import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { withWrite, logEvent } from './write.ts';
 import { ensureBrainAgent, BRAIN_AGENT_ID, type Agent } from './agents.ts';
-import { getOrchestratorSettings, decryptApiKey, type OrchestratorSettings } from './settings.ts';
+import { getOrchestratorSettings, activeGroup, type ActiveOrchestratorGroup } from './settings.ts';
 import { messageInner } from './messages.ts';
 import { TOOL_DEFS, type ToolDef } from './orchestrator-tools.ts';
 import { listBoards, listTasks, LANES } from './tasks.ts';
@@ -437,6 +437,14 @@ export class Brain {
       const s = getOrchestratorSettings(this.#ctx);
       if (s.enabled && !this.#active) this.#activate();
       else if (!s.enabled && this.#active) this.#deactivate('settings: enabled=false');
+      // 配置变更（换模型/URL/KEY）必须丢弃现有会话：Pi 会话创建时绑定 provider/model，
+      // 不重建的话切了设置旧会话仍走旧通道（曾致用户切模型后仍 503）。
+      // 多模型组切换（PUT /settings/orchestrator/active 必发本事件）同样在此闭环：
+      // 旧会话被弃、下一轮用激活组重建——换通道即刻生效，无需重启。
+      else if (s.enabled) {
+        this.#disposeSession();
+        this.#markDirty(); // 尽快用新配置开一轮，验证新通道
+      }
       return;
     }
     if (!this.#active) return;
@@ -514,8 +522,11 @@ export class Brain {
   async #turn(): Promise<void> {
     const s = getOrchestratorSettings(this.#ctx);
     if (!s.enabled || this.#running) return;
-    if (!s.model || !s.baseURL) {
-      this.#reasons = []; // 未配置模型/端点：主脑不启动轮次（设置页明示），唤醒原因丢弃
+    // 多模型组：轮次通道一律取激活组（activeGroup）。无激活组，或组缺 baseURL/model/apiKey
+    // 任一项 → 沿用"未配置"语义：主脑不启动轮次（设置页明示），唤醒原因丢弃
+    const g = activeGroup(this.#ctx);
+    if (!g || !g.baseURL || !g.model || !g.apiKey) {
+      this.#reasons = [];
       return;
     }
     this.#running = true;
@@ -526,11 +537,12 @@ export class Brain {
     const streamBoardId = this.#streamBoardId;
     this.#streamBoardId = null;
     withWrite(this.#ctx, 'brain.turnStart', () => {
-      logEvent(this.#ctx, 'brain.turn_started', { reasons });
+      // groupName/groupId：排查"这次轮次用的哪条通道"（多模型组切换后对账用）
+      logEvent(this.#ctx, 'brain.turn_started', { reasons, groupId: g.id, groupName: g.name });
     });
     try {
       const agent = ensureBrainAgent(this.#ctx);
-      const session = await this.#ensureSession(s);
+      const session = await this.#ensureSession(g);
       const reasonLines = reasons.length > 0 ? reasons.map((r) => `- ${r}`) : ['- （无未处理唤醒，按快照巡检）'];
       const prompt = [
         '【本轮唤醒】',
@@ -669,14 +681,16 @@ export class Brain {
   }
 
   /**
-   * 取主脑会话（指纹相同则复用常驻会话；模型/端点/运行时变更即重建）。
+   * 取主脑会话（指纹相同则复用常驻会话；模型/端点/KEY/运行时变更即重建）。
    * 会话持久化：<dataDir>/brain-session/sessions（SessionManager JSONL 树），
    * 服务器重启后用 continueRecent 续接最近会话——上下文不丢。
+   * 多模型组：入参即本轮激活组（activeGroup 已解密 KEY）；组切换经
+   * settings.orchestrator_updated → #onEvent → #disposeSession 到达这里时指纹必变。
    */
-  async #ensureSession(s: OrchestratorSettings): Promise<AgentSession> {
+  async #ensureSession(g: ActiveOrchestratorGroup): Promise<AgentSession> {
     const rt = this.#runtime.ensureRuntimeEntry(); // 数据卷优先，回落仓库基线；包不完整直接报错
-    // 指纹含 apiKey（解密值本就在内存中的 provider 配置里）：仅换 key 也能触发会话重建
-    const key = JSON.stringify([rt.entryUrl, s.baseURL, s.model, decryptApiKey(this.#ctx)]);
+    // 指纹含解密后的 apiKey：仅换 KEY/换组也能触发会话重建
+    const key = JSON.stringify([rt.entryUrl, g.baseURL, g.model, g.apiKey]);
     if (this.#session && key === this.#sessionKey) return this.#session;
     this.#disposeSession();
 
@@ -687,7 +701,7 @@ export class Brain {
     const agentDir = join(brainDir, 'agent'); // 专用 agentDir：与用户 ~/.pi 完全隔离
     for (const d of [workspace, sessionsDir, agentDir, this.#runtime.skillsDir]) mkdirSync(d, { recursive: true });
 
-    // 自定义 OpenAI 兼容 provider：baseURL/model 来自 settings，apiKey 现场解密（不落盘）
+    // 自定义 OpenAI 兼容 provider：baseURL/model/apiKey 来自激活组（明文仅内存，不落盘）
     const modelRuntime = await pi.ModelRuntime.create({
       authPath: join(agentDir, 'auth.json'),
       modelsPath: null, // 不读任何 models.json，避免读到用户环境配置
@@ -695,14 +709,14 @@ export class Brain {
     });
     modelRuntime.registerProvider('asterhive-brain', {
       name: 'AsterHive 主脑',
-      baseUrl: s.baseURL!,
-      apiKey: decryptApiKey(this.#ctx) ?? 'asterhive-unset',
+      baseUrl: g.baseURL,
+      apiKey: g.apiKey ?? 'asterhive-unset', // #turn 已保证非空，兜底仅为类型收窄
       api: 'openai-completions',
       models: [
         {
           type: 'chat',
-          id: s.model!,
-          name: s.model!,
+          id: g.model!,
+          name: g.model!,
           reasoning: false,
           input: ['text'],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -711,8 +725,8 @@ export class Brain {
         },
       ],
     });
-    const model = modelRuntime.getModel('asterhive-brain', s.model!);
-    if (!model) throw new Error(`provider 注册后未找到模型 asterhive-brain/${s.model}`);
+    const model = modelRuntime.getModel('asterhive-brain', g.model!);
+    if (!model) throw new Error(`provider 注册后未找到模型 asterhive-brain/${g.model}`);
 
     // 主脑身份：工具执行的 actor（幂等；激活时已注册，此处兜底）
     const agent = ensureBrainAgent(this.#ctx);

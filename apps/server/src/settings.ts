@@ -3,7 +3,17 @@ import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { withWrite, logEvent } from './write.ts';
 
-// 主脑模型配置（§7 settings）：apiKey 加密存储（AES-256-GCM）。
+// 主脑模型配置（§7 settings）：多模型组（2026-10-25「主脑多模型组」升级）。
+//
+// 存储形状（settings 表键 orchestrator，JSON）：
+//   {
+//     groups: [{ id, name, baseURL, model?, apiKeyCipher? }],  // 每组独立 apiKey 密文（AES-256-GCM）
+//     activeGroupId: string,   // 激活组；组被删空时允许悬空（主脑未配置态）
+//     enabled: boolean,        // 主脑总开关（组无关）
+//     wakeOn?: { userMessage?/taskSubmitted?/blockedReport?/scheduleDigest? }
+//   }
+// 旧单配置形状（顶层 provider/baseURL/apiKeyCipher/model）由 loadOrchestrator 读到时
+// 一次性迁移为 groups[0]（id 'default'，name = provider || '默认组'），事件 settings.groups_migrated。
 //
 // 加密密钥语义（2026-10-25 单用户模型升级，修遗留耦合）：
 // 1. settings 表键 enc_secret 是工作密钥：首次需要加解密时随机生成 32 字节 hex 落库
@@ -14,16 +24,67 @@ import { withWrite, logEvent } from './write.ts';
 //    则以新 enc_secret 重加密回写，一次性完成迁移（事件 settings.apiKey_migrated）；
 //    解不开（env 已轮换，或旧密文本就派生自已删除的管理令牌）则置空 apiKeyCipher 并记
 //    事件 settings.apiKey_reset——UI 显示 apiKey 未设置，提示重填。尽力而为，不阻塞。
+//    注意：旧密文可能在顶层（groups 迁移尚未发生）或已随组迁移进 groups[0]——两处都找，
+//    并原位重加密/置空，保证 env 密钥迁移不因 groups 迁移先发生而失效。
 // 3. env 从未设置过的部署不可能有旧密文（旧逻辑无密钥即拒绝保存 apiKey），无需迁移。
-export interface OrchestratorSettings {
+
+export interface OrchestratorWakeOn {
+  userMessage?: boolean;
+  taskSubmitted?: boolean;
+  blockedReport?: boolean;
+  scheduleDigest?: boolean;
+}
+
+// 单个模型组（存储形态，含密文；密文永不离开服务端）
+export interface OrchestratorGroup {
+  id: string;
+  name: string;
+  baseURL: string;
+  model?: string;
+  apiKeyCipher?: string;
+}
+
+interface StoredOrchestrator {
+  groups?: OrchestratorGroup[];
+  activeGroupId?: string;
+  enabled?: boolean;
+  wakeOn?: OrchestratorWakeOn;
+  // 旧单配置残留字段（迁移后不存在于存储）：provider / baseURL / model / apiKeyCipher
+}
+
+// 旧单配置形状（迁移输入）：顶层 provider/baseURL/model/apiKeyCipher
+type LegacyOrchestrator = StoredOrchestrator & {
   provider?: string;
   baseURL?: string;
   model?: string;
-  apiKey?: string; // 写入加密；读取仅回掩码
-  // T14：内置主脑总开关。默认 false（getOrchestratorSettings 对未存值兜底）。
-  enabled?: boolean;
-  // 唤醒过滤（T14 语义）：未设置视为 true；显式 false 关闭对应唤醒源。
-  wakeOn?: { userMessage?: boolean; taskSubmitted?: boolean; blockedReport?: boolean; scheduleDigest?: boolean };
+  apiKeyCipher?: string;
+};
+
+// 读侧投影（永不含密文/明文；HTTP GET 的输出形态）
+export interface OrchestratorGroupView {
+  id: string;
+  name: string;
+  baseURL: string;
+  model?: string;
+  apiKeySet: boolean;
+}
+
+export interface OrchestratorSettingsView {
+  enabled: boolean;
+  wakeOn?: OrchestratorWakeOn;
+  activeGroupId: string | null; // 悬空（无组或指向已删组）→ null：主脑未配置态
+  groups: OrchestratorGroupView[];
+}
+
+// 运行时消费形态（brain / models / test）：含解密后 apiKey 明文——仅内存传递，永不落库/回显
+export interface ActiveOrchestratorGroup {
+  id: string;
+  name: string;
+  baseURL: string;
+  model?: string;
+  apiKey: string | null; // 未设置或解不开 → null（主脑不启动轮次）
+  apiKeySet: boolean;    // 密文在场（与解密是否成功无关，供 UI 展示）
+  enabled: boolean;      // 主脑总开关随组一起给出，调用方少读一次
 }
 
 const ENC_SECRET_KEY = 'enc_secret';
@@ -74,6 +135,57 @@ function readOrchestratorRow(ctx: Ctx): Record<string, unknown> | null {
   return row ? (JSON.parse(row.value) as Record<string, unknown>) : null;
 }
 
+function projectGroup(g: OrchestratorGroup): OrchestratorGroupView {
+  return {
+    id: g.id,
+    name: g.name,
+    baseURL: g.baseURL,
+    ...(g.model !== undefined ? { model: g.model } : {}),
+    apiKeySet: !!g.apiKeyCipher,
+  };
+}
+
+// 旧单配置是否携带可迁移的模型配置（仅 {enabled} 的行没有可入组的字段，不迁）
+function hasLegacyConfig(stored: LegacyOrchestrator): boolean {
+  return (
+    stored.provider !== undefined ||
+    stored.baseURL !== undefined ||
+    stored.model !== undefined ||
+    stored.apiKeyCipher !== undefined
+  );
+}
+
+// 统一读取入口：旧单配置形状 → 一次性迁移为 groups[0]（id 'default'，name = provider || '默认组'）。
+// 写回前判断 groups 字段不存在才迁（一次性）；仅 {enabled} 等无模型字段的行不迁（没有可入组内容）。
+// 迁移在 withWrite 内落库并记事件 settings.groups_migrated。注意：本函数可能在无事务的读路径
+// 触发写（与 resolveSecret 同款语义），所有调用点都必须不在 withWrite 事务内。
+function loadOrchestrator(ctx: Ctx): StoredOrchestrator {
+  const stored = readOrchestratorRow(ctx) as LegacyOrchestrator | null;
+  if (!stored) return {};
+  if (!Array.isArray(stored.groups) && hasLegacyConfig(stored)) {
+    const legacy = stored;
+    const group: OrchestratorGroup = {
+      id: 'default',
+      name: legacy.provider?.trim() || '默认组',
+      baseURL: legacy.baseURL ?? '',
+      ...(legacy.model !== undefined ? { model: legacy.model } : {}),
+      ...(legacy.apiKeyCipher ? { apiKeyCipher: legacy.apiKeyCipher } : {}),
+    };
+    const migrated: StoredOrchestrator = {
+      groups: [group],
+      activeGroupId: 'default',
+      ...(legacy.enabled !== undefined ? { enabled: legacy.enabled } : {}),
+      ...(legacy.wakeOn ? { wakeOn: legacy.wakeOn } : {}),
+    };
+    withWrite(ctx, 'settings.groups_migrate', () => {
+      upsertSetting(ctx, 'orchestrator', JSON.stringify(migrated));
+      logEvent(ctx, 'settings.groups_migrated', { groupId: group.id, name: group.name });
+    });
+    return migrated;
+  }
+  return stored;
+}
+
 // 解析当前加密密钥；enc_secret 不存在则建立，并尽力迁移旧 env 密文（语义见文件头注释）。
 // 只在"真的要加解密"时调用（保存 apiKey / 运行时解密），读侧投影不触发。
 function resolveSecret(ctx: Ctx): string {
@@ -81,23 +193,47 @@ function resolveSecret(ctx: Ctx): string {
   if (existing) return existing;
 
   const env = process.env.ASTERHIVE_SECRET ?? null;
-  const legacyCipher = (readOrchestratorRow(ctx) as { apiKeyCipher?: string } | null)?.apiKeyCipher ?? null;
+  // 旧密文位置：顶层（groups 迁移前）或组内（迁移后）——两处都找，env 密钥迁移不因组迁移先发生而失效
+  const row = readOrchestratorRow(ctx) as LegacyOrchestrator | null;
+  const topCipher =
+    typeof row?.apiKeyCipher === 'string' && row.apiKeyCipher ? row.apiKeyCipher : null;
+  const groupWithCipher =
+    row?.groups?.find((g) => typeof g.apiKeyCipher === 'string' && g.apiKeyCipher) ?? null;
+  const legacyCipher = topCipher ?? groupWithCipher?.apiKeyCipher ?? null;
   const fresh = randomBytes(32).toString('hex');
 
   withWrite(ctx, 'settings.encSecret', () => {
     if (readSetting(ctx, ENC_SECRET_KEY)) return; // 并发双检：第一个写入者获胜
     if (legacyCipher && env) {
       const plain = decrypt(legacyCipher, env);
-      const stored = readOrchestratorRow(ctx) ?? {};
+      const stored = (readOrchestratorRow(ctx) as LegacyOrchestrator | null) ?? {};
       if (plain !== null) {
-        // 旧密文可解：以 enc_secret 重加密回写，一次性完成密钥迁移
-        upsertSetting(ctx, 'orchestrator', JSON.stringify({ ...stored, apiKeyCipher: encrypt(plain, fresh) }));
+        // 旧密文可解：原位重加密回写（顶层留顶层、组内写回组内），一次性完成密钥迁移
+        const next: LegacyOrchestrator = topCipher
+          ? { ...stored, apiKeyCipher: encrypt(plain, fresh) }
+          : {
+              ...stored,
+              groups: (stored.groups ?? []).map((g) =>
+                g.id === groupWithCipher!.id ? { ...g, apiKeyCipher: encrypt(plain, fresh) } : g,
+              ),
+            };
+        upsertSetting(ctx, 'orchestrator', JSON.stringify(next));
         logEvent(ctx, 'settings.apiKey_migrated', {});
       } else {
-        // 解不开：apiKey 置空（UI 提示重填），不让坏密文挡路
-        const { apiKeyCipher: _drop, ...rest } = stored as { apiKeyCipher?: string };
-        void _drop;
-        upsertSetting(ctx, 'orchestrator', JSON.stringify(rest));
+        // 解不开：原位置空（UI 提示重填），不让坏密文挡路
+        const next: LegacyOrchestrator = topCipher
+          ? (() => {
+              const { apiKeyCipher: _drop, ...rest } = stored;
+              void _drop;
+              return rest;
+            })()
+          : {
+              ...stored,
+              groups: (stored.groups ?? []).map((g) =>
+                g.id === groupWithCipher!.id ? { ...g, apiKeyCipher: undefined } : g,
+              ),
+            };
+        upsertSetting(ctx, 'orchestrator', JSON.stringify(next));
         logEvent(ctx, 'settings.apiKey_reset', {});
       }
     }
@@ -106,49 +242,218 @@ function resolveSecret(ctx: Ctx): string {
   return readSetting(ctx, ENC_SECRET_KEY)!;
 }
 
-export function getOrchestratorSettings(ctx: Ctx): OrchestratorSettings & { apiKeySet: boolean } {
-  const stored = readOrchestratorRow(ctx);
-  if (!stored) return { enabled: false, apiKeySet: false };
-  const { apiKeyCipher, ...rest } = stored as { apiKeyCipher?: string } & OrchestratorSettings;
-  void apiKeyCipher;
+// ---- 读侧投影（GET /settings/orchestrator；brain 的 enabled/wakeOn 也从这里读）----
+
+export function getOrchestratorSettings(ctx: Ctx): OrchestratorSettingsView {
+  const st = loadOrchestrator(ctx);
+  const groups = st.groups ?? [];
+  const active = groups.find((g) => g.id === st.activeGroupId);
   return {
-    enabled: (rest as OrchestratorSettings).enabled ?? false, // 未存过开关 → 默认关
-    ...(rest as OrchestratorSettings),
-    apiKeySet: !!stored.apiKeyCipher,
+    enabled: st.enabled ?? false, // 未存过开关 → 默认关
+    ...(st.wakeOn ? { wakeOn: st.wakeOn } : {}),
+    activeGroupId: active ? active.id : null,
+    groups: groups.map(projectGroup),
   };
 }
+
+// 激活组（运行时消费入口）：brain 与 models/test 接口一律从这里取通道配置，
+// 替代散落的顶层字段读取。无组或 activeGroupId 悬空 → null（主脑未配置态）。
+export function activeGroup(ctx: Ctx): ActiveOrchestratorGroup | null {
+  const st = loadOrchestrator(ctx);
+  const g = st.groups?.find((x) => x.id === st.activeGroupId);
+  if (!g) return null;
+  return {
+    id: g.id,
+    name: g.name,
+    baseURL: g.baseURL,
+    ...(g.model !== undefined ? { model: g.model } : {}),
+    apiKeySet: !!g.apiKeyCipher,
+    apiKey: g.apiKeyCipher ? decryptGroupApiKey(ctx, g.id) : null,
+    enabled: st.enabled ?? false,
+  };
+}
+
+// 运行时解密指定组的 apiKey（groupId 缺省 = 激活组）。返回前可能触发 enc_secret 建立/
+// 旧 env 密文迁移：迁移判定不可解时密文已被置空（settings.apiKey_reset），重读后按未设置处理。
+export function decryptGroupApiKey(ctx: Ctx, groupId?: string): string | null {
+  const st = loadOrchestrator(ctx);
+  const gid = groupId ?? st.activeGroupId;
+  const g = st.groups?.find((x) => x.id === gid);
+  if (!g?.apiKeyCipher) return null;
+  const secret = resolveSecret(ctx);
+  // resolveSecret 可能原位重加密/置空旧密文：重读后再解
+  const after = loadOrchestrator(ctx);
+  const g2 = after.groups?.find((x) => x.id === g.id);
+  if (!g2?.apiKeyCipher) return null;
+  return decrypt(g2.apiKeyCipher, secret);
+}
+
+// ---- 全局开关（PUT /settings/orchestrator 只管 enabled/wakeOn；模型组字段一律走组接口）----
 
 // 授权由 HTTP 层 requireElevated 闸门负责（user/orchestrator 角色可写），这里只管落库。
 export function putOrchestratorSettings(
   ctx: Ctx,
-  input: OrchestratorSettings,
-): OrchestratorSettings & { apiKeySet: boolean } {
-  const stored = readOrchestratorRow(ctx) ?? {};
-  // 局部更新语义：HTTP 层会对所有键显式传 undefined，这里必须先剔除，
+  input: { enabled?: boolean; wakeOn?: OrchestratorWakeOn },
+): OrchestratorSettingsView {
+  const stored = loadOrchestrator(ctx);
+  // 局部更新语义：HTTP 层会对未传键显式传 undefined，这里必须先剔除，
   // 否则 {...stored, ...input} 会把存量字段覆盖成 undefined 再被 JSON.stringify 丢弃
-  // （曾致只改 model 的 PUT 把 enabled/provider/baseURL 全部清掉）
+  // （曾致只改 model 的 PUT 把 enabled/baseURL 全部清掉）
   const clean = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
+  if (Object.keys(clean).length === 0) return getOrchestratorSettings(ctx); // 空更新不落库不发事件（避免惊动主脑重建会话）
   const next: Record<string, unknown> = { ...stored, ...clean };
-  const apiKey = clean.apiKey as string | undefined;
-  if (apiKey !== undefined) {
-    if (apiKey === '') {
-      delete next.apiKeyCipher;
-    } else {
-      // 首次保存即建立 enc_secret（此后与 env 解耦）
-      next.apiKeyCipher = encrypt(apiKey, resolveSecret(ctx));
-    }
-  }
-  delete next.apiKey;
   withWrite(ctx, 'settings.put', () => {
-    ctx.holder.db
-      .prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
-      .run('orchestrator', JSON.stringify(next), Date.now());
+    upsertSetting(ctx, 'orchestrator', JSON.stringify(next));
     logEvent(ctx, 'settings.orchestrator_updated', { fields: Object.keys(clean) });
   });
   return getOrchestratorSettings(ctx);
 }
 
-// ---- 主脑模型清单与连通测试（设置页下拉/检测按钮的数据源）----
+// ---- 模型组 CRUD（每组独立 name/baseURL/apiKey/model）----
+
+function newGroupId(existing: OrchestratorGroup[]): string {
+  for (;;) {
+    const id = `g${randomBytes(4).toString('hex')}`; // 随机短码，撞码重试
+    if (!existing.some((g) => g.id === id)) return id;
+  }
+}
+
+// 创建模型组。groups 为空（主脑未配置态）时自动激活为首组，避免 activeGroupId 悬空多一次点击；
+// 自动激活即主脑可用配置变化 → 必发 settings.orchestrator_updated（brain 侧 disposeSession 闭环）。
+export function createOrchestratorGroup(
+  ctx: Ctx,
+  input: { name?: string; baseURL?: string; apiKey?: string; model?: string },
+): OrchestratorGroupView {
+  const name = input.name?.trim();
+  const baseURL = input.baseURL?.trim();
+  if (!name) throw new HttpError(422, '模型组名称必填');
+  if (!baseURL) throw new HttpError(422, 'Base URL 必填');
+  const st = loadOrchestrator(ctx);
+  const groups = st.groups ?? [];
+  const group: OrchestratorGroup = { id: newGroupId(groups), name, baseURL };
+  const model = input.model?.trim();
+  if (model) group.model = model;
+  if (input.apiKey) group.apiKeyCipher = encrypt(input.apiKey, resolveSecret(ctx)); // 首个 KEY 即建立 enc_secret
+  const autoActivate = groups.length === 0;
+  const next: StoredOrchestrator = {
+    ...st,
+    groups: [...groups, group],
+    ...(autoActivate ? { activeGroupId: group.id } : {}),
+  };
+  withWrite(ctx, 'settings.groupCreate', () => {
+    upsertSetting(ctx, 'orchestrator', JSON.stringify(next));
+    logEvent(
+      ctx,
+      autoActivate ? 'settings.orchestrator_updated' : 'settings.group_created',
+      autoActivate
+        ? { groupId: group.id, fields: ['groups', 'activeGroupId'] }
+        : { groupId: group.id },
+    );
+  });
+  return projectGroup(group);
+}
+
+// 局部更新（undefined 键不覆盖——沿用修过的坑；apiKey 缺省/空串 = 保留原 KEY，UI 永不回显）。
+// 仅激活组被改才影响主脑运行配置 → 必发 settings.orchestrator_updated 触发既有 disposeSession
+// 闭环；非激活组改动不影响任何轮次，只记审计事件。
+export function updateOrchestratorGroup(
+  ctx: Ctx,
+  id: string,
+  input: { name?: string; baseURL?: string; apiKey?: string; model?: string },
+): OrchestratorGroupView {
+  const st = loadOrchestrator(ctx);
+  const groups = st.groups ?? [];
+  const idx = groups.findIndex((g) => g.id === id);
+  if (idx < 0) throw new HttpError(404, `模型组不存在: ${id}`);
+  const g: OrchestratorGroup = { ...groups[idx] };
+  const changed: string[] = [];
+  if (input.name !== undefined) {
+    const v = input.name.trim();
+    if (!v) throw new HttpError(422, '模型组名称不能为空');
+    if (v !== g.name) {
+      g.name = v;
+      changed.push('name');
+    }
+  }
+  if (input.baseURL !== undefined) {
+    const v = input.baseURL.trim();
+    if (!v) throw new HttpError(422, 'Base URL 不能为空');
+    if (v !== g.baseURL) {
+      g.baseURL = v;
+      changed.push('baseURL');
+    }
+  }
+  if (input.model !== undefined) {
+    const v = input.model.trim();
+    if (v) {
+      if (v !== g.model) {
+        g.model = v;
+        changed.push('model');
+      }
+    } else if (g.model !== undefined) {
+      delete g.model; // 显式空串 = 清除模型
+      changed.push('model');
+    }
+  }
+  if (input.apiKey) {
+    g.apiKeyCipher = encrypt(input.apiKey, resolveSecret(ctx));
+    changed.push('apiKey');
+  }
+  if (changed.length === 0) return projectGroup(groups[idx]); // 无实际变化：不动库不发事件
+  const nextGroups = [...groups];
+  nextGroups[idx] = g;
+  withWrite(ctx, 'settings.groupUpdate', () => {
+    upsertSetting(ctx, 'orchestrator', JSON.stringify({ ...st, groups: nextGroups }));
+    if (st.activeGroupId === id) {
+      logEvent(ctx, 'settings.orchestrator_updated', { fields: changed, groupId: id });
+    } else {
+      logEvent(ctx, 'settings.group_updated', { fields: changed, groupId: id });
+    }
+  });
+  return projectGroup(g);
+}
+
+// 删除模型组：还有其他组时激活组 422（先启用其他组）；删的是最后一组则允许——
+// 删空 = 主脑未配置态（否则"清空重配"在 API 层无路可走）。
+export function deleteOrchestratorGroup(ctx: Ctx, id: string): void {
+  const st = loadOrchestrator(ctx);
+  const groups = st.groups ?? [];
+  if (!groups.some((g) => g.id === id)) throw new HttpError(404, `模型组不存在: ${id}`);
+  const wasActive = st.activeGroupId === id;
+  if (wasActive && groups.length > 1) {
+    throw new HttpError(422, '不能删除当前使用的模型组——请先启用其他组');
+  }
+  withWrite(ctx, 'settings.groupDelete', () => {
+    upsertSetting(
+      ctx,
+      'orchestrator',
+      JSON.stringify({ ...st, groups: groups.filter((g) => g.id !== id) }),
+    );
+    if (wasActive) {
+      // 删的是激活组（最后一组）：主脑可用配置变化 → 必发 orchestrator_updated（disposeSession 闭环）
+      logEvent(ctx, 'settings.orchestrator_updated', { fields: ['groups'], groupId: id });
+    } else {
+      logEvent(ctx, 'settings.group_deleted', { groupId: id });
+    }
+  });
+}
+
+// 切换激活组：组不存在 404。切换必发 settings.orchestrator_updated → brain 既有
+// settings.orchestrator_updated 处理分支（#onEvent）会 #disposeSession + markDirty——
+// Pi 会话创建时绑定 provider/model，不弃会话则切换后旧会话仍走旧通道
+// （真实事故：上游账号池瞬时 503，用户切换模型后主脑仍报错）。同组重复切换为幂等空操作。
+export function switchOrchestratorGroup(ctx: Ctx, groupId: string): OrchestratorSettingsView {
+  const st = loadOrchestrator(ctx);
+  if (!st.groups?.some((g) => g.id === groupId)) throw new HttpError(404, `模型组不存在: ${groupId}`);
+  if (st.activeGroupId === groupId) return getOrchestratorSettings(ctx); // 未变化不发事件，避免无谓的会话重建轮次
+  withWrite(ctx, 'settings.groupActivate', () => {
+    upsertSetting(ctx, 'orchestrator', JSON.stringify({ ...st, activeGroupId: groupId }));
+    logEvent(ctx, 'settings.orchestrator_updated', { fields: ['activeGroupId'], groupId });
+  });
+  return getOrchestratorSettings(ctx);
+}
+
+// ---- 主脑模型清单与连通测试（设置页下拉/检测按钮的数据源，按组路由）----
 // 上游账号池状态瞬息万变（曾出现配置的模型瞬时 503「No available accounts」），
 // 与其让用户盲填模型名，不如把 /models 清单拉出来供选择 + 一键探测当前可用性。
 
@@ -159,6 +464,16 @@ function trimBase(baseURL: string): string {
   return baseURL.replace(/\/+$/, '');
 }
 
+// 组解析：groupId 缺省 = 激活组；组不存在 404，无组可选 422（与组接口同一语义）
+function resolveTargetGroup(ctx: Ctx, groupId?: string): OrchestratorGroup {
+  const st = loadOrchestrator(ctx);
+  const g = st.groups?.find((x) => x.id === (groupId ?? st.activeGroupId));
+  if (!g) {
+    throw new HttpError(groupId ? 404 : 422, groupId ? `模型组不存在: ${groupId}` : '未配置任何模型组');
+  }
+  return g;
+}
+
 export interface OrchestratorModelsResult {
   models: string[];
   fetchedAt: number;
@@ -167,17 +482,19 @@ export interface OrchestratorModelsResult {
 
 export async function listOrchestratorModels(
   ctx: Ctx,
+  opts: { groupId?: string } = {},
   fetchImpl: typeof fetch = fetch,
 ): Promise<OrchestratorModelsResult> {
-  const s = getOrchestratorSettings(ctx);
-  if (!s.baseURL) throw new HttpError(422, 'baseURL 未配置');
-  const key = decryptApiKey(ctx);
+  const g = resolveTargetGroup(ctx, opts.groupId);
+  if (!g.baseURL) throw new HttpError(422, 'baseURL 未配置');
+  const key = decryptGroupApiKey(ctx, g.id);
   if (!key) throw new HttpError(422, 'apiKey 未配置');
-  const hit = modelListCache.get(s.baseURL);
+  // 缓存键 = baseURL：同端点的组共享一份清单（/models 与具体 KEY 无关的场景占绝大多数）
+  const hit = modelListCache.get(g.baseURL);
   if (hit && Date.now() - hit.at < MODEL_LIST_TTL_MS) {
     return { models: hit.ids, fetchedAt: hit.at, cached: true };
   }
-  const res = await fetchImpl(`${trimBase(s.baseURL)}/models`, {
+  const res = await fetchImpl(`${trimBase(g.baseURL)}/models`, {
     headers: { authorization: `Bearer ${key}` },
     signal: AbortSignal.timeout(20_000),
   });
@@ -187,7 +504,7 @@ export async function listOrchestratorModels(
     .map((x) => String(x.id ?? ''))
     .filter(Boolean)
     .sort();
-  modelListCache.set(s.baseURL, { at: Date.now(), ids });
+  modelListCache.set(g.baseURL, { at: Date.now(), ids });
   return { models: ids, fetchedAt: Date.now(), cached: false };
 }
 
@@ -200,17 +517,17 @@ export interface OrchestratorTestResult {
 
 export async function testOrchestratorModel(
   ctx: Ctx,
-  model: string | undefined,
+  opts: { groupId?: string; model?: string } = {},
   fetchImpl: typeof fetch = fetch,
 ): Promise<OrchestratorTestResult> {
-  const s = getOrchestratorSettings(ctx);
-  const target = model ?? s.model;
-  if (!s.baseURL || !target) throw new HttpError(422, 'baseURL/模型未配置');
-  const key = decryptApiKey(ctx);
+  const g = resolveTargetGroup(ctx, opts.groupId);
+  const target = opts.model ?? g.model;
+  if (!g.baseURL || !target) throw new HttpError(422, 'baseURL/模型未配置');
+  const key = decryptGroupApiKey(ctx, g.id);
   if (!key) throw new HttpError(422, 'apiKey 未配置');
   const started = Date.now();
   try {
-    const res = await fetchImpl(`${trimBase(s.baseURL)}/chat/completions`, {
+    const res = await fetchImpl(`${trimBase(g.baseURL)}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
       body: JSON.stringify({ model: target, max_tokens: 16, messages: [{ role: 'user', content: '回复：ok' }] }),
@@ -233,15 +550,4 @@ export async function testOrchestratorModel(
       error: (err instanceof Error ? err.message : String(err)).slice(0, 200),
     };
   }
-}
-
-// 运行时解密（内置主脑消费）。返回前可能触发 enc_secret 建立/旧密文迁移：
-// 迁移判定不可解时密文已被置空（settings.apiKey_reset），此处重读后按未设置处理。
-export function decryptApiKey(ctx: Ctx): string | null {
-  const stored = readOrchestratorRow(ctx) as { apiKeyCipher?: string } | null;
-  if (!stored?.apiKeyCipher) return null;
-  const secret = resolveSecret(ctx);
-  const after = readOrchestratorRow(ctx) as { apiKeyCipher?: string } | null;
-  if (!after?.apiKeyCipher) return null;
-  return decrypt(after.apiKeyCipher, secret);
 }

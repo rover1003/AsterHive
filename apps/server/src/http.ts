@@ -38,7 +38,16 @@ import {
 import { claimTask, nextTask, checkpointTask, releaseTask, submitTask } from './verbs.ts';
 import { createMessage, listMessages, inboxFor, dispatchTask, type MessageKind } from './messages.ts';
 import { getOverview } from './overview.ts';
-import { getOrchestratorSettings, putOrchestratorSettings, listOrchestratorModels, testOrchestratorModel } from './settings.ts';
+import {
+  getOrchestratorSettings,
+  putOrchestratorSettings,
+  createOrchestratorGroup,
+  updateOrchestratorGroup,
+  deleteOrchestratorGroup,
+  switchOrchestratorGroup,
+  listOrchestratorModels,
+  testOrchestratorModel,
+} from './settings.ts';
 import { getUserStatus, renameUser, ensureUserAgent } from './user.ts';
 import { mountMcp } from './mcp.ts';
 import { PiRuntimeManager } from './pi-runtime.ts';
@@ -488,33 +497,82 @@ export function createApp(ctx: Ctx): Hono {
 
   app.get('/overview', (c) => c.json(getOverview(ctx)));
 
+  // 多模型组（主脑多模型组升级）：GET 投影 { enabled, wakeOn, activeGroupId, groups }，
+  // cipher/明文永不回显；旧单配置顶层字段（provider/baseURL/model/apiKey）不再输出。
   app.get('/settings/orchestrator', (c) => c.json(getOrchestratorSettings(ctx)));
 
-  // 上游 /models 清单（60s 缓存）——设置页模型下拉的数据源，让用户看得见当前有哪些模型
-  app.get('/settings/orchestrator/models', async (c) => {
-    requireElevated(ctx, c);
-    return c.json(await listOrchestratorModels(ctx));
-  });
-
-  // 一键探测模型连通（默认探测当前配置的模型）——上游账号池状态瞬时万变，选中后再试一把
-  app.post('/settings/orchestrator/test', async (c) => {
-    requireElevated(ctx, c);
-    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-    return c.json(await testOrchestratorModel(ctx, body.model === undefined ? undefined : String(body.model)));
-  });
-
+  // 全局开关：仅 enabled/wakeOn（模型组字段一律走组接口）
   app.put('/settings/orchestrator', async (c) => {
     requireElevated(ctx, c); // user/orchestrator 身份可写（单用户模型，管理令牌已移除）
     const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-    const settings = putOrchestratorSettings(ctx, {
-      provider: body.provider === undefined ? undefined : String(body.provider),
+    return c.json(
+      putOrchestratorSettings(ctx, {
+        enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
+        wakeOn: body.wakeOn as never,
+      }),
+    );
+  });
+
+  // 上游 /models 清单（60s 缓存，缓存键=baseURL）——设置页模型下拉的数据源；
+  // ?group=<id> 按组拉取，缺省 = 激活组
+  app.get('/settings/orchestrator/models', async (c) => {
+    requireElevated(ctx, c);
+    return c.json(await listOrchestratorModels(ctx, { groupId: c.req.query('group') || undefined }));
+  });
+
+  // 一键探测模型连通：groupId 缺省 = 激活组；model 缺省 = 组配置的模型
+  app.post('/settings/orchestrator/test', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    return c.json(
+      await testOrchestratorModel(ctx, {
+        groupId: body.groupId === undefined ? undefined : String(body.groupId),
+        model: body.model === undefined ? undefined : String(body.model),
+      }),
+    );
+  });
+
+  // ---- 模型组 CRUD（每组独立 name/baseURL/apiKey/model；授权同全局开关）----
+
+  app.post('/settings/orchestrator/groups', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const group = createOrchestratorGroup(ctx, {
+      name: body.name === undefined ? undefined : String(body.name),
       baseURL: body.baseURL === undefined ? undefined : String(body.baseURL),
-      model: body.model === undefined ? undefined : String(body.model),
       apiKey: body.apiKey === undefined ? undefined : String(body.apiKey),
-      enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
-      wakeOn: body.wakeOn as never,
+      model: body.model === undefined ? undefined : String(body.model),
     });
-    return c.json(settings);
+    return c.json({ group }, 201);
+  });
+
+  // 局部更新：未传键不覆盖；apiKey 缺省/空串 = 保留原 KEY（UI 永不回显）
+  app.put('/settings/orchestrator/groups/:id', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const group = updateOrchestratorGroup(ctx, c.req.param('id'), {
+      name: body.name === undefined ? undefined : String(body.name),
+      baseURL: body.baseURL === undefined ? undefined : String(body.baseURL),
+      apiKey: body.apiKey === undefined ? undefined : String(body.apiKey),
+      model: body.model === undefined ? undefined : String(body.model),
+    });
+    return c.json({ group });
+  });
+
+  // 删除模型组：还有其他组时激活组 422（先启用其他组）；删的是最后一组则允许（主脑未配置态）
+  app.delete('/settings/orchestrator/groups/:id', (c) => {
+    requireElevated(ctx, c);
+    deleteOrchestratorGroup(ctx, c.req.param('id'));
+    return c.json({ ok: true, deleted: c.req.param('id') });
+  });
+
+  // 切换激活组：组不存在 404。必发 settings.orchestrator_updated → brain 既有
+  // disposeSession 分支重建会话——换通道下一轮即生效（不用重启、不残留旧 provider 绑定）。
+  app.put('/settings/orchestrator/active', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (body.groupId === undefined || String(body.groupId) === '') throw new HttpError(422, 'groupId required');
+    return c.json(switchOrchestratorGroup(ctx, String(body.groupId)));
   });
 
   // ---- Pi 运行时（T14：数据卷自管理，更新/回滚不重启服务器进程）----
