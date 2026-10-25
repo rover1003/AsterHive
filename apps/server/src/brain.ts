@@ -366,7 +366,7 @@ export class Brain {
   #reasons: string[] = []; // 本轮唤醒原因（下一轮 prompt 的"待处理"清单）
   #lastBoardId: string | null = null; // 最近一次唤醒事件所在板（失败提示要发回对应的房）
   #errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  #modelErrorRetried = false; // 上游瞬时失败只静默重试一轮，再败必须让用户看见
+  #consecutiveModelFailures = 0; // 连续上游失败计数：≥3 停自动重试（成功/用户新消息复位）
   #piCache = new Map<string, PiModule>(); // 运行时入口 → 已加载模块（版本更替即换 URL 重载）
   #streamer: ThrottledStream | null = null; // 本轮 brain.stream 节流发布器（null = 本轮不发流）
   #streamUnsub: (() => void) | null = null; // Pi 会话增量订阅退订器
@@ -460,6 +460,7 @@ export class Brain {
     switch (type) {
       case 'message.created': {
         if (payload.author === BRAIN_AGENT_ID) return; // 自己发的消息不唤醒（防自激）
+        this.#consecutiveModelFailures = 0; // 用户真实介入：重新给予自动重试机会
         const isQuestion = payload.kind === 'question';
         // blockedReport 映射：worker 的 question 消息视为受阻上报；userMessage 覆盖其余消息
         if (isQuestion && wakeOn.blockedReport !== false) reason = `worker 提问/受阻 #${payload.messageId} [板${payload.boardId}] ${payload.author}：${String(payload.content ?? '').slice(0, 120)}`;
@@ -578,11 +579,12 @@ export class Brain {
       withWrite(this.#ctx, 'brain.turnFinish', () => {
         logEvent(this.#ctx, 'brain.turn_finished', { turnMs: Date.now() - started, modelError });
       });
-      // 上游瞬时故障（如中转站账号池瞬时耗尽 503）先静默重试一轮（60s 后）；
-      // 重试仍败则必须让用户看见——往事件所在板的房间发系统提示，不再无声吞掉唤醒
+      // 上游瞬时故障（如中转站账号池瞬时耗尽 503）先静默重试（60s 后）；连续失败封顶：
+      // 连续 ≥3 轮失败即停止自动重试并提示用户换通道——否则中转站整体故障时会在
+      // "失败→60s→再试→再败"里无限空转（每轮还烧几分钟超时），指示器常亮误导用户
       if (modelError) {
-        if (!this.#modelErrorRetried) {
-          this.#modelErrorRetried = true;
+        this.#consecutiveModelFailures += 1;
+        if (this.#consecutiveModelFailures <= 2) {
           if (this.#errorRetryTimer) clearTimeout(this.#errorRetryTimer);
           const brief = modelError.slice(0, 160);
           this.#errorRetryTimer = setTimeout(() => {
@@ -591,24 +593,24 @@ export class Brain {
             this.#markDirty();
           }, 60_000);
         } else {
-          this.#modelErrorRetried = false;
           const board = this.#lastBoardId;
-          if (board) {
+          // 已提示过就不再刷屏：封顶后保持静默，直到成功或用户真实介入（新消息唤醒）复位
+          if (this.#consecutiveModelFailures === 3 && board) {
             withWrite(this.#ctx, 'brain.upstreamError', () => {
               messageInner(this.#ctx, {
                 boardId: board,
                 author: BRAIN_AGENT_ID,
                 kind: 'system',
                 content:
-                  `⚠ 主脑调用上游模型失败（已自动重试一轮仍败）：${modelError.slice(0, 200)}。` +
-                  '本轮唤醒未处理。请到「设置 → 主脑设置」刷新模型列表并切换可用模型，或稍后再 @主脑。',
+                  `⚠ 主脑连续 ${this.#consecutiveModelFailures} 轮调用上游模型失败，已停止自动重试：${modelError.slice(0, 160)}。` +
+                  '请到「设置 → 主脑设置」刷新模型列表/测试连通，启用一条可用通道，或稍后再 @主脑（会自动恢复重试）。',
                 mentions: [],
               });
             });
           }
         }
       } else {
-        this.#modelErrorRetried = false; // 成功即复位，下次瞬时故障重新享受一轮静默重试
+        this.#consecutiveModelFailures = 0; // 成功即复位
       }
     } catch (err) {
       withWrite(this.#ctx, 'brain.error', () => {
