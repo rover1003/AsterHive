@@ -96,6 +96,18 @@ export function createApp(ctx: Ctx): Hono {
   });
 
   if (staticEnabled) {
+    // 缓存策略：index.html 禁缓存（每次拿最新 hash 引用），assets 带内容 hash 可长缓存——
+    // 否则重新部署后浏览器旧 index.html 引用已不存在的旧 chunk，动态导入 404
+    app.use('/assets/*', async (c, next) => {
+      await next();
+      c.header('cache-control', 'public, max-age=31536000, immutable');
+    });
+    app.use('*', async (c, next) => {
+      await next();
+      if (c.res.status === 200 && (c.res.headers.get('content-type') ?? '').includes('text/html')) {
+        c.header('cache-control', 'no-cache');
+      }
+    });
     app.use('*', serveStatic({ root: staticRoot }));
   }
 
