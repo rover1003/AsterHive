@@ -26,7 +26,7 @@
 //     ② session.prompt() 默认展开轮首 /skill:<名>（agent-session.js _expandSkillCommand，
 //        由 Pi 进程读文件全文注入该轮 prompt，与工具面无关）——为将来 UI 触发的定向调用预留。
 //     自定义工具扩展走 extensions/（additionalExtensionPaths，工厂签名见 examples/brain-extension/）。
-import { mkdirSync, readdirSync, renameSync, statSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { Type, type TSchema } from 'typebox';
 import type { ZodType } from 'zod';
@@ -676,6 +676,9 @@ export class Brain {
       // 的初衷背道而驰；主脑的记忆 = 事件台账按需查询 + 每轮快照（自带全量看板状态），
       // 对话历史几乎无损。abortTurn 路径已提前 dispose，此处幂等。
       this.#disposeSession();
+      this.#discardSessionFiles(); // 关键：Pi createAgentSession 会 resume 目录里最近的 jsonl——
+      // 只弃内存会话，磁盘历史还在，下一轮重建时原样带回（实测：部署后首轮即 token 超限）。
+      // 无状态化必须连磁盘文件一起抛弃（用户定调：任务完成上下文就该抛弃）
       this.#running = false;
       this.#aborting = false; // 兜底：catch 路径未走到收尾清标记处，也绝不能把"中止"带进下一轮
       this.#streamBoardId = null; // 运行中 steer 进来的消息会重设此值：本轮流已固定目标板，清掉防残留到无关轮
@@ -687,6 +690,23 @@ export class Brain {
   }
 
   // ---- Pi 会话 ----
+
+  // 抛弃磁盘上的会话历史：Pi 的 createAgentSession 默认 resume sessionsDir 里最近的
+  // jsonl，不删文件的话"每轮新会话"只是形式——历史在重建时原样带回。无状态化要求
+  // 每轮结束后会话文件彻底消失（用户定调：任务完成上下文就该抛弃）。删除失败仅告警：
+  // 最坏情况是下轮 resume 旧历史（回到膨胀路径），由失败重试封顶与 token 超限错误暴露。
+  #discardSessionFiles(): void {
+    const sessionsDir = join(this.#ctx.cfg.dataDir, 'brain-session', 'sessions');
+    try {
+      for (const f of readdirSync(sessionsDir)) {
+        if (f.endsWith('.jsonl')) rmSync(join(sessionsDir, f));
+      }
+    } catch (err) {
+      logEvent(this.#ctx, 'brain.session_discard_failed', {
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   /**
    * 开启本轮流式发布：订阅 Pi 会话增量事件，经节流器合并为 brain.stream 总线事件。
