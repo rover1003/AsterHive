@@ -21,6 +21,10 @@ import { claimTask, nextTask, checkpointTask, releaseTask, submitTask } from './
 import { createMessage, inboxFor, dispatchTask, type MessageKind } from './messages.ts';
 import { getOverview } from './overview.ts';
 import { RepoManager } from './repo-manager.ts';
+import { matchTaskToWorkers } from './scheduler.ts';
+import { probeWorker, restartWorkerService, releaseStuckTask } from './worker-control.ts';
+import { inferAndApplyTaskDependencies } from './dependencies.ts';
+import { getFleetRadar } from './fleet-radar.ts';
 
 export const MESSAGE_KINDS = [
   'dispatch',
@@ -193,6 +197,15 @@ export const TOOL_DEFS: ToolDef[] = [
       }),
   ),
   tool(
+    'asterhive_match_task',
+    'Nomad 风格资源感知调度匹配：结合任务声明的硬件与模型约束，筛选评估最适合的工蜂并给出可解释推荐。',
+    { taskId: z.string() },
+    (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot query scheduling matches');
+      return matchTaskToWorkers(ctx, args.taskId);
+    },
+  ),
+  tool(
     'asterhive_dispatch',
     '主脑分派：给指定卡发指令消息（可选预指派 assignee），一次完成指派 + 房间 @ 消息。',
     {
@@ -230,6 +243,60 @@ export const TOOL_DEFS: ToolDef[] = [
       const task = getTask(ctx, args.taskId);
       const mgr = new RepoManager(ctx);
       return await mgr.integrateTask(task.boardId, args.taskId);
+    },
+  ),
+
+  // ---- 工蜂直接受控诊断与干预工具（Phase 6：仅蜂后/用户可调用，worker 403）----
+  tool(
+    'asterhive_worker_probe',
+    '直接探活并诊断指定工蜂：查询心跳延迟、当前占用任务已耗时、底层受控通道连通度及状态。当工蜂超时或疑似卡死时必须优先调用本工具，严禁建卡派给其他工蜂。',
+    { agentId: z.string() },
+    (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot probe other workers');
+      return probeWorker(ctx, args.agentId);
+    },
+  ),
+  tool(
+    'asterhive_worker_restart',
+    '通过独立受控通道重启失联或卡死的目标工蜂服务（白名单服务级动作，凭据不暴露）。探活确认失联或长时间无响应时调用。',
+    { agentId: z.string(), reason: z.string() },
+    (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot restart workers');
+      return restartWorkerService(ctx, a, args.agentId, args.reason);
+    },
+  ),
+  tool(
+    'asterhive_worker_release_stuck_task',
+    '受控强制解除失联/挂起工蜂的任务占用，并将任务回退至 Ready 泳道供重新调度。',
+    { agentId: z.string(), taskId: z.string(), reason: z.string().optional() },
+    (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot force release tasks');
+      return releaseStuckTask(ctx, a, args.agentId, args.taskId, args.reason ?? '蜂后强制解除挂起占用');
+    },
+  ),
+
+  // ---- 拆解健壮化与所有权推导工具（Phase 7：仅蜂后/用户可调用，worker 403）----
+  tool(
+    'asterhive_infer_dependencies',
+    '依赖自动推导与写冲突分析（Phase 7）：依据任务声明的 writes(files) 与 reads 文件所有权，自动推导缺失的 dependsOn 依赖链并检测并发写冲突。apply=true 时自动批量修补看板任务卡依赖。',
+    {
+      boardId: z.string(),
+      apply: z.boolean().optional(),
+    },
+    (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot infer or modify task dependency graphs');
+      return inferAndApplyTaskDependencies(ctx, a, args.boardId, args.apply !== true);
+    },
+  ),
+
+  // ---- 舰队体检雷达工具（Phase 9：全局算力、停滞预警与干预审计）----
+  tool(
+    'asterhive_fleet_radar',
+    '返回全蜂群舰队体检雷达报告（Phase 9）：包含总工蜂算力池（核心数/内存量/执行内核分布/可用模型去重）、活跃任务停滞僵死风险预警及最近受控干预恢复历史。',
+    undefined,
+    (ctx, a) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot query fleet radar');
+      return getFleetRadar(ctx);
     },
   ),
 ];

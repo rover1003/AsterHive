@@ -11,7 +11,7 @@
 // 用户明确要 repo 语义，静默降级会让"项目在工作区层面有连续性"变成假象。
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Worker } from '@asterhive/sdk';
 
@@ -100,15 +100,29 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
   if (opts.repoMode === 'managed') {
     if (!opts.worker) throw new Error('managed repository mode requires worker instance for snapshot download');
     const baseDir = join(opts.workdirRoot, 'ephemeral', `${opts.boardId}-${opts.taskId}`);
-    mkdirSync(baseDir, { recursive: true });
     const bundleFile = join(baseDir, 'snapshot.bundle');
     const worktreeDir = join(baseDir, 'src');
+    const branch = `asterhive/${opts.taskId}`;
+    if (existsSync(join(worktreeDir, '.git'))) {
+      const currentBranch = (await git(['branch', '--show-current'], worktreeDir, '读取恢复工作区分支失败')).trim();
+      if (currentBranch !== branch) throw new Error(`managed 临时工作区已存在但分支为 ${currentBranch || 'detached'}（期望 ${branch}）；为保护现场，不覆盖。`);
+      const status = await git(['status', '--porcelain', '-z'], worktreeDir, '读取恢复工作区状态失败');
+      if (status.trim()) {
+        log(`managed 模式：现有任务分支 ${branch} 包含未提交的在途改动（${parseStatusZ(status).slice(0, 12).join(', ')}），保留并复用临时工作区。`);
+      } else {
+        log(`managed 模式：发现干净的现有任务分支 ${branch}，安全复用临时工作区。`);
+      }
+      return { dir: worktreeDir, mode: 'managed', taskId: opts.taskId, branch, worker: opts.worker, cleanup: () => rmSync(baseDir, { recursive: true, force: true }), log };
+    }
+    if (existsSync(baseDir) && readdirSync(baseDir).length > 0) {
+      throw new Error(`managed 临时路径存在但没有可验证的任务仓库，拒绝覆盖并保留现场：${baseDir}`);
+    }
+    mkdirSync(baseDir, { recursive: true });
     log(`managed 模式：从服务器下载任务 ${opts.taskId} 的代码快照...`);
     const snap = await opts.worker.downloadTaskSnapshot(opts.taskId);
     writeFileSync(bundleFile, Buffer.from(snap.buffer));
     log(`快照下载完毕（${snap.buffer.byteLength} 字节，基线 ${snap.baseCommit.slice(0, 8)}），解包工作树...`);
     await git(['clone', bundleFile, worktreeDir], baseDir, '解包快照 bundle 失败');
-    const branch = `asterhive/${opts.taskId}`;
     await git(['checkout', '-b', branch], worktreeDir, '创建任务分支失败');
     return {
       dir: worktreeDir,

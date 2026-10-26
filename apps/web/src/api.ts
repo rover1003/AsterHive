@@ -31,13 +31,27 @@ export interface Task {
   workspace: Record<string, string>;
   files: string[];
   evidence: { path: string; machine?: string; note?: string }[];
-  protectedPaths: string[];
+  reviewStatus: 'none' | 'pending' | 'reviewing' | 'passed' | 'rework' | 'blocked' | 'failed';
+  reviewAttempts: number;
+  reviewReworks: number;
+  reviewSummary: string;
+  submitSummary: string;
+  repoMode?: 'managed' | 'remote-legacy';
   claimedAt: number | null;
   lastActivityAt: number | null;
   autoUnblockedAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
+export interface RepoTaskDiff {
+  base: string;
+  head: string;
+  diffStat: string;
+  changedFiles: string[];
+  diffText: string;
+  diffTruncated: boolean;
+}
+
 export interface Message {
   id: number;
   boardId: string;
@@ -48,6 +62,15 @@ export interface Message {
   content: string;
   createdAt: number;
 }
+export interface AgentSpecs {
+  os?: string;
+  arch?: string;
+  cpus?: number;
+  memoryTotalGb?: number;
+  executor?: string;
+  gpu?: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -64,6 +87,8 @@ export interface Agent {
   note: string;
   /** 接入设备名（注册时自报，空 = 手动预创建的身份壳） */
   host: string;
+  /** 设备能力规格（OS/架构/CPU/内存等） */
+  specs?: AgentSpecs;
 }
 export interface AgentOverview {
   id: string;
@@ -74,6 +99,7 @@ export interface AgentOverview {
   enabled: boolean;
   lastSeenAt: number | null;
   status: 'working' | 'idle' | 'stale' | 'disabled';
+  specs?: AgentSpecs;
   currentTask: {
     id: string;
     title: string;
@@ -114,8 +140,10 @@ export interface OrchestratorSettings {
   /** 内置主脑总开关（T14，默认关） */
   enabled?: boolean;
   wakeOn?: Record<string, boolean>;
-  /** 激活组 id；无组或悬空 → null（主脑未配置态） */
   activeGroupId?: string | null;
+  /** 独立 Reviewer 使用的模型组；null 表示跟随主脑激活组 */
+  reviewerGroupId?: string | null;
+  reviewerEnabled?: boolean;
   groups?: OrchestratorGroup[];
 }
 /** GET /settings/orchestrator/models（60s 缓存，按 baseURL） */
@@ -205,6 +233,45 @@ async function req<T>(
     throw new ApiError(res.status, String(json.error ?? res.statusText));
   }
   return json as T;
+}
+
+export interface StagnationAlert {
+  taskId: string;
+  taskTitle: string;
+  boardId: string;
+  agentId: string;
+  agentHandle: string;
+  elapsedMinutes: number;
+  idleCheckpointMinutes: number;
+  severity: 'warning' | 'critical';
+  recommendation: string;
+}
+
+export interface InterventionAuditRecord {
+  id: number;
+  type: string;
+  agentId: string;
+  handle: string;
+  actorId?: string;
+  message: string;
+  ok: boolean;
+  timestamp: number;
+}
+
+export interface FleetRadarReport {
+  timestamp: number;
+  summary: {
+    totalWorkers: number;
+    onlineWorkers: number;
+    staleWorkers: number;
+    workingWorkers: number;
+    totalCpus: number;
+    totalMemoryGb: number;
+    executors: Record<string, number>;
+    uniqueModels: string[];
+  };
+  alerts: StagnationAlert[];
+  recentInterventions: InterventionAuditRecord[];
 }
 
 export const api = {

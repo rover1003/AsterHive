@@ -15,6 +15,7 @@ import {
   heartbeat,
   authByToken,
   reportAgentModels,
+  reportAgentSpecs,
   updateAgentProfile,
   getAgentProfile,
   type Agent,
@@ -32,6 +33,7 @@ import {
   setParticipants,
   listTasks,
   getTask,
+  retryTaskReview,
   createTask,
   updateTask,
   addDependencies,
@@ -55,6 +57,11 @@ import { getUserStatus, renameUser, ensureUserAgent } from './user.ts';
 import { mountMcp } from './mcp.ts';
 import { PiRuntimeManager } from './pi-runtime.ts';
 import { RepoManager } from './repo-manager.ts';
+import { matchTaskToWorkers } from './scheduler.ts';
+import { probeWorker, restartWorkerService, releaseStuckTask } from './worker-control.ts';
+import { inferAndApplyTaskDependencies } from './dependencies.ts';
+import { handleChatToCard } from './webhook.ts';
+import { getFleetRadar } from './fleet-radar.ts';
 import { Brain } from './brain.ts';
 import { fileURLToPath } from 'node:url';
 import { serveStatic } from '@hono/node-server/serve-static';
@@ -227,6 +234,7 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       role?: AgentRole;
       models?: string[];
       host?: string;
+      specs?: unknown;
     };
     if (!body.name || !body.handle) throw new HttpError(422, 'name and handle required');
     const { agent, token } = registerAgent(ctx, {
@@ -236,6 +244,7 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       role: body.role,
       models: body.models,
       host: body.host,
+      specs: body.specs as import('./agents.ts').AgentSpecs | undefined,
     });
     return c.json({ agent, token }, 201); // token 仅此一次返回
   });
@@ -248,6 +257,14 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     const actor = requireActor(ctx, c);
     const body = (await c.req.json().catch(() => ({}))) as { models?: unknown };
     const agent = reportAgentModels(ctx, actor.id, body.models);
+    return c.json({ agent });
+  });
+
+  // 自报设备硬件能力规格（Phase 4：OS、架构、CPU 核心数、内存总量等）
+  app.post('/agents/me/specs', async (c) => {
+    const actor = requireActor(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { specs?: unknown };
+    const agent = reportAgentSpecs(ctx, actor.id, body.specs ?? body);
     return c.json({ agent });
   });
 
@@ -294,7 +311,36 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json({ ok: true, deleted: c.req.param('id') });
   });
 
-  app.post('/agents/:id/heartbeat', (c) => c.json({ agent: heartbeat(ctx, c.req.param('id')) }));
+  app.post('/agents/:id/heartbeat', async (c) => {
+    const id = c.req.param('id');
+    const body = (await c.req.json().catch(() => ({}))) as { specs?: unknown };
+    if (body.specs !== undefined) {
+      reportAgentSpecs(ctx, id, body.specs);
+    }
+    return c.json({ agent: heartbeat(ctx, id) });
+  });
+
+  // ---- 工蜂受控诊断与干预（Phase 6：requireElevated，worker 403）----
+  app.post('/agents/:id/control/probe', async (c) => {
+    requireElevated(ctx, c);
+    const result = await probeWorker(ctx, c.req.param('id'));
+    return c.json(result);
+  });
+
+  app.post('/agents/:id/control/restart', async (c) => {
+    const actor = requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+    const result = await restartWorkerService(ctx, actor, c.req.param('id'), body.reason ?? '受控恢复');
+    return c.json(result);
+  });
+
+  app.post('/agents/:id/control/release-task', async (c) => {
+    const actor = requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { taskId?: string; reason?: string };
+    if (!body.taskId) throw new HttpError(422, 'taskId required');
+    const task = await releaseStuckTask(ctx, actor, c.req.param('id'), body.taskId, body.reason ?? '');
+    return c.json({ task });
+  });
 
   // ---- 看板（§5.1 / §7）----
 
@@ -448,6 +494,14 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json({ task, by: actor.id });
   });
 
+  // 依赖自动推导与写冲突分析（Phase 7：requireElevated，worker 403）
+  app.post('/boards/:b/tasks/infer-dependencies', async (c) => {
+    const actor = requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { apply?: boolean };
+    const report = inferAndApplyTaskDependencies(ctx, actor, c.req.param('b'), body.apply !== true);
+    return c.json(report);
+  });
+
   // ---- Worker 动词（交接协议：claim / checkpoint / release / submit + next 动态拉取）----
 
   app.post('/boards/:b/next', (c) => {
@@ -487,6 +541,12 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       evidence: body.evidence,
     });
     return c.json({ task, by: actor.id });
+  });
+
+  app.post('/tasks/:id/review/retry', (c) => {
+    const actor = requireElevated(ctx, c);
+    const task = retryTaskReview(ctx, actor, c.req.param('id'));
+    return c.json({ task });
   });
 
   // managed 模式：Worker 领取任务代码快照 Bundle
@@ -535,6 +595,25 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json({ status: 'saved', ...result });
   });
 
+  // managed 模式：查询任务分支差异（Diff / Stat），供前端卡片及审查抽屉展示
+  app.get('/tasks/:id/repo-diff', async (c) => {
+    const actor = requireActor(ctx, c);
+    const taskId = c.req.param('id');
+    const task = getTask(ctx, taskId);
+    const board = getBoard(ctx, task.boardId);
+    if (board.repoMode !== 'managed') throw new HttpError(409, 'task does not use a managed repository');
+    if (actor.role === 'worker') requireParticipant(ctx, task.boardId, actor);
+    const diff = await repoManager.inspectTask(task.boardId, taskId);
+    return c.json(diff);
+  });
+
+  // 资源感知任务匹配查询（Nomad 风格调度评估与建议）
+  app.get('/tasks/:id/match', (c) => {
+    requireActor(ctx, c);
+    const result = matchTaskToWorkers(ctx, c.req.param('id'));
+    return c.json(result);
+  });
+
   // ---- 聊天室（§6：统一控制面）----
 
   app.get('/boards/:b/messages', (c) =>
@@ -580,15 +659,41 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json({ ...result, by: actor.id }, 201);
   });
 
+  // ---- 多端无感派活 Webhook（Phase 8：Chat-to-Card）----
+  app.post('/api/webhooks/chat-to-card', async (c) => {
+    let body: Record<string, unknown> = {};
+    const contentType = c.req.header('content-type') || '';
+    if (contentType.includes('application/json')) {
+      body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    } else {
+      const text = await c.req.text().catch(() => '');
+      body = { content: text };
+    }
+
+    const result = await handleChatToCard(ctx, {
+      content: String(body.content ?? ''),
+      boardId: body.boardId ? String(body.boardId) : undefined,
+      source: body.source ? String(body.source) : (c.req.header('x-source') || 'webhook'),
+      author: body.author ? String(body.author) : 'user',
+    });
+    return c.json(result, 201);
+  });
+
   // ---- 总览与设置（§7）----
 
   app.get('/overview', (c) => c.json(getOverview(ctx)));
+
+  // 舰队体检雷达端点（Phase 9：全局算力、停滞预警与干预审计）
+  app.get('/api/fleet/radar', (c) => {
+    requireActor(ctx, c);
+    return c.json(getFleetRadar(ctx));
+  });
 
   // 多模型组（主脑多模型组升级）：GET 投影 { enabled, wakeOn, activeGroupId, groups }，
   // cipher/明文永不回显；旧单配置顶层字段（provider/baseURL/model/apiKey）不再输出。
   app.get('/settings/orchestrator', (c) => c.json(getOrchestratorSettings(ctx)));
 
-  // 全局开关：仅 enabled/wakeOn（模型组字段一律走组接口）
+  // 全局开关与审核员模型组绑定：enabled/wakeOn/reviewerGroupId
   app.put('/settings/orchestrator', async (c) => {
     requireElevated(ctx, c); // user/orchestrator 身份可写（单用户模型，管理令牌已移除）
     const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -596,6 +701,8 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       putOrchestratorSettings(ctx, {
         enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
         wakeOn: body.wakeOn as never,
+        reviewerGroupId: body.reviewerGroupId === undefined ? undefined : (body.reviewerGroupId ? String(body.reviewerGroupId) : null),
+        reviewerEnabled: body.reviewerEnabled === undefined ? undefined : Boolean(body.reviewerEnabled),
       }),
     );
   });

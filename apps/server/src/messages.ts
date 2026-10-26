@@ -49,8 +49,21 @@ function rowToMessage(r: MessageRow): Message {
 }
 
 // @ 句柄机械解析（§6）：服务器只解析 @词元并投递，语义理解在被 @ 的 agent 那里。
-// '@主脑' 为保留句柄，投递时映射到全部 orchestrator 角色 agent。
+// 蜂群别名（Phase 3）：
+// - 蜂后 Queen 别名：'@主脑'、'@蜂后'、'@Queen'、'@queen'，投递给全部 orchestrator 角色 agent。
+// - 工蜂 Worker Bee 别名：'@工蜂'、'@Bee'、'@bee'、'@workerbee'、'@WorkerBee'，广播投递给全体 worker 角色 agent。
 const MENTION_RE = /@([\w\u4e00-\u9fa5][\w\u4e00-\u9fa5-]*)/g;
+
+export const QUEEN_ALIASES = new Set(['主脑', '蜂后', 'queen', 'Queen']);
+export const BEE_ALIASES = new Set(['工蜂', 'bee', 'Bee', 'workerbee', 'WorkerBee']);
+
+export function isQueenMention(mention: string): boolean {
+  return QUEEN_ALIASES.has(mention);
+}
+
+export function isBeeMention(mention: string): boolean {
+  return BEE_ALIASES.has(mention);
+}
 
 export function parseMentions(content: string): string[] {
   const out = new Set<string>();
@@ -136,8 +149,9 @@ export function createMessage(
 
 // 定向投递查询（@ 句柄机械路由的读取面）：
 // - 消息 @ 了该 agent 的句柄；
-// - '@主脑' 投递给全部 orchestrator；
-// - 用户的无 @ 广播默认唤醒主脑。
+// - 蜂后别名（@主脑、@Queen、@蜂后）投递给全部 orchestrator；
+// - 工蜂别名（@Bee、@工蜂）广播投递给全体 worker；
+// - 用户的无 @ 广播默认唤醒蜂后（主脑）。
 export function inboxFor(ctx: Ctx, agent: Agent, since: number): Message[] {
   const rows = ctx.holder.db
     .prepare('SELECT * FROM message WHERE id > ? ORDER BY id LIMIT 500')
@@ -145,8 +159,9 @@ export function inboxFor(ctx: Ctx, agent: Agent, since: number): Message[] {
   const wanted = rows.filter((r) => {
     const mentions = JSON.parse(r.mentions) as string[];
     if (mentions.includes(agent.handle)) return true;
-    if (agent.role === 'orchestrator' && mentions.includes('主脑')) return true;
+    if (agent.role === 'orchestrator' && mentions.some(isQueenMention)) return true;
     if (agent.role === 'orchestrator' && r.author === 'user' && mentions.length === 0) return true;
+    if (agent.role === 'worker' && mentions.some(isBeeMention)) return true;
     return false;
   });
   return wanted.map(rowToMessage);

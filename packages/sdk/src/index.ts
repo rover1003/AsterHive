@@ -3,6 +3,33 @@
 // 七个调用：register（一次性）/ next / claim / checkpoint / submit / release / heartbeat
 // 附：inbox / postMessage（聊天室）、getTask 与 getBoards / getBoard（看板元数据，含 repo）。
 
+import { platform, arch, cpus, totalmem } from 'node:os';
+
+/** 工蜂设备硬件能力规格（Phase 4：隐私最小化，仅上报调度相关指标） */
+export interface AgentSpecs {
+  os?: string; // 如 'win32' | 'darwin' | 'linux'
+  arch?: string; // 如 'x64' | 'arm64'
+  cpus?: number; // CPU 逻辑核心数
+  memoryTotalGb?: number; // 物理总内存（GB，四舍五入）
+  executor?: string; // 运行内核，如 'omp' | 'zcode' | 'shell'
+  gpu?: string; // 可选 GPU 标识
+}
+
+/** 自动采样本机硬件能力（零配置、零外部依赖） */
+export function detectDeviceSpecs(executor?: string): AgentSpecs {
+  try {
+    return {
+      os: platform(),
+      arch: arch(),
+      cpus: cpus().length,
+      memoryTotalGb: Math.round((totalmem() / 1073741824) * 10) / 10,
+      executor: executor || undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 export interface Board {
   id: string;
   name: string;
@@ -84,6 +111,7 @@ export interface RegisterOptions {
   role?: 'worker' | 'orchestrator' | 'user';
   models?: string[];
   host?: string;
+  specs?: AgentSpecs;
 }
 
 export interface RegisterResult {
@@ -177,6 +205,18 @@ export class Worker {
     return r.agent.models;
   }
 
+  /** 自报/更新工蜂设备硬件能力规格（OS/架构/CPU/内存等） */
+  async reportSpecs(specs: AgentSpecs): Promise<AgentSpecs> {
+    const r = await call<{ agent: { specs: AgentSpecs } }>(
+      this.#baseUrl,
+      this.#token,
+      'POST',
+      '/agents/me/specs',
+      { specs },
+    );
+    return r.agent.specs;
+  }
+
   /** 拉自己的档案速览：自报模型 + 用户在设置页为本 agent 选的首选模型 */
   async getMyProfile(): Promise<{ agentId: string; models: string[]; preferredModel: string | null }> {
     return call(this.#baseUrl, this.#token, 'GET', '/agents/me/profile');
@@ -225,8 +265,8 @@ export class Worker {
     return r.task;
   }
 
-  async heartbeat(): Promise<void> {
-    await call(this.#baseUrl, this.#token, 'POST', `/agents/${this.#agentId}/heartbeat`);
+  async heartbeat(specs?: AgentSpecs): Promise<void> {
+    await call(this.#baseUrl, this.#token, 'POST', `/agents/${this.#agentId}/heartbeat`, specs ? { specs } : undefined);
   }
 
   async inbox(since = 0): Promise<PendingMessage[]> {

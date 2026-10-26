@@ -169,8 +169,8 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       <div class="messages"></div>
       <div class="composer">
         <div class="composer-row">
-          <select class="composer-target" title="发送目标：选主脑=找它调度；选 worker=直接派活/干预，主脑仍会同步收到"></select>
-          <textarea class="composer-input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行；@某人 定向，@主脑 找主脑）"></textarea>
+          <select class="composer-target" title="发送目标：选蜂后=找它拆解调度；选工蜂=直接派活/干预，蜂后仍会同步收到"></select>
+          <textarea class="composer-input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行；@某工蜂 定向，@Queen 找蜂后，@Bee 广播）"></textarea>
           <button class="composer-send" title="发送">${icon.send}</button>
         </div>
       </div>`;
@@ -205,8 +205,9 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       }
       const saved = msgTarget;
       targetSelect.innerHTML =
-        `<option value="主脑">主脑</option>` +
-        pool.map((a) => `<option value="${esc(a.handle)}">@${esc(a.handle)}（${esc(a.name)}）</option>`).join('');
+        `<option value="主脑">蜂后 (@Queen / @主脑)</option>` +
+        `<option value="Bee">全体工蜂 (@Bee)</option>` +
+        pool.map((a) => `<option value="${esc(a.handle)}">工蜂 @${esc(a.handle)}（${esc(a.name)}）</option>`).join('');
       // 记住的目标不在本项目可选范围（切板/被移出参与者/已停用，含旧版存过的「全体」空值）→ 回落主脑
       if (![...targetSelect.options].some((o) => o.value === saved)) msgTarget = '主脑';
       targetSelect.value = msgTarget;

@@ -1,7 +1,7 @@
 // Agent 总览（fleet 视图）：Nomad Jobs 风格，一屏纵览；SSE 驱动刷新
 // 入口：侧栏「Agent 总览」组的子项（#/fleet?agent=<id>，定位高亮对应卡片）与 #/fleet 直链。
 // 页头归 render，内容装配复用 renderFleetInto（数据拉取 + SSE 刷新 + 30s 兜底轮询）。
-import { api, type Overview, type AgentOverview } from '../api.ts';
+import { api, type Overview, type AgentOverview, type FleetRadarReport } from '../api.ts';
 import { subscribe } from '../sse.ts';
 import { currentQuery } from '../main.ts';
 import { esc, fmtDuration, fmtTime } from '../ui.ts';
@@ -27,17 +27,28 @@ function agentCardHtml(a: AgentOverview): string {
       </div>`
     : '<div class="fleet-task muted">空闲——未占用任务</div>';
 
+  const specs = a.specs;
+  const specParts = [
+    specs?.os && specs?.arch ? `${specs.os}/${specs.arch}` : (specs?.os || specs?.arch || ''),
+    specs?.cpus || specs?.memoryTotalGb ? `${specs?.cpus ? `${specs.cpus}核` : ''}${specs?.memoryTotalGb ? `/${specs.memoryTotalGb}GB` : ''}` : '',
+    specs?.executor ? `内核 ${specs.executor}` : '',
+  ].filter(Boolean);
+  const specBlock = specParts.length
+    ? `<div class="fleet-specs muted small" style="margin-top:4px;font-size:11px;color:var(--muted-foreground)">💻 ${esc(specParts.join(' · '))}</div>`
+    : '';
+
   return `
     <div class="fleet-card status-${a.status}" id="fleet-agent-${esc(a.id)}" title="${a.status === 'stale' ? `心跳已超过服务器离线阈值（最近：${a.lastSeenAt ? fmtTime(a.lastSeenAt) : '从未上线'}）` : STATUS_LABEL[a.status]}">
       <div class="fleet-head">
         <span class="status-dot ${a.status}"></span>
         <b>${esc(a.name)}</b>
         <span class="handle">@${esc(a.handle)}${a.host ? ` · ${esc(a.host)}` : ''}</span>
-        <span class="role-badge role-${a.role}">worker</span>
+        <span class="role-badge role-${a.role}">${a.role === 'orchestrator' ? '蜂后 Queen' : '工蜂 Bee'}</span>
         <span class="fleet-status-label">${STATUS_LABEL[a.status]}</span>
         <span class="fleet-done" title="累计完成">${icon.check} ${a.doneCount}</span>
       </div>
       ${taskBlock}
+      ${specBlock}
       <div class="fleet-foot muted">
         ${STATUS_LABEL[a.status]} · 心跳 ${a.lastSeenAt ? fmtTime(a.lastSeenAt) : '从未'} · ${esc(a.id)}
       </div>
@@ -62,7 +73,10 @@ export function renderFleetInto(
   const load = async () => {
     if (disposed) return;
     try {
-      const ov = await api.get<Overview>('/overview');
+      const [ov, radar] = await Promise.all([
+        api.get<Overview>('/overview'),
+        api.get<FleetRadarReport>('/api/fleet/radar').catch(() => null),
+      ]);
       if (disposed) return; // 请求在途期间已被销毁：丢弃结果
       const workers = ov.agents.filter((a) => a.role !== 'orchestrator');
       const counts = {
@@ -74,6 +88,26 @@ export function renderFleetInto(
       const lanes = Object.entries(ov.aggregates.lanes)
         .map(([lane, v]) => `<span class="lane-pill">${esc(lane)} <b>${v.count}</b>${v.limit ? `/${v.limit}` : ''}</span>`)
         .join('');
+
+      let radarHtml = '';
+      if (radar) {
+        const sum = radar.summary;
+        const alertHtml = radar.alerts.length
+          ? `<div class="radar-alerts" style="margin:8px 0;padding:8px 12px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.25);border-radius:6px;color:#ef4444;font-size:12px">
+              <b>⚠ 停滞预警（${radar.alerts.length} 项）：</b>
+              ${radar.alerts.map((al) => `<div>· 任务 <b>${esc(al.taskId)}</b>（工蜂 @${esc(al.agentHandle)}）已进行 ${al.elapsedMinutes} 分钟，已 ${al.idleCheckpointMinutes} 分钟无进展：${esc(al.recommendation)}</div>`).join('')}
+            </div>`
+          : '';
+
+        radarHtml = `
+          <div class="radar-bar muted small" style="margin:8px 0;padding:6px 12px;background:var(--secondary);border-radius:6px;display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:12px">
+            <span>💻 <b>全蜂群算力：</b>${sum.onlineWorkers}/${sum.totalWorkers} 在线 · <b>${sum.totalCpus}</b> 核心 · <b>${sum.totalMemoryGb}</b> GB 内存</span>
+            <span>🤖 <b>可用模型：</b>${sum.uniqueModels.length ? esc(sum.uniqueModels.slice(0, 3).join('、')) + (sum.uniqueModels.length > 3 ? ' 等' : '') : '未自报'}</span>
+          </div>
+          ${alertHtml}
+        `;
+      }
+
       container.innerHTML = `
         <div class="agg-bar">
           <span class="agg working">工作中 <b>${counts.working}</b></span>
@@ -82,7 +116,8 @@ export function renderFleetInto(
           <span class="agg disabled">停用 <b>${counts.disabled}</b></span>
           <span class="sep"></span>${lanes}
         </div>
-        <div class="fleet">${workers.length ? workers.map(agentCardHtml).join('') : '<div class="empty">尚无 worker 注册——到「Agent 接入」注册第一个 worker</div>'}</div>`;
+        ${radarHtml}
+        <div class="fleet">${workers.length ? workers.map(agentCardHtml).join('') : '<div class="empty">尚无工蜂注册——到「Agent 接入」注册第一只工蜂</div>'}</div>`;
     } catch (err) {
       if (disposed) return;
       container.innerHTML = `<div class="empty">加载失败：${esc(err instanceof Error ? err.message : '')}</div>`;

@@ -51,8 +51,15 @@ export function openDb(dataDir: string): DatabaseSync {
       acceptance       TEXT NOT NULL DEFAULT '',
       workspace        TEXT NOT NULL DEFAULT '{}',
       files            TEXT NOT NULL DEFAULT '[]',
+      reads            TEXT NOT NULL DEFAULT '[]',
       evidence         TEXT NOT NULL DEFAULT '[]',
       protected_paths  TEXT NOT NULL DEFAULT '[]',
+      review_status    TEXT NOT NULL DEFAULT 'none' CHECK (review_status IN ('none','pending','reviewing','passed','rework','blocked','failed')),
+      review_attempts  INTEGER NOT NULL DEFAULT 0,
+      review_reworks   INTEGER NOT NULL DEFAULT 0,
+      review_summary   TEXT NOT NULL DEFAULT '',
+      submit_summary   TEXT NOT NULL DEFAULT '',
+      requirements     TEXT NOT NULL DEFAULT '{}',
       claimed_at       INTEGER,
       last_activity_at INTEGER,
       auto_unblocked_at INTEGER,
@@ -74,7 +81,8 @@ export function openDb(dataDir: string): DatabaseSync {
       models       TEXT NOT NULL DEFAULT '[]',
       preferred_model TEXT,
       note         TEXT NOT NULL DEFAULT '',
-      host         TEXT NOT NULL DEFAULT ''
+      host         TEXT NOT NULL DEFAULT '',
+      specs        TEXT NOT NULL DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS message (
@@ -137,6 +145,22 @@ export function openDb(dataDir: string): DatabaseSync {
   } catch {
     /* 列已存在 */
   }
+  // 旧库升级：独立审核员 Profile 的任务审核状态与有限重做计数
+  for (const [column, declaration] of [
+    ['review_status', "TEXT NOT NULL DEFAULT 'none' CHECK (review_status IN ('none','pending','reviewing','passed','rework','blocked','failed'))"],
+    ['review_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+    ['review_reworks', 'INTEGER NOT NULL DEFAULT 0'],
+    ['review_summary', "TEXT NOT NULL DEFAULT ''"],
+    ['submit_summary', "TEXT NOT NULL DEFAULT ''"],
+    ['requirements', "TEXT NOT NULL DEFAULT '{}'"],
+    ['reads', "TEXT NOT NULL DEFAULT '[]'"],
+  ] as const) {
+    try {
+      db.exec(`ALTER TABLE task ADD COLUMN ${column} ${declaration}`);
+    } catch {
+      /* 列已存在 */
+    }
+  }
   // 旧库升级：agent 档案（自报模型清单 JSON / 首选模型 / 备注）
   try {
     db.exec("ALTER TABLE agent ADD COLUMN models TEXT NOT NULL DEFAULT '[]'");
@@ -156,6 +180,12 @@ export function openDb(dataDir: string): DatabaseSync {
   // 旧库升级：agent 接入设备名（注册时自报——在哪台设备跑 cli register 就属于哪台设备）
   try {
     db.exec("ALTER TABLE agent ADD COLUMN host TEXT NOT NULL DEFAULT ''");
+  } catch {
+    /* 列已存在 */
+  }
+  // 旧库升级：agent 设备能力自报（操作系统、架构、CPU、内存等规格）
+  try {
+    db.exec("ALTER TABLE agent ADD COLUMN specs TEXT NOT NULL DEFAULT '{}'");
   } catch {
     /* 列已存在 */
   }

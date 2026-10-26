@@ -209,3 +209,52 @@ test('T5: 消息事件经总线实时发布（SSE 数据源）', async () => {
     r.rig.cleanup();
   }
 });
+
+test('Phase 3: 蜂群别名路由——@Queen/@蜂后到主脑，@Bee/@工蜂广播到全体worker', async () => {
+  const r = mkRoomRig();
+  try {
+    await mkBoardWithTask(r);
+    const J = H();
+    // 1. @Queen 发言
+    await r.app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: J,
+      body: JSON.stringify({ content: '@Queen 请启动阶段 3 规划' }),
+    });
+    // 2. @蜂后 发言
+    await r.app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: H(r.bee.token),
+      body: JSON.stringify({ content: '@蜂后 T42 任务已准备妥当' }),
+    });
+    // 3. @Bee 广播给工蜂
+    await r.app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: J,
+      body: JSON.stringify({ content: '@Bee 全体工蜂统一使用临时工作区' }),
+    });
+    // 4. @工蜂 广播
+    await r.app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: J,
+      body: JSON.stringify({ content: '@工蜂 留意代码提交证据' }),
+    });
+
+    const orchInbox = inboxFor(r.rig.ctx, r.orch.agent, 0);
+    // 主脑收到：@Queen + @蜂后（注意两人的消息都指明了主脑别名）
+    assert.ok(orchInbox.some((m) => m.content.includes('@Queen')), '主脑收到 @Queen');
+    assert.ok(orchInbox.some((m) => m.content.includes('@蜂后')), '主脑收到 @蜂后');
+    assert.ok(!orchInbox.some((m) => m.content.includes('@Bee')), '主脑不应收到纯 @Bee 广播');
+
+    const beeInbox = inboxFor(r.rig.ctx, r.bee.agent, 0);
+    const otherInbox = inboxFor(r.rig.ctx, r.other.agent, 0);
+    // 全体 worker 都收到 @Bee 与 @工蜂
+    assert.ok(beeInbox.some((m) => m.content.includes('@Bee')), '工蜂 1 收到 @Bee');
+    assert.ok(beeInbox.some((m) => m.content.includes('@工蜂')), '工蜂 1 收到 @工蜂');
+    assert.ok(otherInbox.some((m) => m.content.includes('@Bee')), '工蜂 2 收到 @Bee');
+    assert.ok(otherInbox.some((m) => m.content.includes('@工蜂')), '工蜂 2 收到 @工蜂');
+    assert.ok(!beeInbox.some((m) => m.content.includes('@Queen')), '工蜂不应收到纯 @Queen');
+  } finally {
+    r.rig.cleanup();
+  }
+});

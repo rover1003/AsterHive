@@ -1,7 +1,7 @@
 // 项目工作台：聊天主舞台（左，主操作面）+ 看板横向条带监视栏（右，状态面）
 // 看板不再是五列竖排：五条水平 lane-strip 纵向堆叠，每条内卡片横向滚动；
 // 详情抽屉（任务消息子流 / 泳道迁移 / 建卡）+ 看板管理抽屉（元数据 / 参与者 / 删除）
-import { api, type Agent, type Board, type Task, type Message } from '../api.ts';
+import { api, type Agent, type Board, type Task, type Message, type RepoTaskDiff } from '../api.ts';
 import { subscribe } from '../sse.ts';
 import { esc, fmtTime, LANE_LABELS, PRIORITY_CLASS, toast } from '../ui.ts';
 import { icon } from '../icons.ts';
@@ -47,7 +47,7 @@ function cardHtml(t: Task): string {
     </div>`;
 }
 
-function drawerHtml(t: Task, msgs: Message[]): string {
+function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): string {
   const actions: string[] = [];
   if (t.lane === 'Backlog') actions.push(`<button data-move="Ready">解锁进 Ready</button>`);
   if (t.lane === 'Ready') {
@@ -59,8 +59,17 @@ function drawerHtml(t: Task, msgs: Message[]): string {
     actions.push(`<button data-release="1">释放</button>`);
   }
   if (t.lane === 'Review') {
-    actions.push(`<button data-move="Done" class="primary">验收 Done</button>`);
-    actions.push(`<button data-move="InProgress">退回执行</button>`);
+    if (t.reviewStatus === 'none') {
+      actions.push(`<button data-move="Done" class="primary">验收 Done</button>`);
+      actions.push(`<button data-move="InProgress">退回执行</button>`);
+    } else if (t.reviewStatus === 'failed') {
+      actions.push(`<button data-review-retry="1" class="primary">重试独立审核</button>`);
+      actions.push(`<button data-move="Done">人工验收通过</button>`);
+      actions.push(`<button data-move="InProgress">人工退回执行</button>`);
+    } else if (t.reviewStatus === 'blocked') {
+      actions.push(`<button data-move="Done" class="primary">人工验收通过</button>`);
+      actions.push(`<button data-move="InProgress">人工退回执行</button>`);
+    }
   }
   if (t.lane === 'Done') actions.push(`<button data-move="Review">重开</button>`);
 
@@ -72,6 +81,19 @@ function drawerHtml(t: Task, msgs: Message[]): string {
   const workspace = Object.keys(t.workspace).length
     ? Object.entries(t.workspace).map(([k, v]) => `<div><span class="muted">${esc(k)}:</span> ${esc(String(v))}</div>`).join('')
     : '<span class="muted">未指定</span>';
+  const reviewSummary = t.reviewSummary && ['passed', 'rework', 'blocked', 'failed'].includes(t.reviewStatus)
+    ? `<div class="field"><label>审核结论</label><div role="status">${esc(t.reviewSummary)}</div></div>`
+    : '';
+  const submitSummary = t.submitSummary
+    ? `<div class="field"><label>Worker 提交摘要</label><div>${esc(t.submitSummary)}</div></div>`
+    : '';
+  const reviewState = t.reviewStatus !== 'none'
+    ? `<div class="field"><label>独立审核</label><div>${esc(({ pending: '排队中', reviewing: '审核中', passed: '已通过', rework: `退回重做 ${t.reviewReworks}/2`, blocked: '超过重做上限，等待人工仲裁', failed: '审核运行失败' } as Record<string, string>)[t.reviewStatus] ?? t.reviewStatus)}${t.reviewAttempts ? ` · 尝试 ${t.reviewAttempts}` : ''}</div></div>`
+    : '';
+  const canInspectDiff = repoMode === 'managed' && (t.lane === 'Review' || t.lane === 'Done' || t.reviewStatus !== 'none');
+  const diffPanel = canInspectDiff
+    ? `<div class="field"><label>代码改动</label><button data-diff-load="1">加载 Diff</button><div data-diff-host aria-live="polite" class="muted small" style="margin-top:8px"></div></div>`
+    : '';
   const substream = msgs.length
     ? msgs
         .map((m) => `<div class="msg-mini"><b>${esc(m.author)}</b> <time>${fmtTime(m.createdAt)}</time><div>${esc(m.content)}</div></div>`)
@@ -92,6 +114,7 @@ function drawerHtml(t: Task, msgs: Message[]): string {
       <div class="drawer-body">
         ${t.detail ? `<div class="field"><label>说明</label><div>${esc(t.detail)}</div></div>` : ''}
         ${t.acceptance ? `<div class="field"><label>验收标准</label><div class="acceptance">${esc(t.acceptance)}</div></div>` : ''}
+        ${reviewState}${submitSummary}${reviewSummary}
         <div class="field"><label>负责人</label><div>${t.assignee === 'unassigned' ? '<span class="muted">未指派</span>' : '@' + esc(t.assignee)}</div></div>
         <div class="field"><label>依赖</label><div>${deps}</div></div>
         <div class="field"><label>工作区</label><div>${workspace}</div></div>
@@ -232,9 +255,57 @@ export async function render(el: HTMLElement): Promise<void> {
           .get<{ messages: Message[] }>(`/boards/${currentBoard}/messages?limit=500`)
           .catch(() => ({ messages: [] as Message[] }))
       ).messages.filter((m) => m.taskRef === id);
-    drawerHost.innerHTML = drawerHtml(t, sub);
+    drawerHost.innerHTML = drawerHtml(t, sub, board.repoMode);
     drawerHost.querySelector('#drawer-close')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
     drawerHost.querySelector('#drawer-mask')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
+    const diffButton = drawerHost.querySelector('[data-diff-load]') as HTMLButtonElement | null;
+    const diffHost = drawerHost.querySelector('[data-diff-host]') as HTMLElement | null;
+    diffButton?.addEventListener('click', async () => {
+      if (!diffHost) return;
+      diffButton.disabled = true;
+      diffButton.setAttribute('aria-busy', 'true');
+      diffButton.textContent = '正在加载 Diff…';
+      diffHost.setAttribute('role', 'status');
+      diffHost.textContent = '正在读取服务器托管仓库的任务差异…';
+      try {
+        const diff = await api.get<RepoTaskDiff>(`/tasks/${encodeURIComponent(id)}/repo-diff`);
+        const rows = diff.diffText.split('\n').map((line) => {
+          const kind = line.startsWith('+') && !line.startsWith('+++') ? 'diff-add'
+            : line.startsWith('-') && !line.startsWith('---') ? 'diff-del'
+              : line.startsWith('@@') ? 'diff-hunk' : '';
+          return `<span class="diff-line ${kind}">${esc(line) || '&nbsp;'}</span>`;
+        }).join('');
+        diffHost.innerHTML = `
+          <div class="diff-meta"><div><span class="muted">基线</span> <code>${esc(diff.base.slice(0, 12))}</code> <span class="muted">→ 任务提交</span> <code>${esc(diff.head.slice(0, 12))}</code></div>
+          <pre class="repo-diff"><code>${rows || '<span class="muted">没有文本差异</span>'}</code></pre>
+          ${diff.diffTruncated ? '<div class="warn" role="status">Diff 超过 50 KB，显示内容已截断；审核时不会对截断 Diff 自动判定通过。</div>' : ''}
+          <details><summary>变更文件与统计</summary><pre class="diff-stat">${esc(diff.diffStat || '无统计')}</pre><ul>${diff.changedFiles.map((path) => `<li><code>${esc(path)}</code></li>`).join('') || '<li class="muted">无变更文件</li>'}</ul></details>
+        </div>`;
+        diffButton.textContent = '重新加载 Diff';
+      } catch (err) {
+        diffHost.innerHTML = `<span class="warn" role="alert">Diff 加载失败：${esc(err instanceof Error ? err.message : String(err))}</span>`;
+        diffButton.textContent = '重试加载 Diff';
+      } finally {
+        diffButton.disabled = false;
+        diffButton.removeAttribute('aria-busy');
+      }
+    });
+    const retryReviewBtn = drawerHost.querySelector('[data-review-retry]');
+    retryReviewBtn?.addEventListener('click', async () => {
+      const button = retryReviewBtn as HTMLButtonElement;
+      button.disabled = true;
+      button.textContent = '正在重新排队…';
+      try {
+        await api.post(`/tasks/${id}/review/retry`, {});
+        toast('独立审核已重新排队');
+        tasks = await load();
+        await openDrawer(id, sub);
+      } catch (err) {
+        button.disabled = false;
+        button.textContent = '重试独立审核';
+        toast(`重试失败：${err instanceof Error ? err.message : ''}`, true);
+      }
+    });
     drawerHost.querySelectorAll('[data-move]').forEach((btn) => {
       btn.addEventListener('click', async () => {
             const to = (btn as HTMLElement).dataset.move!;

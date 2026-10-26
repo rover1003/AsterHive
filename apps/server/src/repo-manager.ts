@@ -29,14 +29,14 @@ function validRemote(remote: string): boolean {
   return /^git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+(?:\.git)?$/.test(remote);
 }
 
-function runGit(args: string[], cwd?: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runGit(args: string[], cwd?: string, allowLocalTransport = false): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn('git', args, {
       cwd,
       env: {
         ...process.env,
         GIT_TERMINAL_PROMPT: '0',
-        GIT_ALLOW_PROTOCOL: 'https:ssh:file',
+        GIT_ALLOW_PROTOCOL: allowLocalTransport ? 'https:ssh:file' : 'https:ssh',
         GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME || 'AsterHive Server',
         GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL || 'server@asterhive.internal',
         GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME || 'AsterHive Server',
@@ -185,7 +185,7 @@ export class RepoManager {
       });
       const branches = refs.filter((ref) => ref.startsWith('refs/heads/'));
       if (!branches.length) throw new HttpError(422, 'Git bundle must contain at least one branch');
-      const fetched = await runGit(['fetch', bundle, '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*'], repo);
+      const fetched = await runGit(['fetch', bundle, '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*'], repo, true);
       if (fetched.code !== 0) throw new HttpError(422, `Git bundle import failed: ${safeError(fetched.stderr)}`);
       const defaultBranch = branches.includes('refs/heads/main') ? 'main'
         : branches.includes('refs/heads/master') ? 'master'
@@ -223,6 +223,12 @@ export class RepoManager {
     if (created.code !== 0) {
       rmSync(tempDir, { recursive: true, force: true });
       throw new HttpError(500, `failed to generate task snapshot bundle: ${safeError(created.stderr)}`);
+    }
+    const baseRef = `refs/asterhive/task-bases/${taskId}`;
+    const storedBase = await runGit(['update-ref', baseRef, baseCommit], repo);
+    if (storedBase.code !== 0) {
+      rmSync(tempDir, { recursive: true, force: true });
+      throw new HttpError(500, `failed to record task snapshot base: ${safeError(storedBase.stderr)}`);
     }
     return {
       bundlePath: bundle,
@@ -278,8 +284,10 @@ export class RepoManager {
       if (!commit || !refName) throw new HttpError(422, 'malformed ref line in bundle');
 
       const targetRef = `refs/asterhive/tasks/${taskId}`;
-      const fetched = await runGit(['fetch', bundle, `+${refName}:${targetRef}`], repo);
+      const fetched = await runGit(['fetch', bundle, `+${refName}:${targetRef}`], repo, true);
       if (fetched.code !== 0) throw new HttpError(422, `failed to store task result ref: ${safeError(fetched.stderr)}`);
+      const update = await runGit(['update-ref', targetRef, commit], repo);
+      if (update.code !== 0) throw new HttpError(422, `failed to finalize task result ref: ${safeError(update.stderr)}`);
 
       withWrite(this.#ctx, 'repo.task_stored', () => logEvent(this.#ctx, 'repo.task_stored', { boardId, taskId, targetRef, commit }));
       return { taskRef: targetRef, headCommit: commit };
@@ -292,7 +300,7 @@ export class RepoManager {
     }
   }
 
-  async inspectTask(boardId: string, taskId: string): Promise<{ base: string; head: string; diffStat: string; changedFiles: string[] }> {
+  async inspectTask(boardId: string, taskId: string): Promise<{ base: string; head: string; diffStat: string; changedFiles: string[]; diffText: string; diffTruncated: boolean }> {
     const board = getBoard(this.#ctx, boardId);
     if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
     const repo = this.repoPath(boardId);
@@ -300,16 +308,29 @@ export class RepoManager {
     const headRes = await runGit(['rev-parse', targetRef], repo);
     if (headRes.code !== 0 || !headRes.stdout.trim()) throw new HttpError(404, `task ref ${targetRef} not found`);
     const head = headRes.stdout.trim();
-    const baseRes = await runGit(['merge-base', 'HEAD', targetRef], repo);
-    if (baseRes.code !== 0 || !baseRes.stdout.trim()) throw new HttpError(422, 'no common ancestor between master and task');
-    const base = baseRes.stdout.trim();
+    const taskRow = this.#ctx.holder.db.prepare('SELECT review_summary, submit_summary, review_status FROM task WHERE id=? AND board_id=?').get(taskId, boardId) as { review_summary: string; submit_summary: string; review_status: string } | undefined;
+    if (!taskRow) throw new HttpError(404, `task not found: ${taskId}`);
+    const baseRef = `refs/asterhive/task-bases/${taskId}`;
+    let base = '';
+    const storedBase = await runGit(['rev-parse', '--verify', baseRef], repo);
+    if (storedBase.code === 0 && storedBase.stdout.trim()) {
+      base = storedBase.stdout.trim();
+    } else {
+      const parentRes = await runGit(['rev-list', '--max-parents=0', head], repo);
+      if (parentRes.code !== 0 || !parentRes.stdout.trim()) throw new HttpError(422, 'task branch has no verifiable base commit');
+      base = parentRes.stdout.trim();
+    }
     const statRes = await runGit(['diff', '--stat', base, head], repo);
     const filesRes = await runGit(['diff', '--name-only', base, head], repo);
+    const diffRes = await runGit(['diff', '-p', base, head], repo);
+    const diffText = diffRes.stdout.slice(0, 50_000);
     return {
       base,
       head,
       diffStat: statRes.stdout.slice(-2000),
       changedFiles: filesRes.stdout.split('\n').map((l) => l.trim()).filter(Boolean),
+      diffText,
+      diffTruncated: diffRes.stdout.length > diffText.length,
     };
   }
 
@@ -322,14 +343,22 @@ export class RepoManager {
     if (headRes.code !== 0 || !headRes.stdout.trim()) throw new HttpError(404, `task ref ${targetRef} not found`);
     const taskCommit = headRes.stdout.trim();
 
-    // 结构化合并：在临时工作树中尝试 merge，无冲突则推进 master 并打审计日志
+    // 结构化合并：在临时工作树中尝试 merge 到 bare 仓库 HEAD 指向的默认分支
     const tempWork = join(this.root, `.integrate-${boardId}-${taskId}-${randomUUID()}`);
     mkdirSync(tempWork, { recursive: true, mode: 0o700 });
     try {
-      const clone = await runGit(['clone', '--local', repo, tempWork]);
+      const defaultRefRes = await runGit(['symbolic-ref', 'HEAD'], repo);
+      if (defaultRefRes.code !== 0 || !defaultRefRes.stdout.trim().startsWith('refs/heads/')) {
+        throw new HttpError(409, 'server repository default branch is not configured');
+      }
+      const defaultRef = defaultRefRes.stdout.trim();
+      const defaultBranch = defaultRef.slice('refs/heads/'.length);
+      const clone = await runGit(['clone', '--local', repo, tempWork], undefined, true);
       if (clone.code !== 0) throw new HttpError(500, `integrate workspace setup failed: ${safeError(clone.stderr)}`);
-      const fetchTask = await runGit(['fetch', 'origin', `+${targetRef}:refs/remotes/origin/task-${taskId}`], tempWork);
+      const fetchTask = await runGit(['fetch', 'origin', `+${targetRef}:refs/remotes/origin/task-${taskId}`], tempWork, true);
       if (fetchTask.code !== 0) throw new HttpError(500, `integrate task fetch failed: ${safeError(fetchTask.stderr)}`);
+      const checkout = await runGit(['checkout', defaultBranch], tempWork);
+      if (checkout.code !== 0) throw new HttpError(500, `could not checkout default branch ${defaultBranch}: ${safeError(checkout.stderr)}`);
       
       const merge = await runGit([
         'merge',
@@ -342,9 +371,9 @@ export class RepoManager {
         const status = await runGit(['status', '--short'], tempWork);
         throw new HttpError(409, `Merge conflict integrating task ${taskId} (merge code ${merge.code}): ${merge.stderr}\n${status.stdout.slice(-1500)}`);
       }
-      const push = await runGit(['push', 'origin', 'HEAD:refs/heads/main'], tempWork);
-      if (push.code !== 0) throw new HttpError(500, `failed to push integrated master: ${safeError(push.stderr)}`);
-      const newHeadRes = await runGit(['rev-parse', 'HEAD'], repo);
+      const push = await runGit(['push', 'origin', `HEAD:${defaultRef}`], tempWork, true);
+      if (push.code !== 0) throw new HttpError(500, `failed to push integrated default branch: ${safeError(push.stderr)}`);
+      const newHeadRes = await runGit(['rev-parse', defaultRef], repo);
       const mergedCommit = newHeadRes.stdout.trim();
       setBoardRepoState(this.#ctx, boardId, { status: 'ready', head: mergedCommit });
       withWrite(this.#ctx, 'repo.task_integrated', () => logEvent(this.#ctx, 'repo.task_integrated', { boardId, taskId, taskCommit, mergedCommit }));

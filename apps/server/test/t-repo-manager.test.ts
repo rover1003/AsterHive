@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkRig } from './helpers.ts';
-import { createBoard, getBoard } from '../src/tasks.ts';
+import { createBoard, getBoard, createTask, getTask, finalizeTaskReview, claimTaskForReview, failTaskReview, retryTaskReview, recoverReviewerClaims } from '../src/tasks.ts';
+import { registerAgent } from '../src/agents.ts';
+import { submitTask } from '../src/verbs.ts';
 import { RepoManager } from '../src/repo-manager.ts';
 
 function git(args: string[], cwd?: string): string {

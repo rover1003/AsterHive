@@ -14,7 +14,15 @@
 //   ZCODE_BIN          zcode 可执行（默认本机 ZCode Desktop 的 zcode.cjs，找不到再退 PATH 的 zcode）
 //   POLL_MS            轮询间隔（默认 10000；每次轮询同时充当心跳）
 //   TASK_TIMEOUT_MS    单任务执行超时（默认 1800000 = 30 分钟）
-import { SdkError, Worker, defaultWorkerIdentity, registerWithRetry, type Task, type PendingMessage } from '@asterhive/sdk';
+import {
+  SdkError,
+  Worker,
+  defaultWorkerIdentity,
+  registerWithRetry,
+  detectDeviceSpecs,
+  type Task,
+  type PendingMessage,
+} from '@asterhive/sdk';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
@@ -150,12 +158,22 @@ function runExecutor(prompt: string, cwd: string, model: string | undefined): Pr
   const promptArg = ex.kind === 'omp' ? `@${promptFile.replace(/\\/g, '/')}` : prompt;
   const flagArgs =
     ex.kind === 'omp'
-      ? ['--cwd', `"${cwd.replace(/\\/g, '/')}"`, ...(model ? ['--model', model] : [])]
+      ? [
+          '--print',
+          '--no-prewalk',
+          '--no-title',
+          '--no-skills',
+          '--auto-approve',
+          '--cwd',
+          cwd.replace(/\\/g, '/'),
+          ...(model ? ['--model', model] : []),
+        ]
       : ['--mode', 'yolo'];
   return new Promise((resolveRun) => {
-    const child = spawn(ex.cmd, [...ex.args, promptArg, ...flagArgs], {
+    const child = spawn(ex.cmd, [...ex.args, ...flagArgs, promptArg], {
       cwd,
       shell: process.platform === 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ASTERHIVE_WORKER: '1' },
     });
     let stdout = '';
@@ -326,28 +344,39 @@ async function main(): Promise<void> {
     if (lines[1]) CFG.handle = lines[1];
   }
   const worker = new Worker(CFG.url, CFG.token, CFG.handle);
+  const deviceSpecs = detectDeviceSpecs(detectExecutorKind());
   if (!CFG.token) {
-    // 注册时自报接入设备名（本机主机名），UI「设备」列据此显示 worker 属于哪台设备；
+    // 注册时自报接入设备名（本机主机名）与硬件规格；
     // registerWithRetry：handle 撞名（409）自动加 -2/-3… 后缀，接入不需要人工挑名字
     const reg = await registerWithRetry(worker, {
       name: CFG.name,
       handle: CFG.handle,
       models: CFG.models,
       host: hostname(),
+      specs: deviceSpecs,
     });
     if (reg.handle !== CFG.handle) log(`句柄 @${CFG.handle} 已被占用，自动改用 @${reg.handle}`);
     CFG.handle = reg.handle; // 后续日志与 token.txt 落盘用实际生效的句柄
     // token 只此一次：落盘到 work 目录（连同实际 handle），供下次复用
     mkdirSync(CFG.workdirRoot, { recursive: true });
     writeFileSync(join(CFG.workdirRoot, 'token.txt'), `${reg.token}\n${reg.handle}\n`, 'utf8');
-    log(`已注册 worker ${reg.handle}（token 已存 ${join(CFG.workdirRoot, 'token.txt')}）`);
-  } else if (CFG.models.length > 0) {
-    // token 复用（已注册）：设备主人可能改过本机模型，启动时全量重报一次
+    log(`已注册工蜂 ${reg.handle}（token 已存 ${join(CFG.workdirRoot, 'token.txt')}）`);
+    log(`已自报设备能力：${deviceSpecs.os}/${deviceSpecs.arch} · ${deviceSpecs.cpus}C/${deviceSpecs.memoryTotalGb}GB · 内核 ${deviceSpecs.executor}`);
+  } else {
+    // token 复用（已注册）：启动时自报设备硬件能力与模型清单
     try {
-      const reported = await worker.reportModels(CFG.models);
-      log(`已上报模型清单：${reported.join('、')}`);
+      await worker.reportSpecs(deviceSpecs);
+      log(`已自报设备能力：${deviceSpecs.os}/${deviceSpecs.arch} · ${deviceSpecs.cpus}C/${deviceSpecs.memoryTotalGb}GB · 内核 ${deviceSpecs.executor}`);
     } catch (err) {
-      log('模型清单上报失败（不影响取活）：', err instanceof Error ? err.message : err);
+      log('设备能力规格上报失败（非致命）：', err instanceof Error ? err.message : err);
+    }
+    if (CFG.models.length > 0) {
+      try {
+        const reported = await worker.reportModels(CFG.models);
+        log(`已上报模型清单：${reported.join('、')}`);
+      } catch (err) {
+        log('模型清单上报失败（不影响取活）：', err instanceof Error ? err.message : err);
+      }
     }
   }
 
@@ -527,7 +556,24 @@ async function main(): Promise<void> {
       const cp1 = await worker.checkpoint(task.id, reworkNotes.length ? '收到退回反馈，开始重做' : '开始执行');
       logPending(cp1.pendingMessages);
 
-      const { stdout, code } = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model);
+      const startTime = Date.now();
+      const keepAliveIntervalMs = 60000;
+      const keepAliveTimer = setInterval(() => {
+        const mins = Math.max(1, Math.round((Date.now() - startTime) / 60000));
+        void worker.checkpoint(task.id, `进行中：任务持续执行（已耗时约 ${mins} 分钟）`).then((cp) => {
+          logPending(cp.pendingMessages);
+        }).catch((err) => {
+          log('保活心跳发送失败（非致命）：', err instanceof Error ? err.message : err);
+        });
+      }, keepAliveIntervalMs);
+
+      let execRes: { stdout: string; code: number | null };
+      try {
+        execRes = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model);
+      } finally {
+        clearInterval(keepAliveTimer);
+      }
+      const { stdout, code } = execRes;
       log(`执行结束（exit=${code}），输出 ${stdout.length} 字符`);
       const cp2 = await worker.checkpoint(task.id, code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），仍上交现场`);
       logPending(cp2.pendingMessages);

@@ -229,3 +229,101 @@ test('agent 设置: 启停与档案合一端点不破坏原语义——只传 en
     rig.cleanup();
   }
 });
+
+test('Phase 4: 工蜂设备硬件能力自报——注册自报、me/specs 自报、心跳更新与 422 校验', async () => {
+  const rig = mkRig();
+  try {
+    const app = createApp(rig.ctx);
+    // 1. 注册时自报 specs
+    let regRes = await app.request('/agents/register', {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({
+        name: 'Omp Bee',
+        handle: 'omp-bee',
+        models: ['gemini-flash'],
+        host: 'X5800',
+        specs: {
+          os: 'win32',
+          arch: 'x64',
+          cpus: 16,
+          memoryTotalGb: 32,
+          executor: 'omp',
+        },
+      }),
+    });
+    assert.equal(regRes.status, 201);
+    const regData = (await regRes.json()) as { agent: Agent; token: string };
+    assert.equal(regData.agent.specs.os, 'win32');
+    assert.equal(regData.agent.specs.arch, 'x64');
+    assert.equal(regData.agent.specs.cpus, 16);
+    assert.equal(regData.agent.specs.memoryTotalGb, 32);
+    assert.equal(regData.agent.specs.executor, 'omp');
+
+    // 2. overview 接口可见 specs
+    let ovRes = await app.request('/overview', { headers: H() });
+    assert.equal(ovRes.status, 200);
+    const ov = (await ovRes.json()) as { agents: { id: string; specs?: { cpus?: number; memoryTotalGb?: number } }[] };
+    const beeOv = ov.agents.find((a) => a.id === 'omp-bee');
+    assert.ok(beeOv, 'overview 中包含 omp-bee');
+    assert.equal(beeOv.specs?.cpus, 16);
+    assert.equal(beeOv.specs?.memoryTotalGb, 32);
+
+    // 3. me/specs 自报更新
+    let updateRes = await app.request('/agents/me/specs', {
+      method: 'POST',
+      headers: H(regData.token),
+      body: JSON.stringify({
+        specs: {
+          os: 'win32',
+          arch: 'x64',
+          cpus: 16,
+          memoryTotalGb: 64, // 扩容到 64G
+          executor: 'omp',
+          gpu: 'RTX 4090',
+        },
+      }),
+    });
+    assert.equal(updateRes.status, 200);
+    const updated = (await updateRes.json()) as { agent: Agent };
+    assert.equal(updated.agent.specs.memoryTotalGb, 64);
+    assert.equal(updated.agent.specs.gpu, 'RTX 4090');
+
+    // 检查事件台账
+    const events = listEvents(rig.ctx);
+    assert.ok(events.some((e) => e.type === 'agent.specs_reported'), 'agent.specs_reported 事件落账');
+
+    // 4. 心跳携带 specs 顺便刷新
+    let hbRes = await app.request('/agents/omp-bee/heartbeat', {
+      method: 'POST',
+      headers: H(regData.token),
+      body: JSON.stringify({
+        specs: {
+          memoryTotalGb: 64,
+          gpu: 'RTX 4090 (Driver updated)',
+        },
+      }),
+    });
+    assert.equal(hbRes.status, 200);
+    const hbData = (await hbRes.json()) as { agent: Agent };
+    assert.equal(hbData.agent.specs.gpu, 'RTX 4090 (Driver updated)');
+
+    // 5. 校验边界：非法 cpus 或 非法载荷报 422
+    let badRes = await app.request('/agents/me/specs', {
+      method: 'POST',
+      headers: H(regData.token),
+      body: JSON.stringify({ specs: { cpus: -4 } }),
+    });
+    assert.equal(badRes.status, 422);
+
+    // 6. 无效 token 报 401
+    let badTokenRes = await app.request('/agents/me/specs', {
+      method: 'POST',
+      headers: H('invalid-token'),
+      body: JSON.stringify({ specs: { cpus: 8 } }),
+    });
+    assert.equal(badTokenRes.status, 401);
+  } finally {
+    rig.cleanup();
+  }
+});

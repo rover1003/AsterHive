@@ -5,6 +5,16 @@ import { withWrite, logEvent } from './write.ts';
 
 export type AgentRole = 'worker' | 'orchestrator' | 'user';
 
+/** 工蜂设备硬件能力规格（Phase 4：隐私最小化，仅上报调度相关指标） */
+export interface AgentSpecs {
+  os?: string; // 如 'win32' | 'darwin' | 'linux'
+  arch?: string; // 如 'x64' | 'arm64'
+  cpus?: number; // CPU 逻辑核心数
+  memoryTotalGb?: number; // 物理总内存（GB，四舍五入）
+  executor?: string; // 运行内核，如 'omp' | 'zcode' | 'shell'
+  gpu?: string; // 可选 GPU 标识
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -21,10 +31,19 @@ export interface Agent {
   note: string;
   /** 接入设备名（注册时自报，如 os.hostname()；注册后不再变更，空 = 手动预创建的身份壳） */
   host: string;
+  /** 设备能力规格（操作系统、架构、CPU、内存等） */
+  specs: AgentSpecs;
 }
 
-// '@主脑' 为保留句柄，指向当前主脑（模式 A/B 通用），不允许注册占用。
-const RESERVED_HANDLES = new Set(['主脑', 'orchestrator', 'brain']);
+// 蜂群主脑保留句柄，不允许普通注册占用
+const RESERVED_HANDLES = new Set([
+  '主脑',
+  'orchestrator',
+  'brain',
+  '蜂后',
+  'queen',
+  'Queen',
+]);
 
 export type AgentRow = {
   id: string;
@@ -39,6 +58,7 @@ export type AgentRow = {
   preferred_model: string | null;
   note: string;
   host: string;
+  specs?: string;
 };
 
 function parseModels(raw: string | undefined | null): string[] {
@@ -50,6 +70,60 @@ function parseModels(raw: string | undefined | null): string[] {
   } catch {
     return [];
   }
+}
+
+function parseSpecs(raw: string | undefined | null): AgentSpecs {
+  try {
+    const parsed = JSON.parse(raw ?? '{}') as unknown;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+    const obj = parsed as Record<string, unknown>;
+    const specs: AgentSpecs = {};
+    if (typeof obj.os === 'string') specs.os = obj.os.trim().slice(0, 32);
+    if (typeof obj.arch === 'string') specs.arch = obj.arch.trim().slice(0, 32);
+    if (typeof obj.cpus === 'number' && Number.isSafeInteger(obj.cpus) && obj.cpus > 0) specs.cpus = obj.cpus;
+    if (typeof obj.memoryTotalGb === 'number' && obj.memoryTotalGb > 0) specs.memoryTotalGb = Math.round(obj.memoryTotalGb * 10) / 10;
+    if (typeof obj.executor === 'string') specs.executor = obj.executor.trim().slice(0, 32);
+    if (typeof obj.gpu === 'string') specs.gpu = obj.gpu.trim().slice(0, 64);
+    return specs;
+  } catch {
+    return {};
+  }
+}
+
+export function normalizeSpecs(raw: unknown): AgentSpecs {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(422, 'specs: object required');
+  const obj = raw as Record<string, unknown>;
+  const out: AgentSpecs = {};
+  if (obj.os !== undefined) {
+    if (typeof obj.os !== 'string') throw new HttpError(422, 'specs.os: string required');
+    out.os = obj.os.trim().slice(0, 32);
+  }
+  if (obj.arch !== undefined) {
+    if (typeof obj.arch !== 'string') throw new HttpError(422, 'specs.arch: string required');
+    out.arch = obj.arch.trim().slice(0, 32);
+  }
+  if (obj.cpus !== undefined) {
+    if (typeof obj.cpus !== 'number' || !Number.isSafeInteger(obj.cpus) || obj.cpus <= 0) {
+      throw new HttpError(422, 'specs.cpus: positive integer required');
+    }
+    out.cpus = obj.cpus;
+  }
+  if (obj.memoryTotalGb !== undefined) {
+    if (typeof obj.memoryTotalGb !== 'number' || obj.memoryTotalGb <= 0) {
+      throw new HttpError(422, 'specs.memoryTotalGb: positive number required');
+    }
+    out.memoryTotalGb = Math.round(obj.memoryTotalGb * 10) / 10;
+  }
+  if (obj.executor !== undefined) {
+    if (typeof obj.executor !== 'string') throw new HttpError(422, 'specs.executor: string required');
+    out.executor = obj.executor.trim().slice(0, 32);
+  }
+  if (obj.gpu !== undefined) {
+    if (typeof obj.gpu !== 'string') throw new HttpError(422, 'specs.gpu: string required');
+    out.gpu = obj.gpu.trim().slice(0, 64);
+  }
+  return out;
 }
 
 function rowToAgent(r: AgentRow): Agent {
@@ -65,6 +139,7 @@ function rowToAgent(r: AgentRow): Agent {
     preferredModel: r.preferred_model,
     note: r.note ?? '',
     host: r.host ?? '',
+    specs: parseSpecs(r.specs),
   };
 }
 
@@ -81,6 +156,8 @@ export interface RegisterInput {
   models?: string[];
   /** 注册时自报接入设备名（可选，通常由 CLI 填 os.hostname()；注册后不再变更） */
   host?: string;
+  /** 注册时自报设备硬件能力（可选，如 OS/架构/CPU/内存） */
+  specs?: AgentSpecs;
 }
 
 // 模型清单归一：去空白、去空项、去重；每项过乱码校验（注册自报与 me/models 共用）。
@@ -121,16 +198,17 @@ export function registerAgent(ctx: Ctx, input: RegisterInput): { agent: Agent; t
   // host 归一：trim + 截断 64 字符；非空才过乱码校验（手动预创建的身份壳 host 为空串）
   const host = String(input.host ?? '').trim().slice(0, 64);
   if (host) assertNoMojibake(host, 'host');
+  const specs = normalizeSpecs(input.specs);
   const id = (input.id ?? handle).trim();
   const token = 'ah_' + randomBytes(24).toString('base64url');
   try {
     withWrite(ctx, 'agent.register', () => {
       ctx.holder.db
         .prepare(
-          'INSERT INTO agent (id, name, handle, role, token_hash, enabled, created_at, models, host) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)',
+          'INSERT INTO agent (id, name, handle, role, token_hash, enabled, created_at, models, host, specs) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)',
         )
-        .run(id, input.name, handle, role, hashToken(token), Date.now(), JSON.stringify(models), host);
-      logEvent(ctx, 'agent.registered', { agentId: id, handle, role, host });
+        .run(id, input.name, handle, role, hashToken(token), Date.now(), JSON.stringify(models), host, JSON.stringify(specs));
+      logEvent(ctx, 'agent.registered', { agentId: id, handle, role, host, specs });
     });
   } catch (err) {
     if (err instanceof Error && err.message.includes('UNIQUE')) {
@@ -225,6 +303,17 @@ export function reportAgentModels(ctx: Ctx, id: string, models: unknown): Agent 
   withWrite(ctx, 'agent.modelsReported', () => {
     ctx.holder.db.prepare('UPDATE agent SET models = ? WHERE id = ?').run(JSON.stringify(list), id);
     logEvent(ctx, 'agent.models_reported', { agentId: id, models: list });
+  });
+  return getAgent(ctx, id);
+}
+
+// 自报/更新设备能力规格（操作系统、架构、CPU、内存等）
+export function reportAgentSpecs(ctx: Ctx, id: string, rawSpecs: unknown): Agent {
+  const specs = normalizeSpecs(rawSpecs);
+  getAgent(ctx, id); // 404 if missing
+  withWrite(ctx, 'agent.specsReported', () => {
+    ctx.holder.db.prepare('UPDATE agent SET specs = ? WHERE id = ?').run(JSON.stringify(specs), id);
+    logEvent(ctx, 'agent.specs_reported', { agentId: id, specs });
   });
   return getAgent(ctx, id);
 }

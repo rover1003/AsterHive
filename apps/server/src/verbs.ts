@@ -245,24 +245,32 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   if (reviewCount.n >= reviewLimit) {
     throw new HttpError(409, `WIP limit reached for Review on board ${task.boardId} (limit ${reviewLimit})`);
   }
+  const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
+  let reviewerEnabled = false;
+  try {
+    reviewerEnabled = JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && board.repoMode === 'managed';
+  } catch { /* invalid settings fall back to manual review */ }
   const evidence = [...(task.evidence ?? []), ...(input.evidence ?? [])];
   return withWrite(ctx, 'task.submit', () => {
     const now = Date.now();
     ctx.holder.db
-      .prepare("UPDATE task SET lane = 'Review', evidence = ?, last_activity_at = ?, updated_at = ? WHERE id = ?")
-      .run(JSON.stringify(evidence), now, now, taskId);
+      .prepare("UPDATE task SET lane='Review', review_status=?, review_attempts=0, review_reworks=CASE WHEN review_status='rework' THEN review_reworks ELSE 0 END, review_summary='', submit_summary=?, evidence=?, last_activity_at=?, updated_at=? WHERE id=?")
+      .run(reviewerEnabled ? 'pending' : 'none', input.summary.trim().slice(0, 6000), JSON.stringify(evidence), now, now, taskId);
     logEvent(ctx, 'task.submitted', {
       taskId,
       by: actor.id,
       summary: input.summary.trim(),
       evidence: input.evidence ?? [],
+      reviewerEnabled,
     });
-    // 上交在聊天室渲染为一条 @主脑 的 submit 消息（同一事件，两个投影）
+    if (reviewerEnabled) logEvent(ctx, 'task.review_queued', { taskId, boardId: task.boardId });
     messageInner(ctx, {
       boardId: task.boardId,
       author: actor.id,
       kind: 'submit',
-      content: `@主脑 ${taskId} 已完成：${input.summary.trim()}`,
+      content: reviewerEnabled
+        ? `@主脑 ${taskId} 已完成并排队独立审核：${input.summary.trim()}`
+        : `@主脑 ${taskId} 已完成：${input.summary.trim()}`,
     });
     return getTask(ctx, taskId);
   });

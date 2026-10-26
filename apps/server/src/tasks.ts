@@ -2,6 +2,7 @@ import type { Ctx } from './types.ts';
 import { HttpError, assertNoMojibake } from './types.ts';
 import type { SQLInputValue } from 'node:sqlite';
 import { withWrite, logEvent } from './write.ts';
+import { messageInner } from './messages.ts';
 import { getAgent, type Agent } from './agents.ts';
 
 export const LANES = ['Backlog', 'Ready', 'InProgress', 'Review', 'Done'] as const;
@@ -28,6 +29,21 @@ export interface Board {
   updatedAt: number;
 }
 
+export interface TaskRequirements {
+  /** 期望或必需的操作系统，如 'win32' | 'linux' | 'darwin' */
+  os?: string;
+  /** 期望或必需的架构，如 'x64' | 'arm64' */
+  arch?: string;
+  /** 最低 CPU 核心数 */
+  minCpus?: number;
+  /** 最低物理内存（GB） */
+  minMemoryGb?: number;
+  /** 必需的模型或系列标识（模糊匹配，如 'gemini' | 'opus' | 'gpt-5'） */
+  requiredModel?: string;
+  /** 期望执行内核，如 'omp' | 'zcode' */
+  executor?: string;
+}
+
 export interface Task {
   id: string;
   boardId: string;
@@ -41,8 +57,15 @@ export interface Task {
   acceptance: string;
   workspace: Record<string, unknown>;
   files: string[];
+  reads: string[];
   evidence: { path: string; machine?: string; note?: string }[];
   protectedPaths: string[];
+  requirements: TaskRequirements;
+  reviewStatus: 'none' | 'pending' | 'reviewing' | 'passed' | 'rework' | 'blocked' | 'failed';
+  reviewAttempts: number;
+  reviewReworks: number;
+  reviewSummary: string;
+  submitSummary: string;
   claimedAt: number | null;
   lastActivityAt: number | null;
   autoUnblockedAt: number | null;
@@ -63,14 +86,75 @@ type TaskRow = {
   acceptance: string;
   workspace: string;
   files: string;
+  reads?: string;
   evidence: string;
   protected_paths: string;
+  requirements?: string;
+  review_status: Task['reviewStatus'];
+  review_attempts: number;
+  review_reworks: number;
+  review_summary: string;
+  submit_summary: string;
   claimed_at: number | null;
   last_activity_at: number | null;
   auto_unblocked_at: number | null;
   created_at: number;
   updated_at: number;
 };
+
+export function parseRequirements(raw: string | undefined | null): TaskRequirements {
+  try {
+    const parsed = JSON.parse(raw ?? '{}') as unknown;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
+    const obj = parsed as Record<string, unknown>;
+    const req: TaskRequirements = {};
+    if (typeof obj.os === 'string') req.os = obj.os.trim().toLowerCase();
+    if (typeof obj.arch === 'string') req.arch = obj.arch.trim().toLowerCase();
+    if (typeof obj.minCpus === 'number' && Number.isSafeInteger(obj.minCpus) && obj.minCpus > 0) req.minCpus = obj.minCpus;
+    if (typeof obj.minMemoryGb === 'number' && obj.minMemoryGb > 0) req.minMemoryGb = obj.minMemoryGb;
+    if (typeof obj.requiredModel === 'string') req.requiredModel = obj.requiredModel.trim();
+    if (typeof obj.executor === 'string') req.executor = obj.executor.trim().toLowerCase();
+    return req;
+  } catch {
+    return {};
+  }
+}
+
+export function normalizeRequirements(raw: unknown): TaskRequirements {
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(422, 'requirements: object required');
+  const obj = raw as Record<string, unknown>;
+  const req: TaskRequirements = {};
+  if (obj.os !== undefined) {
+    if (typeof obj.os !== 'string') throw new HttpError(422, 'requirements.os: string required');
+    req.os = obj.os.trim().toLowerCase();
+  }
+  if (obj.arch !== undefined) {
+    if (typeof obj.arch !== 'string') throw new HttpError(422, 'requirements.arch: string required');
+    req.arch = obj.arch.trim().toLowerCase();
+  }
+  if (obj.minCpus !== undefined) {
+    if (typeof obj.minCpus !== 'number' || !Number.isSafeInteger(obj.minCpus) || obj.minCpus <= 0) {
+      throw new HttpError(422, 'requirements.minCpus: positive integer required');
+    }
+    req.minCpus = obj.minCpus;
+  }
+  if (obj.minMemoryGb !== undefined) {
+    if (typeof obj.minMemoryGb !== 'number' || obj.minMemoryGb <= 0) {
+      throw new HttpError(422, 'requirements.minMemoryGb: positive number required');
+    }
+    req.minMemoryGb = obj.minMemoryGb;
+  }
+  if (obj.requiredModel !== undefined) {
+    if (typeof obj.requiredModel !== 'string') throw new HttpError(422, 'requirements.requiredModel: string required');
+    req.requiredModel = obj.requiredModel.trim();
+  }
+  if (obj.executor !== undefined) {
+    if (typeof obj.executor !== 'string') throw new HttpError(422, 'requirements.executor: string required');
+    req.executor = obj.executor.trim().toLowerCase();
+  }
+  return req;
+}
 
 function rowToTask(r: TaskRow): Task {
   return {
@@ -86,8 +170,15 @@ function rowToTask(r: TaskRow): Task {
     acceptance: r.acceptance,
     workspace: JSON.parse(r.workspace) as Record<string, unknown>,
     files: JSON.parse(r.files) as string[],
+    reads: JSON.parse(r.reads ?? '[]') as string[],
     evidence: JSON.parse(r.evidence) as Task['evidence'],
     protectedPaths: JSON.parse(r.protected_paths) as string[],
+    requirements: parseRequirements(r.requirements),
+    reviewStatus: r.review_status ?? 'none',
+    reviewAttempts: r.review_attempts ?? 0,
+    reviewReworks: r.review_reworks ?? 0,
+    reviewSummary: r.review_summary ?? '',
+    submitSummary: r.submit_summary ?? '',
     claimedAt: r.claimed_at,
     lastActivityAt: r.last_activity_at,
     autoUnblockedAt: r.auto_unblocked_at,
@@ -332,7 +423,9 @@ export interface CreateTaskInput {
   acceptance?: string;
   workspace?: Record<string, unknown>;
   files?: string[];
+  reads?: string[];
   protectedPaths?: string[];
+  requirements?: TaskRequirements;
   dependsOn?: string[];
 }
 
@@ -417,14 +510,15 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
   if (lane === 'InProgress' || lane === 'Review') {
     assertWip(ctx, boardId, lane, id);
   }
+  const requirements = normalizeRequirements(input.requirements);
   const now = Date.now();
   try {
     withWrite(ctx, 'task.create', () => {
       ctx.holder.db
         .prepare(
           `INSERT INTO task (id, board_id, title, detail, lane, priority, category, acceptance,
-             workspace, files, protected_paths, depends_on, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             workspace, files, reads, protected_paths, requirements, depends_on, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -437,7 +531,9 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
           input.acceptance ?? '',
           JSON.stringify(input.workspace ?? {}),
           JSON.stringify(input.files ?? []),
+          JSON.stringify(input.reads ?? []),
           JSON.stringify(input.protectedPaths ?? []),
+          JSON.stringify(requirements),
           JSON.stringify(dependsOn),
           now,
           now,
@@ -448,6 +544,8 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
         title: input.title.trim(),
         lane,
         dependsOn,
+        requirements,
+        reads: input.reads ?? [],
       });
     });
   } catch (err) {
@@ -469,7 +567,9 @@ export interface PatchTaskInput {
   acceptance?: string;
   workspace?: Record<string, unknown>;
   files?: string[];
+  reads?: string[];
   protectedPaths?: string[];
+  requirements?: TaskRequirements;
 }
 
 export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskInput): Task {
@@ -479,6 +579,18 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
     patch.lane && patch.lane !== row.lane ? { from: row.lane, to: patch.lane } : null;
 
   if (laneChanges) {
+    // 启用独立审核时，失败或熔断的审核任务不能经普通 lane patch 绕过审核。
+    if (actor.role === 'orchestrator' && laneChanges.to === 'Done' && ['failed', 'blocked'].includes(row.review_status)) {
+      throw new HttpError(403, 'failed/blocked reviewer tasks require explicit user arbitration');
+    }
+    if (row.lane === 'Review' && laneChanges.to !== 'Review' && actor.role === 'orchestrator') {
+      const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
+      let reviewerEnabled = false;
+      try {
+        reviewerEnabled = JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && getBoard(ctx, row.board_id).repoMode === 'managed';
+      } catch { /* Invalid settings retain manual review behavior. */ }
+      if (reviewerEnabled) throw new HttpError(403, 'reviewer workflow owns Review task transitions');
+    }
     // 信任分层（§5.2）：Review→Done（及 Done 的任何移出/移入）仅主脑/用户可操作
     if ((laneChanges.to === 'Done' || laneChanges.from === 'Done') && actor.role === 'worker') {
       throw new HttpError(403, 'workers cannot move tasks into or out of Done (trust boundary)');
@@ -507,7 +619,9 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
     if (patch.acceptance !== undefined) push('acceptance', patch.acceptance);
     if (patch.workspace !== undefined) push('workspace', JSON.stringify(patch.workspace));
     if (patch.files !== undefined) push('files', JSON.stringify(patch.files));
+    if (patch.reads !== undefined) push('reads', JSON.stringify(patch.reads));
     if (patch.protectedPaths !== undefined) push('protected_paths', JSON.stringify(patch.protectedPaths));
+    if (patch.requirements !== undefined) push('requirements', JSON.stringify(normalizeRequirements(patch.requirements)));
     if (patch.assignee !== undefined) push('assignee', patch.assignee);
     if (laneChanges) {
       push('lane', laneChanges.to);
@@ -533,6 +647,109 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
     }
   });
   return getTask(ctx, id);
+}
+
+export function finalizeTaskReview(
+  ctx: Ctx,
+  actor: Agent,
+  id: string,
+  result: { verdict: 'pass' | 'reject'; summary: string },
+  opts: { maxReworks?: number; integrated?: boolean } = {},
+): Task {
+  if (actor.role !== 'orchestrator' && actor.role !== 'user') {
+    throw new HttpError(403, 'only orchestrator/user may finalize task review');
+  }
+  const task = getTask(ctx, id);
+  if (task.lane !== 'Review' || task.reviewStatus !== 'reviewing') {
+    throw new HttpError(409, `task ${id} is not being reviewed`);
+  }
+  const maxReworks = opts.maxReworks ?? 2;
+  if (result.verdict === 'pass' && !opts.integrated) {
+    throw new HttpError(409, 'task branch must be integrated before reviewer pass is finalized');
+  }
+  const summary = result.summary.trim().slice(0, 6000);
+  if (!summary) throw new HttpError(422, 'review summary required');
+  return withWrite(ctx, 'task.reviewFinalize', () => {
+    const now = Date.now();
+    const user = ctx.holder.db.prepare("SELECT handle FROM agent WHERE id='user'").get() as { handle?: string } | undefined;
+    const userHandle = user?.handle || '用户';
+    if (result.verdict === 'pass') {
+      ctx.holder.db.prepare("UPDATE task SET lane='Done', review_status='passed', review_summary=?, last_activity_at=?, updated_at=? WHERE id=?")
+        .run(summary, now, now, id);
+      logEvent(ctx, 'task.review_passed', { taskId: id, boardId: task.boardId, summary });
+      logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'Done', by: actor.id });
+      messageInner(ctx, { boardId: task.boardId, author: actor.id, kind: 'report', content: `@${userHandle} ${id} 独立审核通过，变更已合并并移入 Done。\n\n${summary}` });
+      unlockDependents(ctx, id);
+    } else if (task.reviewReworks < maxReworks) {
+      const nextReworks = task.reviewReworks + 1;
+      ctx.holder.db.prepare("UPDATE task SET lane='InProgress', review_status='rework', review_reworks=?, review_summary=?, last_activity_at=?, updated_at=? WHERE id=?")
+        .run(nextReworks, summary, now, now, id);
+      logEvent(ctx, 'task.review_rejected', { taskId: id, boardId: task.boardId, reworks: nextReworks, summary });
+      messageInner(ctx, { boardId: task.boardId, author: actor.id, kind: 'intervention', content: `@${task.assignee} @老板 ${id} 独立审核未通过（重做 ${nextReworks}/${maxReworks}）。请按以下问题修正后重新提交：\n\n${summary}` });
+      logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'InProgress', by: actor.id });
+    } else {
+      ctx.holder.db.prepare("UPDATE task SET review_status='blocked', review_summary=?, last_activity_at=?, updated_at=? WHERE id=?")
+        .run(summary, now, now, id);
+      logEvent(ctx, 'task.review_blocked', { taskId: id, boardId: task.boardId, reworks: task.reviewReworks, summary });
+      messageInner(ctx, { boardId: task.boardId, author: actor.id, kind: 'system', content: `⚠ ${id} 独立审核连续未通过，已达到 ${maxReworks} 次重做上限并挂起，请 @${userHandle} 人工仲裁。\n\n${summary}` });
+    }
+    return getTask(ctx, id);
+  });
+}
+
+export function recoverReviewerClaims(ctx: Ctx): number {
+  const rows = ctx.holder.db.prepare("SELECT id, board_id FROM task WHERE lane='Review' AND review_status='reviewing'").all() as { id: string; board_id: string }[];
+  if (rows.length === 0) return 0;
+  return withWrite(ctx, 'task.reviewRecover', () => {
+    for (const row of rows) {
+      ctx.holder.db.prepare("UPDATE task SET review_status='pending', updated_at=? WHERE id=? AND review_status='reviewing'")
+        .run(Date.now(), row.id);
+      logEvent(ctx, 'task.review_queued', { taskId: row.id, boardId: row.board_id, recovered: true });
+    }
+    return rows.length;
+  });
+}
+
+export function retryTaskReview(ctx: Ctx, actor: Agent, taskId: string): Task {
+  if (actor.role !== 'orchestrator' && actor.role !== 'user') throw new HttpError(403, 'only orchestrator/user may retry a review');
+  const task = getTask(ctx, taskId);
+  if (task.lane !== 'Review' || task.reviewStatus !== 'failed') throw new HttpError(409, 'only failed Review tasks can be retried');
+  const repoMode = getBoard(ctx, task.boardId).repoMode;
+  const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
+  let enabled = false;
+  try { enabled = JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && repoMode === 'managed'; } catch { /* ignore malformed setting */ }
+  if (!enabled) throw new HttpError(409, 'independent reviewer is not enabled for this managed board');
+  return withWrite(ctx, 'task.reviewRetry', () => {
+    ctx.holder.db.prepare("UPDATE task SET review_status='pending', review_summary='', updated_at=? WHERE id=?")
+      .run(Date.now(), taskId);
+    logEvent(ctx, 'task.review_queued', { taskId, boardId: task.boardId, retry: true });
+    return getTask(ctx, taskId);
+  });
+}
+
+export function claimTaskForReview(ctx: Ctx, taskId: string): Task | null {
+  const task = getTask(ctx, taskId);
+  if (task.lane !== 'Review' || task.reviewStatus !== 'pending') return null;
+  return withWrite(ctx, 'task.reviewStart', () => {
+    const now = Date.now();
+    const res = ctx.holder.db.prepare("UPDATE task SET review_status='reviewing', review_attempts=review_attempts+1, updated_at=? WHERE id=? AND lane='Review' AND review_status IN ('pending','failed')")
+      .run(now, taskId);
+    if (Number(res.changes) !== 1) return null;
+    logEvent(ctx, 'task.review_started', { taskId, boardId: task.boardId, attempt: task.reviewAttempts + 1 });
+    return getTask(ctx, taskId);
+  });
+}
+
+export function failTaskReview(ctx: Ctx, taskId: string, summary: string): void {
+  const task = getTask(ctx, taskId);
+  if (task.lane !== 'Review' || task.reviewStatus !== 'reviewing') return;
+  const message = summary.trim().slice(0, 2000) || 'Reviewer 运行失败，未产生有效裁决。';
+  withWrite(ctx, 'task.reviewFailed', () => {
+    ctx.holder.db.prepare("UPDATE task SET review_status='failed', review_summary=?, updated_at=? WHERE id=?")
+      .run(message, Date.now(), taskId);
+    logEvent(ctx, 'task.review_failed', { taskId, boardId: task.boardId, summary: message });
+    messageInner(ctx, { boardId: task.boardId, author: 'asterhive-brain', kind: 'system', content: `⚠ ${taskId} 的独立审核未能完成，任务仍停留在 Review，未自动通过。请检查审核员模型配置后重试。` });
+  });
 }
 
 // 上游进 Done：依赖它的任务若全部依赖已完成，记 autoUnblockedAt（§5.1）

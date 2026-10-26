@@ -54,6 +54,12 @@ export async function render(el: HTMLElement): Promise<void> {
         <div class="field"><label for="oc-enabled">启用主脑</label>
           <select id="oc-enabled"><option value="off">关闭（默认）</option><option value="on">启用</option></select>
         </div>
+        <div class="field"><label for="oc-reviewer-enabled">独立审核员</label>
+          <select id="oc-reviewer-enabled"><option value="off">关闭（主脑手动验收）</option><option value="on">启用（托管仓库自动审核）</option></select>
+        </div>
+        <div class="field"><label for="oc-reviewer-group">审核模型</label>
+          <select id="oc-reviewer-group"><option value="">跟随主脑当前模型组</option></select>
+        </div>
       </div>
       <div class="inline-form">
         <button class="primary" id="oc-save">保存</button>
@@ -115,6 +121,8 @@ export async function render(el: HTMLElement): Promise<void> {
   const groupsStatus = el.querySelector('#oc-groups-status') as HTMLElement;
   const groupsBox = el.querySelector('#oc-groups') as HTMLElement;
   let brainEnabled = false;
+  let reviewerEnabled = false;
+  let reviewerGroupId: string | null = null;
 
   // ---- 模型组：本地状态 + 事件委托（innerHTML 重渲染不重复绑监听）----
   let groups: GroupVm[] = [];
@@ -242,6 +250,11 @@ export async function render(el: HTMLElement): Promise<void> {
   // 全局状态行：启用态与激活组配置是否齐全（与服务端 #turn 的启动条件一致）
   function updateGlobalStatus(): void {
     const active = groups.find((g) => g.id === activeGroupId);
+    const reviewerGroup = reviewerGroupId ? groups.find((g) => g.id === reviewerGroupId) : active;
+    const reviewerReady = !!reviewerGroup?.baseURL && !!reviewerGroup.model && reviewerGroup.apiKeySet;
+    const reviewerStatus = reviewerEnabled
+      ? reviewerReady ? ` · Reviewer「${reviewerGroup!.name}」` : ' · Reviewer 模型组配置不完整'
+      : ' · Reviewer 关闭';
     if (!brainEnabled) {
       ocStatus.textContent = `主脑关闭 · 模型组 ${groups.length} 个`;
       return;
@@ -255,7 +268,7 @@ export async function render(el: HTMLElement): Promise<void> {
       ocStatus.innerHTML = `<span class="warn">主脑已启用，当前通道「${esc(active.name)}」缺${missing}——补全后主脑才会开始轮次。</span>`;
       return;
     }
-    ocStatus.textContent = `运行中：通道「${active.name}」 · 模型 ${active.model}`;
+    ocStatus.textContent = `运行中：通道「${active.name}」 · 模型 ${active.model}${reviewerStatus}`;
   }
 
   async function reload(): Promise<void> {
@@ -269,8 +282,14 @@ export async function render(el: HTMLElement): Promise<void> {
         apiKeySet: !!g.apiKeySet,
       }));
       activeGroupId = s.activeGroupId ?? null;
+      reviewerGroupId = s.reviewerGroupId ?? null;
+      reviewerEnabled = !!s.reviewerEnabled;
       brainEnabled = !!s.enabled;
       (el.querySelector('#oc-enabled') as HTMLSelectElement).value = brainEnabled ? 'on' : 'off';
+      (el.querySelector('#oc-reviewer-enabled') as HTMLSelectElement).value = reviewerEnabled ? 'on' : 'off';
+      const reviewerSelect = el.querySelector('#oc-reviewer-group') as HTMLSelectElement;
+      reviewerSelect.innerHTML = `<option value="">跟随主脑当前模型组</option>${groups.map((g) => `<option value="${esc(g.id)}"${reviewerGroupId === g.id ? ' selected' : ''}>${esc(g.name)}${g.model ? ` · ${esc(g.model)}` : ''}</option>`).join('')}`;
+      if (reviewerGroupId && !groups.some((g) => g.id === reviewerGroupId)) reviewerGroupId = null;
       renderGroups();
       updateGlobalStatus();
       for (const g of groups) if (!modelCache.has(g.id)) void loadGroupModels(g);
@@ -443,9 +462,17 @@ export async function render(el: HTMLElement): Promise<void> {
 
   (el.querySelector('#oc-save') as HTMLElement).addEventListener('click', async () => {
     const enabled = (el.querySelector('#oc-enabled') as HTMLSelectElement).value === 'on';
+    const nextReviewerEnabled = (el.querySelector('#oc-reviewer-enabled') as HTMLSelectElement).value === 'on';
+    const nextReviewerGroupId = (el.querySelector('#oc-reviewer-group') as HTMLSelectElement).value || null;
     try {
-      await api.put<OrchestratorSettings>('/settings/orchestrator', { enabled });
+      await api.put<OrchestratorSettings>('/settings/orchestrator', {
+        enabled,
+        reviewerEnabled: nextReviewerEnabled,
+        reviewerGroupId: nextReviewerGroupId,
+      });
       brainEnabled = enabled;
+      reviewerEnabled = nextReviewerEnabled;
+      reviewerGroupId = nextReviewerGroupId;
       updateGlobalStatus();
     } catch (err) {
       ocStatus.textContent = `保存失败：${err instanceof Error ? err.message : ''}`;

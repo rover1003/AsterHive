@@ -40,10 +40,11 @@ import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { withWrite, logEvent } from './write.ts';
 import { ensureBrainAgent, BRAIN_AGENT_ID, type Agent } from './agents.ts';
-import { getOrchestratorSettings, activeGroup, type ActiveOrchestratorGroup } from './settings.ts';
+import { getOrchestratorSettings, activeGroup, reviewerGroup, type ActiveOrchestratorGroup } from './settings.ts';
 import { messageInner } from './messages.ts';
 import { TOOL_DEFS, type ToolDef } from './orchestrator-tools.ts';
-import { listBoards, listTasks, LANES } from './tasks.ts';
+import { getBoard, getTask, listBoards, listTasks, LANES, finalizeTaskReview, claimTaskForReview, failTaskReview, recoverReviewerClaims } from './tasks.ts';
+import { RepoManager } from './repo-manager.ts';
 import type { PiRuntimeManager } from './pi-runtime.ts';
 
 // 单轮超时（默认 10 分钟）；去抖默认 3 秒——测试用环境变量缩短。
@@ -168,15 +169,16 @@ function assistantToolCalls(message: StreamAssistantMessage): BrainToolActivity[
 
 // ---- 主脑系统提示（角色纪律）----
 
-const BRAIN_SYSTEM_PROMPT = (userHandle: string) => `你是 AsterHive（星巢）的内置主脑（@主脑）——舰队的大脑、唯一的调度者与验收者。
-当前用户的自定义称呼/handle 是「${userHandle}」；向用户发送聊天室消息时必须使用 @${userHandle}，不要写死 @user。若用户改名，下轮会提供新的 handle。向 worker 或主脑自身发消息仍按其各自 handle。
+const BRAIN_SYSTEM_PROMPT = (userHandle: string) => `你是 AsterHive（星巢）的内置蜂后 Queen（保留句柄 @主脑、@Queen、@蜂后）——整个蜂群的大脑、唯一的调度者与验收者。
+执行节点统称为「工蜂 Worker Bee」，可使用各自唯一 handle 调度，或使用 @Bee / @工蜂 广播。
+当前用户的自定义称呼/handle 是「${userHandle}」；向用户发送聊天室消息时必须使用 @${userHandle}，不要写死 @user。若用户改名，下轮会提供新的 handle。向工蜂发消息可使用其具体 handle 或 @Bee。
 你的产出只有五种：追问、任务卡、分派、验收结论、汇报。其余一切都不是你的工作。
 
 ## 身份边界（结构性约束，不是自觉）
 你可用的工具只有 15 个 asterhive_* 协议工具；没有 shell、文件读写、浏览器等任何执行面。
-claim/next/checkpoint/submit 是 worker 的动词，你调用会被领域层 403，绝不尝试绕过。
+claim/next/checkpoint/submit 是工蜂 worker 的动词，你调用会被领域层 403，绝不尝试绕过。
 推论：哪怕一件事你"顺手就能做"——写一段代码、跑一条命令、查一个网页——也必须建成卡
-分派给 worker。你永远不参与任何实际的具体任务；你亲手干活的那一刻就是系统失职的那一刻。
+分派给合适工蜂（Worker Bee）。你永远不参与任何实际的具体任务；你亲手干活的那一刻就是系统失职的那一刻。
 
 ## 纪律一：先澄清真实意图，再动手拆解
 用户的目标往往带着隐含假设。建卡前自检四问：目标是什么？边界内/边界外各是什么？怎样算
@@ -230,9 +232,41 @@ worker 协作模型对三者完全一致。用户项目含未公开内容时：
   出口；不要让用户把完整项目直接推公开仓库；
 - **密钥与私有配置永不入 git**（.gitignore + 环境变量/secret 管理）——这是 agent 与人
   共守的纪律；验收时若在提交内容或证据中发现密钥/凭据 → 一律打回，并提醒用户轮换
-  已泄露的凭据后再补卡重做。`;
+  已泄露的凭据后再补卡重做。
 
-// ---- zod → TypeBox（Pi ToolDefinition.parameters 用 TypeBox schema）----
+## 纪律八：失联/挂起工蜂直接受控诊断，禁止建卡代查，禁止推托无 SSH
+当某只工蜂心跳过期（stale）或认领任务长时间无任何进展/怀疑卡死时：
+- **绝对禁止建排障卡（如 DIAG-1/CHECK-1）分派给其他工蜂**——工蜂只负责项目代码实现，不得替系统代查其他节点；
+- **绝对禁止向用户报告"我没有 SSH 工具"或推托需要人工登录**——底层控制通道已集成于服务器受限协议中；
+- **直接调用受控诊断工具**：
+  1. 调用 \`asterhive_worker_probe(agentId)\` 检查目标工蜂的健康状况、任务持续时间及受控通道连通度；
+  2. 若探活显示受控通道可用且服务需要拉起，调用 \`asterhive_worker_restart(agentId, reason)\` 执行受控重启；
+  3. 若需重新分配卡片，调用 \`asterhive_worker_release_stuck_task(agentId, taskId, reason)\` 解除卡死占用并将任务回退至 Ready；
+  4. 仅当探活报告目标设备物理不可达（如断网/关机/通道超时）时，才向用户陈述事实并请求人工兜底介入。`;
+
+const REVIEWER_SYSTEM_PROMPT = `你是 AsterHive 内置的独立代码审核员。你只对照验收标准检查本次代码差异，不参与任务规划、派发或实现。
+
+输入仅包含原始验收标准、执行者提交摘要、变更文件和 Git diff。不要推断未提供的实现，也不要因为摘要声称完成而通过。
+
+审核要求：
+- 只有所有可检查的验收标准都有 diff 中的直接证据，且没有明显回归、严重错误或安全问题时才 pass。
+- 如果材料不足以核验、diff 截断、缺少有效改动或有任何必须修复的问题，必须 reject，并列出具体路径、问题、影响及可执行的修复要求。
+- 不要要求与验收标准无关的重构、风格改动或附加工作。
+- 只输出一个 JSON 对象，不要 Markdown 围栏或对象外文字：{"verdict":"pass"|"reject","summary":"中文、证据明确的结论"}`;
+
+const REVIEWER_PROMPT = (input: { taskId: string; title: string; acceptance: string; workerSummary: string; base: string; head: string; diffStat: string; changedFiles: string[]; diffText: string }) => JSON.stringify({
+  taskId: input.taskId,
+  title: input.title,
+  acceptanceCriteria: input.acceptance || '未填写验收标准：仅可依据标题和明确可验证的预期判断；若无法形成可核验依据则 reject。',
+  workerSummary: input.workerSummary,
+  baseCommit: input.base,
+  taskCommit: input.head,
+  diffStat: input.diffStat,
+  changedFiles: input.changedFiles,
+  diff: input.diffText,
+}, null, 2);
+
+// ---- zod → TypeBox (Pi ToolDefinition.parameters 用 TypeBox schema) ----
 // 只覆盖 orchestrator-tools.ts 用到的子集：string/number/enum/array/object/record/optional。
 
 type ZodDef = {
@@ -429,6 +463,10 @@ export class Brain {
   #streamer: ThrottledStream | null = null; // 本轮 brain.stream 节流发布器（null = 本轮不发流）
   #streamUnsub: (() => void) | null = null; // Pi 会话增量订阅退订器
   #streamBoardId: string | null = null; // 最近一次消息触发唤醒所在板：流式发布的目标板（非消息触发的轮为 null）
+  #reviewJobs = new Map<string, Promise<void>>();
+  #reviewQueueTimer: ReturnType<typeof setTimeout> | null = null;
+  #reviewQueueRunning = false;
+  #reviewStopped = false;
 
   #ctx: Ctx;
   #runtime: PiRuntimeManager;
@@ -445,14 +483,22 @@ export class Brain {
     // 挂载点目录随服务器启动建好（幂等）：extensions/、skills/ 空目录即"未挂载任何"，
     // 用户往里放东西对主脑下个会话生效，无需重启进程
     this.#runtime.ensureMountDirs();
+    const settings = getOrchestratorSettings(this.#ctx);
+    this.#reviewStopped = !settings.enabled || !settings.reviewerEnabled;
+    const recovered = settings.reviewerEnabled ? recoverReviewerClaims(this.#ctx) : 0;
+    if (recovered > 0) logEvent(this.#ctx, 'brain.reviewer_recovered', { count: recovered });
     this.#unsub = this.#ctx.bus.subscribe((type, payload) => this.#onEvent(type, payload));
-    if (getOrchestratorSettings(this.#ctx).enabled) this.#activate();
+    if (settings.enabled) this.#activate();
+    if (settings.enabled && settings.reviewerEnabled) this.#scheduleReviewerQueue(0);
   }
 
   /** 服务器停机关闭时调用（常规部署进程直接退出，不必调） */
   stop(): void {
     this.#unsub?.();
     this.#unsub = null;
+    this.#reviewStopped = true;
+    if (this.#reviewQueueTimer) clearTimeout(this.#reviewQueueTimer);
+    this.#reviewQueueTimer = null;
     this.#deactivate('server stopped');
   }
 
@@ -501,16 +547,30 @@ export class Brain {
     }
     if (type === 'settings.orchestrator_updated') {
       const s = getOrchestratorSettings(this.#ctx);
-      if (s.enabled && !this.#active) this.#activate();
-      else if (!s.enabled && this.#active) this.#deactivate('settings: enabled=false');
-      // 配置变更（换模型/URL/KEY）必须丢弃现有会话：Pi 会话创建时绑定 provider/model，
-      // 不重建的话切了设置旧会话仍走旧通道（曾致用户切模型后仍 503）。
-      // 多模型组切换（PUT /settings/orchestrator/active 必发本事件）同样在此闭环：
-      // 旧会话被弃、下一轮用激活组重建——换通道即刻生效，无需重启。
-      else if (s.enabled) {
-        this.#disposeSession();
-        this.#markDirty(); // 尽快用新配置开一轮，验证新通道
+      this.#reviewStopped = !s.enabled || !s.reviewerEnabled;
+      const fields = Array.isArray(payload.fields) ? payload.fields.map(String) : [];
+      const changedGroupId = typeof payload.groupId === 'string' ? payload.groupId : null;
+      const reviewerOnlySetting = fields.length > 0 && fields.every((field) => field === 'reviewerEnabled' || field === 'reviewerGroupId');
+      const reviewerOnlyGroup = changedGroupId !== null && fields.length > 0 && activeGroup(this.#ctx)?.id !== changedGroupId;
+      const affectsMainBrain = !reviewerOnlySetting && !reviewerOnlyGroup;
+      if (affectsMainBrain) {
+        if (s.enabled && !this.#active) this.#activate();
+        else if (!s.enabled && this.#active) this.#deactivate('settings: enabled=false');
+        else if (s.enabled) {
+          this.#disposeSession();
+          this.#markDirty();
+        }
       }
+      if (s.enabled && s.reviewerEnabled) this.#scheduleReviewerQueue(0);
+      else if (this.#reviewQueueTimer) {
+        clearTimeout(this.#reviewQueueTimer);
+        this.#reviewQueueTimer = null;
+      }
+      return;
+    }
+    if (type === 'task.review_queued' || type === 'task.review_failed') {
+      const s = getOrchestratorSettings(this.#ctx);
+      if (s.enabled && s.reviewerEnabled) this.#scheduleReviewerQueue(0);
       return;
     }
     if (!this.#active) return;
@@ -529,6 +589,12 @@ export class Brain {
     switch (type) {
       case 'message.created': {
         if (payload.author === BRAIN_AGENT_ID) return; // 自己发的消息不唤醒（防自激）
+        if (payload.kind === 'submit' && typeof payload.taskRef === 'string') {
+          try {
+            const submittedTask = getTask(this.#ctx, payload.taskRef);
+            if (submittedTask.lane === 'Review' && ['pending', 'reviewing'].includes(submittedTask.reviewStatus)) return;
+          } catch { /* unrelated or deleted task */ }
+        }
         this.#consecutiveModelFailures = 0; // 用户真实介入：重新给予自动重试机会
         const isQuestion = payload.kind === 'question';
         // blockedReport 映射：worker 的 question 消息视为受阻上报；userMessage 覆盖其余消息
@@ -538,6 +604,10 @@ export class Brain {
         break;
       }
       case 'task.submitted':
+        if (payload.reviewerEnabled === true) {
+          this.#scheduleReviewerQueue(0);
+          return;
+        }
         if (wakeOn.taskSubmitted !== false) reason = `任务 ${payload.taskId} 提交待验收：${String(payload.summary ?? '').slice(0, 120)}`;
         break;
       case 'task.lane_changed':
@@ -585,6 +655,145 @@ export class Brain {
       this.#timer = null;
       void this.#turn();
     }, DEBOUNCE_MS);
+  }
+
+  // ---- 独立 Reviewer Profile：仅托管仓库自动审核，和主脑会话/工具/会话文件完全隔离 ----
+
+  #scheduleReviewerQueue(delayMs: number): void {
+    if (this.#reviewQueueTimer) clearTimeout(this.#reviewQueueTimer);
+    this.#reviewQueueTimer = setTimeout(() => {
+      this.#reviewQueueTimer = null;
+      if (this.#reviewStopped) return;
+      void this.#drainReviewerQueue();
+    }, delayMs);
+  }
+
+  async #drainReviewerQueue(): Promise<void> {
+    if (this.#reviewQueueRunning || this.#reviewStopped) return;
+      const settings = getOrchestratorSettings(this.#ctx);
+      if (!settings.enabled || !settings.reviewerEnabled) return;
+      const reviewer = reviewerGroup(this.#ctx);
+      if (!reviewer?.baseURL || !reviewer.model || !reviewer.apiKey) return;
+      this.#reviewQueueRunning = true;
+    try {
+      for (const board of listBoards(this.#ctx)) {
+        if (getBoard(this.#ctx, board.id).repoMode !== 'managed') continue;
+        for (const task of listTasks(this.#ctx, board.id, { lane: 'Review' })) {
+          if (task.reviewStatus !== 'pending' || this.#reviewJobs.has(task.id)) continue;
+          const claimed = claimTaskForReview(this.#ctx, task.id);
+          if (!claimed) continue;
+          const job = this.#runReviewer(claimed.id).finally(() => {
+            this.#reviewJobs.delete(claimed.id);
+            this.#scheduleReviewerQueue(250);
+          });
+          this.#reviewJobs.set(claimed.id, job);
+          return; // Reviewer 串行运行，避免并发放大模型成本与上游速率限制
+        }
+      }
+    } finally {
+      this.#reviewQueueRunning = false;
+    }
+  }
+
+  async #runReviewer(taskId: string): Promise<void> {
+    try {
+      const task = getTask(this.#ctx, taskId);
+      const workerSummary = task.submitSummary;
+      const diff = await new RepoManager(this.#ctx).inspectTask(task.boardId, taskId);
+      if (!diff.diffText.trim() || diff.diffTruncated) {
+        throw new Error(diff.diffTruncated
+          ? '任务 diff 超过 50KB 审核上下文上限；需人工核验，不得自动通过。'
+          : '任务 diff 为空；需人工核验，不得自动通过。');
+      }
+      const group = reviewerGroup(this.#ctx);
+    if (!group?.baseURL || !group.model || !group.apiKey) throw new Error('审核员模型组未配置完整的 Base URL、模型或 API Key。');
+      const result = await this.#reviewOnce(group, REVIEWER_PROMPT({
+        taskId,
+        title: task.title,
+        acceptance: task.acceptance,
+        workerSummary: workerSummary ?? '',
+        base: diff.base,
+        head: diff.head,
+        diffStat: diff.diffStat,
+        changedFiles: diff.changedFiles,
+        diffText: diff.diffText,
+      }));
+      const currentSettings = getOrchestratorSettings(this.#ctx);
+      if (!currentSettings.enabled || !currentSettings.reviewerEnabled) return;
+      if (result.verdict === 'pass') {
+        await new RepoManager(this.#ctx).integrateTask(task.boardId, taskId);
+        finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { integrated: true, maxReworks: 2 });
+      } else {
+        finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { maxReworks: 2 });
+      }
+    } catch (err) {
+      failTaskReview(this.#ctx, taskId, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async #reviewOnce(group: ActiveOrchestratorGroup, input: string): Promise<{ verdict: 'pass' | 'reject'; summary: string }> {
+    const rt = this.#runtime.ensureRuntimeEntry();
+    const key = JSON.stringify([rt.entryUrl, group.baseURL, group.model, group.apiKey]);
+    const brainDir = join(this.#ctx.cfg.dataDir, 'brain-session');
+    const workspace = join(brainDir, 'reviewer-workspace');
+    const agentDir = join(brainDir, 'reviewer-agent');
+    const sessionsDir = join(brainDir, 'reviewer-sessions');
+    for (const d of [workspace, agentDir, sessionsDir]) mkdirSync(d, { recursive: true });
+    const pi = await this.#loadPi(rt.entryUrl);
+    const modelRuntime = await pi.ModelRuntime.create({
+      authPath: join(agentDir, 'auth.json'),
+      modelsPath: null,
+      refreshOnCreate: false,
+    });
+    modelRuntime.registerProvider('asterhive-reviewer', {
+      name: 'AsterHive Reviewer',
+      baseUrl: group.baseURL,
+      apiKey: group.apiKey!,
+      api: 'openai-completions',
+      models: [{ type: 'chat', id: group.model!, name: group.model!, reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8_192 }],
+    });
+    const model = modelRuntime.getModel('asterhive-reviewer', group.model!);
+    if (!model) throw new Error(`reviewer provider has no model ${group.model}`);
+    const loader = new pi.DefaultResourceLoader({ cwd: workspace, agentDir, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
+    await loader.reload();
+    const resourceLoader: ResourceLoader = {
+      getExtensions: () => ({ extensions: [], errors: [], runtime: loader.getExtensions().runtime }),
+      getSkills: () => ({ skills: [], diagnostics: [] }),
+      getPrompts: () => ({ prompts: [], diagnostics: [] }),
+      getThemes: () => ({ themes: [], diagnostics: [] }),
+      getAgentsFiles: () => ({ agentsFiles: [] }),
+      getSystemPrompt: () => REVIEWER_SYSTEM_PROMPT,
+      getSystemPromptSource: () => undefined,
+      getAppendSystemPrompt: () => [],
+      getAppendSystemPromptSources: () => [],
+      extendResources: () => {},
+      reload: async () => {},
+    };
+    const { session } = await pi.createAgentSession({
+      cwd: workspace, agentDir, model, modelRuntime, thinkingLevel: 'off', resourceLoader,
+      settingsManager: pi.SettingsManager.inMemory({}),
+      sessionManager: pi.SessionManager.inMemory(workspace),
+      noTools: 'all',
+      customTools: [],
+    });
+    try {
+      await session.prompt(input);
+      if (session.agent.state.errorMessage) throw new Error(`reviewer model error: ${session.agent.state.errorMessage}`);
+      const messages = session.messages as Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>;
+      const answer = [...messages].reverse().find((m) => m.role === 'assistant')?.content
+        ?.filter((c) => c.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('').trim() ?? '';
+      const match = answer.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error('reviewer returned no JSON verdict');
+      const parsed = JSON.parse(match[0]) as { verdict?: unknown; summary?: unknown };
+      if (parsed.verdict !== 'pass' && parsed.verdict !== 'reject') throw new Error('reviewer verdict must be pass or reject');
+      if (typeof parsed.summary !== 'string' || !parsed.summary.trim()) throw new Error('reviewer verdict summary is missing');
+      return { verdict: parsed.verdict, summary: parsed.summary.trim().slice(0, 6000) };
+    } finally {
+      session.dispose();
+      try {
+        for (const name of readdirSync(sessionsDir)) if (name.endsWith('.jsonl')) rmSync(join(sessionsDir, name), { force: true });
+      } catch { /* in-memory sessions normally create no transcript files */ }
+    }
   }
 
   // ---- 主动中止（用户停止按钮 → POST /settings/orchestrator/abort）----

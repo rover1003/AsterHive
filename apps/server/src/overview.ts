@@ -1,5 +1,5 @@
 import type { Ctx } from './types.ts';
-import { listAgents, type Agent } from './agents.ts';
+import { listAgents, type Agent, type AgentSpecs } from './agents.ts';
 import { LANES, DEFAULT_WIP, type Lane } from './tasks.ts';
 
 // fleet 视图数据源（§4 Agent 总览页 / §7 GET /overview）：
@@ -13,6 +13,8 @@ export interface AgentOverview {
   enabled: boolean;
   lastSeenAt: number | null;
   status: 'working' | 'idle' | 'stale' | 'disabled';
+  specs?: AgentSpecs;
+  models?: string[];
   currentTask: {
     id: string;
     title: string;
@@ -102,6 +104,8 @@ export function getOverview(ctx: Ctx): Overview {
       enabled: a.enabled,
       lastSeenAt: a.lastSeenAt,
       status,
+      specs: a.specs,
+      models: a.models,
       currentTask: currentByAssignee.get(a.id) ?? null,
       doneCount: doneByAssignee.get(a.id) ?? 0,
     };
