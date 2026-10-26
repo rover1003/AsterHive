@@ -1,8 +1,8 @@
 ﻿# AsterHive（星巢）托管工蜂（Bee）一键安装脚本 —— Windows 原生 PowerShell
 #
-# 一行命令（在 PowerShell 中执行；hive 地址见 Hive 部署完成输出或 Web「Agent 接入」页）：
-#   iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
-#   （也可先设好地址跳过提问：$env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm ...)）
+# 一行命令（在 PowerShell 中执行；推荐由 Web「Agent 接入」页复制——服务器地址已自动注入）：
+#   $env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
+#   （地址解析顺序：$env:ASTERHIVE_URL → 命令行参数 & ([scriptblock]::Create((irm <本脚本url>))) 'http://<hive-ip>:8067' → 交互提问）
 #
 # 全自动依赖检测与部署：Node ≥23.6 缺失/过旧 → 自动下载便携版并写入用户 PATH；
 # 源码/依赖从 GitHub 自动拉取（tar 不可用时回退 zip）；安装完成后注册计划任务常驻化。
@@ -21,8 +21,9 @@ function Log($m)  { Write-Host "[bee] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[bee] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[bee] $m" -ForegroundColor Red; exit 1 }
 
-# ---- 0. Hive 地址：env 优先，否则交互提问并探活 ----
+# ---- 0. Hive 地址：env 优先 → 命令行参数次之 → 交互提问；取得后探活 ----
 $HiveUrl = $env:ASTERHIVE_URL
+if (-not $HiveUrl -and $args.Count -gt 0) { $HiveUrl = [string]$args[0] }
 if (-not $HiveUrl) {
   Write-Host ''
   $HiveUrl = Read-Host 'Hive 服务器地址（如 http://192.168.1.10:8067，见部署完成输出或 Web「Agent 接入」页）'

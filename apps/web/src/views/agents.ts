@@ -43,9 +43,10 @@ export async function render(el: HTMLElement): Promise<void> {
     const skillUrl = `${location.origin}/skill/asterhive-worker`;
     // 复制给 agent 的就是这句话本身（不含"告诉任何 agent："前缀）
     const bootLine = `访问 ${skillUrl} 并照做——它会自己完成注册、学习循环并常驻`;
-    // 托管工蜂（T19）：一行命令在裸设备装内置 Pi 工蜂（交互式配模型，Key 只存设备）——按设备系统给 bash / PowerShell 两条
+    // 托管工蜂（T19）：一行命令在裸设备装内置 Pi 工蜂（交互式配模型，Key 只存设备）——按设备系统给 bash / PowerShell 两条。
+    // 服务器地址自动注入当前浏览器访问的 origin，复制即可用、无需手填；PS 用环境变量内联传址（命令不带注释尾巴）。
     const beeBashCmd = `curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- ${location.origin}`;
-    const beePsCmd = `iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)  # 脚本内按提示填写 Hive 地址 ${location.origin}`;
+    const beePsCmd = `$env:ASTERHIVE_URL='${location.origin}'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)`;
     const isWindowsDevice = /Windows/i.test(navigator.userAgent);
     // 附注（人类手动操作时）：--url 默认当前 origin（同源部署）；<仓库> 由设备主人按 docs/WORKER.md clone 后替换
     const runCmd = `ASTERHIVE_URL=${location.origin} node <仓库>/apps/worker-zcode/src/main.ts`;
@@ -63,7 +64,7 @@ export async function render(el: HTMLElement): Promise<void> {
         <p class="hint" style="margin-bottom:4px"><b>Linux / macOS（bash）</b></p>`}
         <pre class="cmd-line"><code id="bee-cmd">${esc(beeBashCmd)}</code></pre>
         <button class="sm" id="bee-copy">复制命令</button>
-        <p class="hint" style="margin-top:6px">装好的工蜂默认多板巡检，看板参与在本页看板管理里勾选；Windows 计划任务、Linux systemd 用户服务均可随时卸载重装。</p>
+        <p class="hint" style="margin-top:6px">服务器地址已按当前浏览器访问的地址自动注入（<code>${esc(location.origin)}</code>）——复制即可执行，无需手填；若从其他地址访问该服务器，请先修改命令中的地址再复制。装好的工蜂默认多板巡检，看板参与在本页看板管理里勾选；Windows 计划任务、Linux systemd 用户服务均可随时卸载重装。</p>
       </div>
       <div class="panel">
         <h3>已有 agent 接入（自举协议）</h3>

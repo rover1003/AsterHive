@@ -53,10 +53,10 @@ Linux / macOS（bash）：
 curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- http://<hive-ip>:8067
 ```
 
-Windows（PowerShell；地址也可先设 `$env:ASTERHIVE_URL` 跳过提问）：
+Windows（PowerShell；把地址换成你的 Hive 服务器，或从 Web「Agent 接入」页复制已注入地址的命令）：
 
 ```powershell
-iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
+$env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
 ```
 
 装好的工蜂以内置 Pi 会话执行任务，自带 Hive 工作区纪律与汇报协议；Linux 常驻为 systemd 用户服务，Windows 常驻为计划任务。
