@@ -127,7 +127,7 @@ export interface AuditEntry {
   result: string;
   detail?: string;
 }
-/** 模型组（主脑多模型组）：GET /settings/orchestrator 的 groups 投影，cipher/明文永不回显 */
+/** 模型组（蜂后多模型组）：GET /settings/orchestrator 的 groups 投影，cipher/明文永不回显 */
 export interface OrchestratorGroup {
   id: string;
   name: string;
@@ -137,12 +137,14 @@ export interface OrchestratorGroup {
   apiKeySet?: boolean;
 }
 export interface OrchestratorSettings {
-  /** 内置主脑总开关（T14，默认关） */
+  /** 内置蜂后总开关（T14，默认关） */
   enabled?: boolean;
   wakeOn?: Record<string, boolean>;
   activeGroupId?: string | null;
-  /** 独立 Reviewer 使用的模型组；null 表示跟随主脑激活组 */
+  /** 独立 Reviewer 使用的模型组；null 表示跟随蜂后激活组 */
   reviewerGroupId?: string | null;
+  /** 审核员用的具体模型（所选组清单内任选；null = 用组当前 model） */
+  reviewerModel?: string | null;
   reviewerEnabled?: boolean;
   groups?: OrchestratorGroup[];
 }

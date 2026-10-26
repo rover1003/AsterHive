@@ -257,10 +257,21 @@ export function ensureBrainAgent(ctx: Ctx): Agent {
   const row = ctx.holder.db.prepare('SELECT * FROM agent WHERE id = ?').get(BRAIN_AGENT_ID) as
     | AgentRow
     | undefined;
-  if (row) return rowToAgent(row);
+  if (row) {
+    // 蜂后命名迁移（Phase 3 定稿后的显示名统一）：旧库的 主脑/内置主脑 → 蜂后，
+    // 幂等且仅在旧名时触发（用户手动改过的名字不覆盖）；句柄保持 '主脑'（保留句柄路由不变）
+    if (row.name === '主脑' || row.name === '内置主脑') {
+      withWrite(ctx, 'agent.brainRenamed', () => {
+        ctx.holder.db.prepare('UPDATE agent SET name = ? WHERE id = ?').run('蜂后', BRAIN_AGENT_ID);
+        logEvent(ctx, 'agent.updated', { agentId: BRAIN_AGENT_ID, fields: ['name'] });
+      });
+      return getAgent(ctx, BRAIN_AGENT_ID);
+    }
+    return rowToAgent(row);
+  }
   return registerSystemAgent(ctx, {
     id: BRAIN_AGENT_ID,
-    name: '内置主脑',
+    name: '蜂后',
     handle: '主脑',
     role: 'orchestrator',
   });

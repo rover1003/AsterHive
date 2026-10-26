@@ -48,6 +48,7 @@ interface StoredOrchestrator {
   groups?: OrchestratorGroup[];
   activeGroupId?: string;
   reviewerGroupId?: string | null; // 独立审核员绑定的模型组 id（null 或空则跟随主脑 activeGroupId）
+  reviewerModel?: string | null;   // 审核员用的具体模型（组内清单任选；null = 用组当前 model）
   reviewerEnabled?: boolean; // 默认关闭，启用后 managed 任务由内置 Pi Reviewer 自动验收
   enabled?: boolean;
   wakeOn?: OrchestratorWakeOn;
@@ -76,6 +77,7 @@ export interface OrchestratorSettingsView {
   wakeOn?: OrchestratorWakeOn;
   activeGroupId: string | null;   // 悬空（无组或指向已删组）→ null：主脑未配置态
   reviewerGroupId: string | null; // 独立审核员绑定的模型组 id（null = 跟随主脑激活组）
+  reviewerModel?: string | null;  // 审核员用的具体模型（组内清单任选；null = 用组当前 model）
   reviewerEnabled: boolean;
   groups: OrchestratorGroupView[];
 }
@@ -258,6 +260,7 @@ export function getOrchestratorSettings(ctx: Ctx): OrchestratorSettingsView {
     ...(st.wakeOn ? { wakeOn: st.wakeOn } : {}),
     activeGroupId: active ? active.id : null,
     reviewerGroupId: reviewer ? reviewer.id : null,
+    reviewerModel: reviewer ? (st.reviewerModel ?? null) : null, // 悬空组不回显模型
     reviewerEnabled: st.reviewerEnabled ?? false,
     groups: groups.map(projectGroup),
   };
@@ -282,15 +285,17 @@ export function activeGroup(ctx: Ctx): ActiveOrchestratorGroup | null {
 
 // 独立审核员（Reviewer Profile）运行时消费入口：
 // 若 reviewerGroupId 有值且找到有效组，则使用该组；否则自动回退到主脑激活组（activeGroup）。
+// 组内模型优先取 reviewerModel（审核员在组清单里任选），未设则用组当前 model。
 export function reviewerGroup(ctx: Ctx): ActiveOrchestratorGroup | null {
   const st = loadOrchestrator(ctx);
   const g = st.reviewerGroupId ? st.groups?.find((x) => x.id === st.reviewerGroupId) : null;
   if (g) {
+    const model = st.reviewerModel ?? g.model;
     return {
       id: g.id,
       name: g.name,
       baseURL: g.baseURL,
-      ...(g.model !== undefined ? { model: g.model } : {}),
+      ...(model !== undefined ? { model } : {}),
       apiKeySet: !!g.apiKeyCipher,
       apiKey: g.apiKeyCipher ? decryptGroupApiKey(ctx, g.id) : null,
       enabled: st.enabled ?? false,
@@ -319,17 +324,24 @@ export function decryptGroupApiKey(ctx: Ctx, groupId?: string): string | null {
 // 授权由 HTTP 层 requireElevated 闸门负责（user/orchestrator 角色可写），这里只管落库。
 export function putOrchestratorSettings(
   ctx: Ctx,
-  input: { enabled?: boolean; wakeOn?: OrchestratorWakeOn; reviewerGroupId?: string | null; reviewerEnabled?: boolean },
+  input: { enabled?: boolean; wakeOn?: OrchestratorWakeOn; reviewerGroupId?: string | null; reviewerModel?: string | null; reviewerEnabled?: boolean },
 ): OrchestratorSettingsView {
   const stored = loadOrchestrator(ctx);
   if (input.reviewerGroupId && !stored.groups?.some((g) => g.id === input.reviewerGroupId)) {
     throw new HttpError(404, `审核员模型组不存在: ${input.reviewerGroupId}`);
   }
+  // reviewerModel 必须归属 reviewerGroupId 指向的组（跨组绑定一律拒绝——Key 与模型必须同源）
+  if (input.reviewerModel) {
+    const targetId = input.reviewerGroupId === undefined ? stored.reviewerGroupId : input.reviewerGroupId;
+    if (!targetId) throw new HttpError(422, '审核模型需要先选择模型组（reviewerGroupId）');
+    if (!stored.groups?.some((g) => g.id === targetId)) throw new HttpError(404, `审核员模型组不存在: ${targetId}`);
+  }
   const reviewerEnabled = input.reviewerEnabled ?? stored.reviewerEnabled ?? false;
   if (reviewerEnabled) {
     const selectedId = input.reviewerGroupId === undefined ? stored.reviewerGroupId : input.reviewerGroupId;
     const group = (stored.groups ?? []).find((g) => g.id === (selectedId || stored.activeGroupId));
-    if (!group?.baseURL || !group.model || !group.apiKeyCipher || !decryptGroupApiKey(ctx, group.id)) {
+    const reviewerModel = input.reviewerModel === undefined ? stored.reviewerModel : input.reviewerModel;
+    if (!group?.baseURL || !(reviewerModel || group.model) || !group.apiKeyCipher || !decryptGroupApiKey(ctx, group.id)) {
       throw new HttpError(422, '启用独立审核员前，请配置完整的审核模型组（Base URL、模型和有效 API Key）。');
     }
   }
@@ -338,7 +350,7 @@ export function putOrchestratorSettings(
     const previous = (stored as Record<string, unknown>)[key];
     const nextValue = clean[key];
     if (key === 'enabled' || key === 'reviewerEnabled') return Boolean(previous) !== Boolean(nextValue);
-    if (key === 'reviewerGroupId') return (previous ?? null) !== (nextValue ?? null);
+    if (key === 'reviewerGroupId' || key === 'reviewerModel') return (previous ?? null) !== (nextValue ?? null);
     return JSON.stringify(previous) !== JSON.stringify(nextValue);
   });
   if (fields.length === 0) return getOrchestratorSettings(ctx);
@@ -477,7 +489,7 @@ export function deleteOrchestratorGroup(ctx: Ctx, id: string): void {
       JSON.stringify({
         ...st,
         groups: groups.filter((g) => g.id !== id),
-        ...(wasReviewer ? { reviewerGroupId: null, reviewerEnabled: false } : {}),
+        ...(wasReviewer ? { reviewerGroupId: null, reviewerModel: null, reviewerEnabled: false } : {}),
       }),
     );
     if (wasActive || wasReviewer) {
@@ -533,16 +545,17 @@ export interface OrchestratorModelsResult {
 
 export async function listOrchestratorModels(
   ctx: Ctx,
-  opts: { groupId?: string } = {},
+  opts: { groupId?: string; force?: boolean } = {},
   fetchImpl: typeof fetch = fetch,
 ): Promise<OrchestratorModelsResult> {
   const g = resolveTargetGroup(ctx, opts.groupId);
   if (!g.baseURL) throw new HttpError(422, 'baseURL 未配置');
   const key = decryptGroupApiKey(ctx, g.id);
   if (!key) throw new HttpError(422, 'apiKey 未配置');
-  // 缓存键 = baseURL：同端点的组共享一份清单（/models 与具体 KEY 无关的场景占绝大多数）
+  // 缓存键 = baseURL：同端点的组共享一份清单（/models 与具体 KEY 无关的场景占绝大多数）；
+  // force = 手动刷新按钮，绕过 60s 缓存强制重拉
   const hit = modelListCache.get(g.baseURL);
-  if (hit && Date.now() - hit.at < MODEL_LIST_TTL_MS) {
+  if (!opts.force && hit && Date.now() - hit.at < MODEL_LIST_TTL_MS) {
     return { models: hit.ids, fetchedAt: hit.at, cached: true };
   }
   const res = await fetchImpl(`${trimBase(g.baseURL)}/models`, {

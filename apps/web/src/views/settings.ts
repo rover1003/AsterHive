@@ -1,9 +1,9 @@
-// 设置页：用户名（显示名）+ 内置主脑设置（启用开关/运行状态）+ 模型组（多模型组）+ Pi 运行时卡片
+// 设置页：用户名（显示名）+ 内置蜂后设置（启用开关/运行状态）+ 模型组（多模型组）+ Pi 运行时卡片
 // 零令牌终态（2026-10-25 用户终裁）：浏览器不携带任何凭据，服务器把请求视为唯一用户——
 // 用户名只是聊天室里的显示名，不存在 token 的签发/保存/轮换。
 //
-// 主脑多模型组（2026-10-25）：主脑的模型通道（Base URL + API Key + 模型）按「组」管理——
-// 每组可独立刷新模型列表 / 测试连通 / 一键启用；启用组即主脑下一轮使用的通道。
+// 蜂后多模型组（2026-10-25）：蜂后的模型通道（Base URL + API Key + 模型）按「组」管理——
+// 每组可独立刷新模型列表 / 测试连通 / 一键启用；启用组即蜂后下一轮使用的通道。
 // 背景痛点：上游账号池瞬时 503 时，切到备用组立刻恢复（服务端经 settings.orchestrator_updated
 // 弃旧会话重建，见 brain.ts）。全局面板只管 enabled 开关；组数据走组接口（CRUD/active/models/test）。
 import {
@@ -48,17 +48,21 @@ export async function render(el: HTMLElement): Promise<void> {
       <div id="user-result"></div>
     </div>
     <div class="panel">
-      <h3>主脑设置（内置主脑，模式 B）</h3>
-      <p class="muted">内置主脑是服务器常驻的分派者：拆解建卡 / 分派 / 验收 / 汇报，绝不执行任务。模型通道（Base URL + API Key + 模型）在下方「模型组」按组管理，这里只管总开关。</p>
+      <h3>蜂后设置（内置蜂后，模式 B）</h3>
+      <p class="muted">蜂后是服务器常驻的调度者：拆解建卡 / 分派 / 验收 / 汇报，绝不执行任务。模型通道（Base URL + API Key + 模型）在下方「模型组」按组管理，这里只管总开关。</p>
       <div class="grid-form">
-        <div class="field"><label for="oc-enabled">启用主脑</label>
+        <div class="field"><label for="oc-enabled">启用蜂后</label>
           <select id="oc-enabled"><option value="off">关闭（默认）</option><option value="on">启用</option></select>
         </div>
         <div class="field"><label for="oc-reviewer-enabled">独立审核员</label>
-          <select id="oc-reviewer-enabled"><option value="off">关闭（主脑手动验收）</option><option value="on">启用（托管仓库自动审核）</option></select>
+          <select id="oc-reviewer-enabled"><option value="off">关闭（蜂后手动验收）</option><option value="on">启用（托管仓库自动审核）</option></select>
         </div>
-        <div class="field"><label for="oc-reviewer-group">审核模型</label>
-          <select id="oc-reviewer-group"><option value="">跟随主脑当前模型组</option></select>
+        <div class="field"><label for="oc-reviewer-group">审核模型（复用下方模型组完整清单）</label>
+          <div class="inline-form">
+            <select id="oc-reviewer-group" style="flex:1;min-width:220px"><option value="">跟随蜂后当前模型组</option></select>
+            <button class="sm" id="oc-reviewer-refresh" title="绕过 60 秒缓存，强制重新拉取各组模型清单">刷新</button>
+          </div>
+          <div id="oc-reviewer-hint" class="muted small" style="margin-top:6px">清单来自各组上游 /models，与下方模型组共用同一次拉取</div>
         </div>
       </div>
       <div class="inline-form">
@@ -69,7 +73,7 @@ export async function render(el: HTMLElement): Promise<void> {
     </div>
     <div class="panel">
       <h3>模型组</h3>
-      <p class="muted">主脑的模型通道按组管理：每组 = 名称 + Base URL + API Key（加密存储，界面永不回显）+ 模型。各组可独立刷新模型列表、测试连通、一键启用——上游账号池瞬时 503 时切到备用组，主脑下一轮即走新通道。</p>
+      <p class="muted">蜂后的模型通道按组管理：每组 = 名称 + Base URL + API Key（加密存储，界面永不回显）+ 模型。各组可独立刷新模型列表、测试连通、一键启用——上游账号池瞬时 503 时切到备用组，蜂后下一轮即走新通道。</p>
       <div id="oc-groups"></div>
       <div class="inline-form">
         <button class="primary" id="oc-group-add">＋ 添加模型组</button>
@@ -78,18 +82,18 @@ export async function render(el: HTMLElement): Promise<void> {
     </div>
     <div class="panel">
       <h3>Pi 运行时</h3>
-      <p class="muted">主脑的 Pi agent 运行时装由服务器数据卷自管理（不进镜像）：装新版 → 原子切换 → 旧版保留可回滚；更新不重启服务器，只影响下次主脑会话创建。</p>
+      <p class="muted">蜂后的 Pi agent 运行时装由服务器数据卷自管理（不进镜像）：装新版 → 原子切换 → 旧版保留可回滚；更新不重启服务器，只影响下次蜂后会话创建。</p>
       <div id="rt-status" class="muted small">加载中…</div>
       <div class="inline-form">
         <button id="rt-update">更新到最新版</button>
         <button id="rt-rollback" class="danger">回滚上一版</button>
       </div>
       <div id="rt-result"></div>
-      <p class="muted small">社区插件挂载点：<code id="rt-extdir">…</code><br />把社区插件放到该目录（每个插件一个子目录）即可被主脑会话加载；服务器不预装任何插件。</p>
+      <p class="muted small">社区插件挂载点：<code id="rt-extdir">…</code><br />把社区插件放到该目录（每个插件一个子目录）即可被蜂后会话加载；服务器不预装任何插件。</p>
     </div>
     <div class="panel">
-      <h3>主脑扩展与技能</h3>
-      <p class="muted">管理主脑的 Pi 扩展插件与技能：npm 包名安装（服务器代装入数据卷）、启停、删除；技能直接写 SKILL.md。变更不打断运行中的会话，主脑下个会话生效。</p>
+      <h3>蜂后扩展与技能</h3>
+      <p class="muted">管理蜂后的 Pi 扩展插件与技能：npm 包名安装（服务器代装入数据卷）、启停、删除；技能直接写 SKILL.md。变更不打断运行中的会话，蜂后下个会话生效。</p>
       <div id="ext-list" class="muted small">加载中…</div>
       <div class="inline-form">
         <input id="ext-pkg" placeholder="npm 包名，如 @scope/some-pi-ext" style="flex:1;min-width:220px" />
@@ -138,13 +142,14 @@ export async function render(el: HTMLElement): Promise<void> {
     }
   });
 
-  // ---- 主脑全局开关：保存只管 enabled（wakeOn 无界面字段，走同一接口透传）----
+  // ---- 蜂后全局开关：保存只管 enabled（wakeOn 无界面字段，走同一接口透传）----
   const ocStatus = el.querySelector('#oc-status') as HTMLElement;
   const groupsStatus = el.querySelector('#oc-groups-status') as HTMLElement;
   const groupsBox = el.querySelector('#oc-groups') as HTMLElement;
   let brainEnabled = false;
   let reviewerEnabled = false;
   let reviewerGroupId: string | null = null;
+  let reviewerModel: string | null = null;
 
   // ---- 模型组：本地状态 + 事件委托（innerHTML 重渲染不重复绑监听）----
   let groups: GroupVm[] = [];
@@ -238,7 +243,7 @@ export async function render(el: HTMLElement): Promise<void> {
           <button data-act="test" title="向上游发一条极短的测试消息，确认选中模型此刻真实可用">测试连通</button>
           ${isActive
             ? '<button disabled title="正在使用该组">当前使用</button>'
-            : '<button data-act="activate" class="primary" title="切换主脑到此通道，下一轮生效">启用此组</button>'}
+            : '<button data-act="activate" class="primary" title="切换蜂后到此通道，下一轮生效">启用此组</button>'}
           <button data-act="edit" title="修改名称 / Base URL / KEY / 模型">编辑</button>
           <button data-act="del" class="danger" title="删除该组（当前使用的组需先切换）">删除</button>
         </div>
@@ -265,29 +270,56 @@ export async function render(el: HTMLElement): Promise<void> {
       : '';
     groupsBox.innerHTML =
       cards + newForm ||
-      '<p class="muted small">还没有模型组——添加第一组（名称 + Base URL + API KEY + 模型）后主脑才能开始轮次。</p>';
+      '<p class="muted small">还没有模型组——添加第一组（名称 + Base URL + API KEY + 模型）后蜂后才能开始轮次。</p>';
     for (const g of groups) hydrateGroupSelects(g.id);
+  }
+
+  // 审核员模型下拉：复用各组已拉取的完整清单（optgroup 按组分组），与下方模型组共用 modelCache。
+  // 选中值编码为 "组id|模型名"；未拉取到清单的组回退为该组当前 model 单项。
+  function populateReviewerSelect(): void {
+    const sel = el.querySelector('#oc-reviewer-group') as HTMLSelectElement;
+    const parts: string[] = ['<option value="">跟随蜂后当前模型组</option>'];
+    for (const g of groups) {
+      const cached = modelCache.get(g.id);
+      const models = cached?.models?.length ? cached.models : g.model ? [g.model] : [];
+      if (models.length) {
+        parts.push(
+          `<optgroup label="${esc(g.name)}">${models
+            .map((m) => `<option value="${esc(`${g.id}|${m}`)}"${reviewerGroupId === g.id && reviewerModel === m ? ' selected' : ''}>${esc(m)}</option>`)
+            .join('')}</optgroup>`,
+        );
+      } else {
+        parts.push(`<option value="${esc(g.id)}|"${reviewerGroupId === g.id && !reviewerModel ? ' selected' : ''}>${esc(g.name)}（未拉取到模型清单）</option>`);
+      }
+    }
+    sel.innerHTML = parts.join('');
+    const hint = el.querySelector('#oc-reviewer-hint') as HTMLElement;
+    const withCache = groups.filter((g) => modelCache.get(g.id)?.models?.length);
+    hint.textContent = withCache.length
+      ? `已复用 ${withCache.length} 个模型组的清单（最近更新 ${new Date(Math.max(...withCache.map((g) => modelCache.get(g.id)!.fetchedAt))).toLocaleTimeString()}）`
+      : '清单来自各组上游 /models，与下方模型组共用同一次拉取';
   }
 
   // 全局状态行：启用态与激活组配置是否齐全（与服务端 #turn 的启动条件一致）
   function updateGlobalStatus(): void {
     const active = groups.find((g) => g.id === activeGroupId);
-    const reviewerGroup = reviewerGroupId ? groups.find((g) => g.id === reviewerGroupId) : active;
-    const reviewerReady = !!reviewerGroup?.baseURL && !!reviewerGroup.model && reviewerGroup.apiKeySet;
+    const reviewerGroupObj = reviewerGroupId ? groups.find((g) => g.id === reviewerGroupId) : active;
+    const reviewerModelShown = reviewerGroupId ? (reviewerModel ?? reviewerGroupObj?.model) : active?.model;
+    const reviewerReady = !!reviewerGroupObj?.baseURL && !!reviewerModelShown && reviewerGroupObj.apiKeySet;
     const reviewerStatus = reviewerEnabled
-      ? reviewerReady ? ` · Reviewer「${reviewerGroup!.name}」` : ' · Reviewer 模型组配置不完整'
+      ? reviewerReady ? ` · Reviewer「${reviewerGroupObj!.name} · ${reviewerModelShown}」` : ' · Reviewer 模型组配置不完整'
       : ' · Reviewer 关闭';
     if (!brainEnabled) {
-      ocStatus.textContent = `主脑关闭 · 模型组 ${groups.length} 个`;
+      ocStatus.textContent = `蜂后关闭 · 模型组 ${groups.length} 个`;
       return;
     }
     if (!active) {
-      ocStatus.innerHTML = '<span class="warn">主脑已启用但没有任何模型组——添加并启用一组后主脑才会开始轮次。</span>';
+      ocStatus.innerHTML = '<span class="warn">蜂后已启用但没有任何模型组——添加并启用一组后蜂后才会开始轮次。</span>';
       return;
     }
     if (!active.model || !active.apiKeySet) {
       const missing = [active.model ? '' : '模型', active.apiKeySet ? '' : 'API KEY'].filter(Boolean).join('和');
-      ocStatus.innerHTML = `<span class="warn">主脑已启用，当前通道「${esc(active.name)}」缺${missing}——补全后主脑才会开始轮次。</span>`;
+      ocStatus.innerHTML = `<span class="warn">蜂后已启用，当前通道「${esc(active.name)}」缺${missing}——补全后蜂后才会开始轮次。</span>`;
       return;
     }
     ocStatus.textContent = `运行中：通道「${active.name}」 · 模型 ${active.model}${reviewerStatus}`;
@@ -305,13 +337,16 @@ export async function render(el: HTMLElement): Promise<void> {
       }));
       activeGroupId = s.activeGroupId ?? null;
       reviewerGroupId = s.reviewerGroupId ?? null;
+      reviewerModel = s.reviewerModel ?? null;
       reviewerEnabled = !!s.reviewerEnabled;
       brainEnabled = !!s.enabled;
       (el.querySelector('#oc-enabled') as HTMLSelectElement).value = brainEnabled ? 'on' : 'off';
       (el.querySelector('#oc-reviewer-enabled') as HTMLSelectElement).value = reviewerEnabled ? 'on' : 'off';
-      const reviewerSelect = el.querySelector('#oc-reviewer-group') as HTMLSelectElement;
-      reviewerSelect.innerHTML = `<option value="">跟随主脑当前模型组</option>${groups.map((g) => `<option value="${esc(g.id)}"${reviewerGroupId === g.id ? ' selected' : ''}>${esc(g.name)}${g.model ? ` · ${esc(g.model)}` : ''}</option>`).join('')}`;
-      if (reviewerGroupId && !groups.some((g) => g.id === reviewerGroupId)) reviewerGroupId = null;
+      if (reviewerGroupId && !groups.some((g) => g.id === reviewerGroupId)) {
+        reviewerGroupId = null;
+        reviewerModel = null;
+      }
+      populateReviewerSelect();
       renderGroups();
       updateGlobalStatus();
       for (const g of groups) if (!modelCache.has(g.id)) void loadGroupModels(g);
@@ -320,12 +355,13 @@ export async function render(el: HTMLElement): Promise<void> {
     }
   }
 
-  // 按组拉取模型清单（60s 服务端缓存；成功后只回填下拉，不整卡重渲染——不打断编辑中的表单）
-  async function loadGroupModels(g: GroupVm, silent = true): Promise<void> {
+  // 按组拉取模型清单（60s 服务端缓存；成功后只回填下拉，不整卡重渲染——不打断编辑中的表单）；
+  // force = 手动刷新按钮，绕过服务端缓存
+  async function loadGroupModels(g: GroupVm, silent = true, force = false): Promise<void> {
     setHint(g.id, silent ? '刷新模型列表…' : '拉取模型列表…');
     try {
       const r = await api.get<OrchestratorModelsResult>(
-        `/settings/orchestrator/models?group=${encodeURIComponent(g.id)}`,
+        `/settings/orchestrator/models?group=${encodeURIComponent(g.id)}${force ? '&force=1' : ''}`,
       );
       modelCache.set(g.id, { models: r.models, fetchedAt: r.fetchedAt });
       setHint(
@@ -333,13 +369,14 @@ export async function render(el: HTMLElement): Promise<void> {
         `共 ${r.models.length} 个模型 · 更新于 ${new Date(r.fetchedAt).toLocaleTimeString()}${r.cached ? '（缓存）' : ''}`,
       );
       hydrateGroupSelects(g.id);
+      populateReviewerSelect();
     } catch (err) {
       setHint(g.id, `列表拉取失败：${esc(err instanceof Error ? err.message : '')}`);
       if (!modelCache.has(g.id)) hydrateGroupSelects(g.id); // 空清单 → 下拉只剩「自定义…」兜底
     }
   }
 
-  // 展示下拉改动即保存（激活组改模型 → 服务端 orchestrator_updated → 主脑重建会话走新模型）
+  // 展示下拉改动即保存（激活组改模型 → 服务端 orchestrator_updated → 蜂后重建会话走新模型）
   async function saveGroupModel(id: string, card: HTMLElement): Promise<void> {
     const g = groups.find((x) => x.id === id);
     if (!g) return;
@@ -401,7 +438,7 @@ export async function render(el: HTMLElement): Promise<void> {
           if (!g) return;
           await api.put('/settings/orchestrator/active', { groupId: g.id });
           await reload();
-          groupsStatus.innerHTML = `<span class="ok">已切换到 ${esc(g.name)}，主脑下一轮使用新通道</span>`;
+          groupsStatus.innerHTML = `<span class="ok">已切换到 ${esc(g.name)}，蜂后下一轮使用新通道</span>`;
           return;
         }
         case 'edit': {
@@ -485,19 +522,38 @@ export async function render(el: HTMLElement): Promise<void> {
   (el.querySelector('#oc-save') as HTMLElement).addEventListener('click', async () => {
     const enabled = (el.querySelector('#oc-enabled') as HTMLSelectElement).value === 'on';
     const nextReviewerEnabled = (el.querySelector('#oc-reviewer-enabled') as HTMLSelectElement).value === 'on';
-    const nextReviewerGroupId = (el.querySelector('#oc-reviewer-group') as HTMLSelectElement).value || null;
+    // 审核员下拉选中值编码为 "组id|模型名"（空 = 跟随蜂后当前模型组）
+    const rawReviewer = (el.querySelector('#oc-reviewer-group') as HTMLSelectElement).value || '';
+    const sep = rawReviewer.indexOf('|');
+    const nextReviewerGroupId = sep === -1 ? rawReviewer || null : rawReviewer.slice(0, sep) || null;
+    const nextReviewerModel = sep === -1 ? null : rawReviewer.slice(sep + 1) || null;
     try {
       await api.put<OrchestratorSettings>('/settings/orchestrator', {
         enabled,
         reviewerEnabled: nextReviewerEnabled,
         reviewerGroupId: nextReviewerGroupId,
+        reviewerModel: nextReviewerModel,
       });
       brainEnabled = enabled;
       reviewerEnabled = nextReviewerEnabled;
       reviewerGroupId = nextReviewerGroupId;
+      reviewerModel = nextReviewerModel;
       updateGlobalStatus();
     } catch (err) {
       ocStatus.textContent = `保存失败：${err instanceof Error ? err.message : ''}`;
+    }
+  });
+
+  // 审核员清单手动刷新：绕过服务端 60s 缓存，逐组强拉
+  (el.querySelector('#oc-reviewer-refresh') as HTMLElement).addEventListener('click', async () => {
+    const btn = el.querySelector('#oc-reviewer-refresh') as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = '刷新中…';
+    try {
+      for (const g of groups) await loadGroupModels(g, false, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '刷新';
     }
   });
 
@@ -508,7 +564,7 @@ export async function render(el: HTMLElement): Promise<void> {
     for (const g of groups) void loadGroupModels(g, true);
   }, 60_000);
 
-  // ---- 主脑运行状态行：从事件台账尾部取最新 brain.* ----
+  // ---- 蜂后运行状态行：从事件台账尾部取最新 brain.* ----
   const runtimeLine = el.querySelector('#oc-runtime-line') as HTMLElement;
   async function refreshBrainRuntimeLine(): Promise<void> {
     try {
@@ -517,7 +573,7 @@ export async function render(el: HTMLElement): Promise<void> {
       );
       const latest = r.events.find((e) => e.type.startsWith('brain.'));
       if (!latest) {
-        runtimeLine.textContent = '主脑运行状态：暂无记录（未启用或尚未唤醒过）';
+        runtimeLine.textContent = '蜂后运行状态：暂无记录（未启用或尚未唤醒过）';
         return;
       }
       const detail =
@@ -528,9 +584,9 @@ export async function render(el: HTMLElement): Promise<void> {
             : latest.type === 'brain.turn_started' && typeof latest.payload.groupName === 'string'
               ? `通道「${latest.payload.groupName}」`
               : '';
-      runtimeLine.textContent = `主脑运行状态：${latest.type}${detail ? `（${detail}）` : ''} · ${fmtTime(latest.time_created)}`;
+      runtimeLine.textContent = `蜂后运行状态：${latest.type}${detail ? `（${detail}）` : ''} · ${fmtTime(latest.time_created)}`;
     } catch {
-      runtimeLine.textContent = '主脑运行状态：读取失败';
+      runtimeLine.textContent = '蜂后运行状态：读取失败';
     }
   }
   refreshBrainRuntimeLine();
@@ -557,7 +613,7 @@ export async function render(el: HTMLElement): Promise<void> {
   }
   refreshRuntime();
   (el.querySelector('#rt-update') as HTMLElement).addEventListener('click', async () => {
-    if (!confirm('确认更新 Pi 运行时到上游最新版？安装期间主脑不能创建新会话。')) return;
+    if (!confirm('确认更新 Pi 运行时到上游最新版？安装期间蜂后不能创建新会话。')) return;
     rtResult.textContent = '更新中（npm install 可能需要一两分钟）…';
     try {
       const r = await api.post<{ from: string; to: string }>('/settings/runtime/update', {});
@@ -579,7 +635,7 @@ export async function render(el: HTMLElement): Promise<void> {
     refreshRuntime();
   });
 
-  // ---- 主脑扩展与技能卡片：列表/安装/启停/删除 + 技能写入/删除 ----
+  // ---- 蜂后扩展与技能卡片：列表/安装/启停/删除 + 技能写入/删除 ----
   const extList = el.querySelector('#ext-list') as HTMLElement;
   const extResult = el.querySelector('#ext-result') as HTMLElement;
   const skillList = el.querySelector('#skill-list') as HTMLElement;
@@ -628,7 +684,7 @@ export async function render(el: HTMLElement): Promise<void> {
     extResult.textContent = `安装中：${pkg}（npm install，可能需要一两分钟）…`;
     try {
       await api.post<{ name: string }>('/settings/runtime/extensions/install', { package: pkg });
-      extResult.innerHTML = `已安装：<b>${esc(pkg)}</b>（默认启用，主脑下个会话生效）`;
+      extResult.innerHTML = `已安装：<b>${esc(pkg)}</b>（默认启用，蜂后下个会话生效）`;
       (el.querySelector('#ext-pkg') as HTMLInputElement).value = '';
     } catch (err) {
       extResult.innerHTML = `<span class="warn">安装失败：${esc(err instanceof Error ? err.message : '')}</span>`;
@@ -677,7 +733,7 @@ export async function render(el: HTMLElement): Promise<void> {
     }
     try {
       await api.put<{ name: string }>(`/settings/runtime/skills/${encodeURIComponent(name)}`, { markdown });
-      skillResult.innerHTML = `已保存：<b>${esc(name)}</b>（主脑下个会话生效）`;
+      skillResult.innerHTML = `已保存：<b>${esc(name)}</b>（蜂后下个会话生效）`;
     } catch (err) {
       skillResult.innerHTML = `<span class="warn">保存失败：${esc(err instanceof Error ? err.message : '')}</span>`;
     }

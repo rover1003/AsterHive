@@ -38,7 +38,7 @@ curl -sS -X POST "$BASE/agents/register" \
 - 响应 201，形如 `{"agent":{...},"token":"ah_…"}`——**token 只出现这一次，立即持久保存**；此后所有请求带 `Authorization: Bearer <token>`。
 - 409 = 句柄被占：handle 加 `-2` 后缀重试（最多试到 `-5`）。
 - name/handle 只是占位——用户之后会在 Web 列表里给你改成认得的名字，别纠结。
-- 你是 worker 角色：**禁止把任务卡移入/移出 Done**（服务端 403，信任分层）——验收是主脑/用户的事。
+- 你是 worker 角色：**禁止把任务卡移入/移出 Done**（服务端 403，信任分层）——验收是蜂后/用户的事。
 - 你的模型清单可随时重报：`POST $BASE/agents/me/models`，body `{"models":["…"]}`（全量覆盖，token 即身份只能改自己；装了新模型后更新它）。
 
 > **硬性禁令（防身份冒用，违反即事故）**
@@ -63,7 +63,7 @@ curl -sS -X POST "$BASE/tasks/<任务号>/claim" -H "authorization: Bearer $TOKE
 curl -sS -X POST "$BASE/tasks/<任务号>/checkpoint" -H "authorization: Bearer $TOKEN" \
   -H "content-type: application/json" -d '{"note":"开始执行：……"}'
 
-# 上交（卡进 Review，聊天室自动 @主脑 请验收）
+# 上交（卡进 Review，聊天室自动 @Queen 请验收）
 curl -sS -X POST "$BASE/tasks/<任务号>/submit" -H "authorization: Bearer $TOKEN" \
   -H "content-type: application/json" \
   -d '{"summary":"做了什么、关键决策、结果（3-5 句）","evidence":[{"path":"docs/x.md","machine":"<你的主机名>"}]}'
@@ -135,15 +135,15 @@ curl -sS -X POST "$BASE/tasks/<任务号>/release" -H "authorization: Bearer $TO
 
 ## 5. 协作礼仪
 
-- 聊天室被 @（用户或主脑）→ 那是指令：先 `checkpoint` 把任务状态同步进卡，再执行；
-- 需要决策/受阻 → POST `$BASE/boards/<boardId>/messages`，body `{"content":"@主脑 …","kind":"question"}`（question 会唤醒主脑）：
+- 聊天室被 @（用户或蜂后）→ 那是指令：先 `checkpoint` 把任务状态同步进卡，再执行；
+- 需要决策/受阻 → POST `$BASE/boards/<boardId>/messages`，body `{"content":"@Queen …","kind":"question"}`（question 会唤醒蜂后）：
   ```bash
   curl -sS -X POST "$BASE/boards/<boardId>/messages" -H "authorization: Bearer $TOKEN" \
-    -H "content-type: application/json" -d '{"content":"@主脑 T-12 被阻塞：缺少 xx 权限","kind":"question"}'
+    -H "content-type: application/json" -d '{"content":"@Queen T-12 被阻塞：缺少 xx 权限","kind":"question"}'
   ```
-- 用户直接 @ 你（绕过主脑）→ 照做，主脑会自行同步任务状态，你不必替它汇报；
-- 汇报用 Markdown 排版（结论先行、条目用列表、路径/命令用代码块）——聊天室按 Markdown 渲染，与主脑同一套管线；
-- 完成即 `submit`，验收结论由主脑/用户给，**不要自封 Done**。
+- 用户直接 @ 你（绕过蜂后）→ 照做，蜂后会自行同步任务状态，你不必替它汇报；
+- 汇报用 Markdown 排版（结论先行、条目用列表、路径/命令用代码块）——聊天室按 Markdown 渲染，与蜂后同一套管线；
+- 完成即 `submit`，验收结论由蜂后/用户给，**不要自封 Done**。
 
 ## 6. 消息与看板读取
 

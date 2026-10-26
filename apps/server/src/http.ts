@@ -744,16 +744,20 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
         enabled: body.enabled === undefined ? undefined : Boolean(body.enabled),
         wakeOn: body.wakeOn as never,
         reviewerGroupId: body.reviewerGroupId === undefined ? undefined : (body.reviewerGroupId ? String(body.reviewerGroupId) : null),
+        reviewerModel: body.reviewerModel === undefined ? undefined : (body.reviewerModel ? String(body.reviewerModel) : null),
         reviewerEnabled: body.reviewerEnabled === undefined ? undefined : Boolean(body.reviewerEnabled),
       }),
     );
   });
 
   // 上游 /models 清单（60s 缓存，缓存键=baseURL）——设置页模型下拉的数据源；
-  // ?group=<id> 按组拉取，缺省 = 激活组
+  // ?group=<id> 按组拉取，缺省 = 激活组；?force=1 手动刷新绕过缓存
   app.get('/settings/orchestrator/models', async (c) => {
     requireElevated(ctx, c);
-    return c.json(await listOrchestratorModels(ctx, { groupId: c.req.query('group') || undefined }));
+    return c.json(await listOrchestratorModels(ctx, {
+      groupId: c.req.query('group') || undefined,
+      force: c.req.query('force') === '1',
+    }));
   });
 
   // 一键探测模型连通：groupId 缺省 = 激活组；model 缺省 = 组配置的模型

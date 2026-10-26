@@ -24,7 +24,7 @@ const KNOWN_EVENTS = [
   'task.submitted',
   'message.created',
   'settings.orchestrator_updated',
-  // 主脑体验：思考中指示（A）与流式回复（B）。brain.stream 为瞬态事件（服务端直接总线发布，不入台账）
+  // 蜂后体验：思考中指示（A）与流式回复（B）。brain.stream 为瞬态事件（服务端直接总线发布，不入台账）
   'brain.turn_started',
   'brain.turn_finished',
   'brain.stream',

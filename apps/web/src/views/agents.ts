@@ -90,7 +90,7 @@ export async function render(el: HTMLElement): Promise<void> {
           <div class="field"><label for="reg-name">名称</label><input id="reg-name" placeholder="如：ZCode 工作机" /></div>
           <div class="field"><label for="reg-handle">@句柄（唯一）</label><input id="reg-handle" placeholder="如：zcode" /></div>
           <div class="field"><label for="reg-role">角色</label>
-            <select id="reg-role"><option value="worker">worker</option><option value="orchestrator">orchestrator（主脑）</option></select></div>
+            <select id="reg-role"><option value="worker">worker</option><option value="orchestrator">orchestrator（蜂后）</option></select></div>
         </div>
         <button class="primary" id="reg-submit">注册并签发 token</button>
         <div id="reg-result"></div>
@@ -220,7 +220,7 @@ export async function render(el: HTMLElement): Promise<void> {
           ? `<option value="${esc(current)}" selected>${esc(current)}（当前值）</option>`
           : '';
       const modelHint = isBrain
-        ? '<div class="muted small">内置主脑的执行模型以「设置页 → 主脑」为准，此处仅作档案记录。</div>'
+        ? '<div class="muted small">内置蜂后的执行模型以「设置页 → 蜂后」为准，此处仅作档案记录。</div>'
         : agent.models.length
           ? ''
           : '<div class="muted small">接入时自报：CLI 注册时 --models 一次上报，或 worker 启动经 WORKER_MODELS 上报。</div>';

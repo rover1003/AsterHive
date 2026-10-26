@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-hive.sh | bash
 #
 # 交互式完成：下载源码 → docker compose 构建启动 → 等待健康检查 →
-# 初始设置（用户称呼、主脑模型组 baseURL/API Key/模型选择）→ 打印工蜂接入命令。
+# 初始设置（用户称呼、蜂后模型组 baseURL/API Key/模型选择）→ 打印工蜂接入命令。
 # 环境变量：ASTERHIVE_REPO（仓库地址）、ASTERHIVE_REF（分支/标签，默认 main）、
 #           ASTERHIVE_HOME（安装目录，默认 ~/AsterHive）
 set -euo pipefail
@@ -87,7 +87,7 @@ if [ -n "$USER_NAME" ]; then
 fi
 
 echo
-echo "② 主脑模型组（OpenAI 兼容端点；直接回车跳过，之后在 Web「设置 → 模型组」配置）"
+echo "② 蜂后模型组（OpenAI 兼容端点；直接回车跳过，之后在 Web「设置 → 模型组」配置）"
 read -r -p "   Base URL [https://api.openai.com/v1]：" BASE_URL
 BASE_URL="${BASE_URL:-https://api.openai.com/v1}"
 read -rs -p "   API Key：" API_KEY
@@ -115,7 +115,7 @@ if [ -n "$API_KEY" ]; then
       if [ -n "$GROUP_ID" ]; then
         curl -fsS -X PUT "$API/settings/orchestrator/active" -H 'content-type: application/json' -d "{\"groupId\":\"$GROUP_ID\"}" >/dev/null || true
         curl -fsS -X PUT "$API/settings/orchestrator" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null \
-          && log "主脑已启用：通道「default」· 模型 $MODEL_ID（聊天室 @Queen / @主脑 唤醒）" \
+          && log "蜂后已启用：通道「default」· 模型 $MODEL_ID（聊天室 @Queen 唤醒）" \
           || warn "模型组已创建但启用失败——请在 Web 设置页手动启用。"
       else
         warn "模型组创建失败——请在 Web 设置页手动配置。"

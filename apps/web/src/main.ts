@@ -267,7 +267,7 @@ function main(): void {
     if (type === 'board.created' || type === 'board.updated' || type === 'board.deleted') {
       void loadBoards();
     }
-    // Agent 子导航跟随状态事件（任务流转 / agent 上下线 / 主脑回合起止）：
+    // Agent 子导航跟随状态事件（任务流转 / agent 上下线 / 蜂后回合起止）：
     // debounce 500ms 重拉 /overview，只更新子项区不整栏重渲
     if (type.startsWith('task.') || type.startsWith('agent.') || type.startsWith('brain.turn_')) {
       scheduleAgentsReload();

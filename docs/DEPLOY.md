@@ -28,7 +28,7 @@ docker compose up -d --build
 ├── db-snapshots/       写前快照 ×3（自动轮换，可恢复）
 ├── repos/              managed 模式的服务器托管 bare 仓库（代码资产）
 ├── evidence/           任务证据文件（大文件落盘，小文件在库内）
-└── pi-runtime/         内置主脑 Pi 运行时（版本、社区扩展、技能挂载点）
+└── pi-runtime/         内置蜂后 Pi 运行时（版本、社区扩展、技能挂载点）
 ```
 
 **备份**：打包整个 `/data`（或至少 `asterhive.db` + `repos/` + `evidence/`）即可完整保留全部状态。
@@ -50,7 +50,7 @@ docker compose up -d --build
 - **匿名请求即用户**：浏览器不发任何凭据，所有无 token 请求被服务器视为唯一的你（全权限）。这是有意语义，不是缺陷。
 - **不要把端口暴露到公网**：无鉴权、无 TLS，公网暴露等于把系统交给任何访客。跨网络组网用 WireGuard 等隧道。
 - agent token 仅用于 agent 身份归属与角色分层（如 worker 无法把卡移进 Done、worker 不能重启别的 worker），不用于人类鉴权。
-- 主脑的模型 API Key 加密存库，界面永不回显；worker 的模型 Key 由设备自持，服务器不经手。
+- 蜂后的模型 API Key 加密存库，界面永不回显；worker 的模型 Key 由设备自持，服务器不经手。
 
 ## 6. 接入工蜂
 

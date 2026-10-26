@@ -199,7 +199,7 @@ export async function render(el: HTMLElement): Promise<void> {
     <div class="workbench" id="workbench">
       <section class="chat-panel" id="chat-panel" aria-label="项目聊天">
         <div class="chat-panel-head">
-          <span class="chat-panel-title" title="发言即指令；@句柄 定向投递，@主脑 唤醒主脑">${icon.chat} 项目聊天</span>
+          <span class="chat-panel-title" title="发言即指令；@句柄 定向投递，@Queen 唤醒蜂后">${icon.chat} 项目聊天</span>
         </div>
         <div class="chat-panel-body" id="chat-panel-body"></div>
       </section>
@@ -427,7 +427,7 @@ export async function render(el: HTMLElement): Promise<void> {
   // 看板管理抽屉：项目元数据 + 参与者开关 + 危险区删除
   (el.querySelector('#manage-board') as HTMLElement).addEventListener('click', async () => {
     // 参与者数据：worker 角色 agent × 该板当前参与者列表。
-    // 主脑（orchestrator）结构性豁免参与门禁、必须参与，故不列出——避免用户误把它"开除"。
+    // 蜂后（orchestrator）结构性豁免参与门禁、必须参与，故不列出——避免用户误把它"开除"。
     let participants: string[];
     let agents: Agent[];
     try {
@@ -455,7 +455,7 @@ export async function render(el: HTMLElement): Promise<void> {
           <button class="primary" id="m-save">保存</button>
 
           <div class="field">
-            <label>参与者 <span class="muted">（默认全部加入；全部勾选 = 开放给全部，含未来新注册的 agent。主脑始终参与，不在此列）</span></label>
+            <label>参与者 <span class="muted">（默认全部加入；全部勾选 = 开放给全部，含未来新注册的 agent。蜂后始终参与，不在此列）</span></label>
             <div class="participant-list">
               ${agents.length
                 ? agents

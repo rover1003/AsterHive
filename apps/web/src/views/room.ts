@@ -2,9 +2,9 @@
 // 由独立「聊天室」路由视图重构而来——消息渲染/发送/SSE 增量/目标下拉/自动 @前缀/目标态持久化逻辑不变；
 // 变化点：① 板由宿主传入（opts.boardId），切板 = 宿主销毁重挂；② taskRef 点击回调宿主
 //（opts.onTaskClick → 看板页开任务抽屉，同页联动），不再跳路由；③ UI 翻新：user 气泡右对齐、
-// 头像角色状态点、composer 单行化、目标下拉移除「全体」并默认主脑；④ 正文 Markdown 渲染管线
+// 头像角色状态点、composer 单行化、目标下拉移除「全体」并默认蜂后；④ 正文 Markdown 渲染管线
 //（renderMarkdown：marked 解析 → DOMPurify 消毒 → DOM 文本节点遍历内联提及/任务号），
-// 普通消息与主脑流式气泡共用，样式见 styles.css「消息正文 Markdown 元素」节。
+// 普通消息与蜂后流式气泡共用，样式见 styles.css「消息正文 Markdown 元素」节。
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { api, type Message } from '../api.ts';
@@ -12,15 +12,15 @@ import { subscribe } from '../sse.ts';
 import { esc, fmtTime, KIND_LABELS, agentsCached, roleOf, displayAuthor, toast } from '../ui.ts';
 import { icon } from '../icons.ts';
 
-// 内置主脑的 agent id（服务端 agents.ts BRAIN_AGENT_ID）：目标下拉里它有独立选项，不进 worker 列表
+// 内置蜂后的 agent id（服务端 agents.ts BRAIN_AGENT_ID）：目标下拉里它有独立选项，不进 worker 列表
 const BRAIN_AGENT_ID = 'asterhive-brain';
-// 发送目标持久化键：跨会话记住"上次发给谁"（全局一份；落到不可选目标时自动回落主脑）
+// 发送目标持久化键：跨会话记住"上次发给谁"（全局一份；落到不可选目标时自动回落蜂后）
 const MSG_TARGET_KEY = 'asterhive.msgTarget';
 
 export interface ChatPanelOpts {
   /** 面板归属的看板（项目）id；宿主切板时销毁重挂 */
   boardId: string;
-  /** 预填输入框（兼容旧 ?reply=T42 深链：填入 @主脑 引导语并聚焦） */
+  /** 预填输入框（兼容旧 ?reply=T42 深链：填入 @Queen 引导语并聚焦） */
   replyTo?: string;
   /** 消息内任务号（taskRef）点击回调 → 宿主打开任务抽屉 */
   onTaskClick?: (taskId: string) => void;
@@ -160,7 +160,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     const agents = await agentsCached();
     if (destroyed) return;
 
-    // 主脑显示身份（思考指示行/流式气泡头像用）：与消息渲染同一套 roleOf/displayAuthor
+    // 蜂后显示身份（思考指示行/流式气泡头像用）：与消息渲染同一套 roleOf/displayAuthor
     const brainName = displayAuthor(BRAIN_AGENT_ID, agents);
     const brainRole = roleOf(BRAIN_AGENT_ID, agents);
 
@@ -179,7 +179,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     const input = container.querySelector('.composer-input') as HTMLTextAreaElement;
     const targetSelect = container.querySelector('.composer-target') as HTMLSelectElement;
     const sendBtn = container.querySelector('.composer-send') as HTMLButtonElement;
-    let msgTarget = localStorage.getItem(MSG_TARGET_KEY) ?? '主脑'; // 默认发给主脑
+    let msgTarget = localStorage.getItem(MSG_TARGET_KEY) ?? 'Queen'; // 默认发给蜂后（@Queen 为服务端保留别名，路由同 @Queen）
 
     // 输入框自适应：输入时按内容撑高（封顶 220px ≈ 十行，让长提示词完整可读），
     // 发送/清空后弹回初始高度
@@ -189,8 +189,8 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     };
     input.addEventListener('input', fitInput);
 
-    // 目标下拉选项：主脑固定第一项（默认目标）+ 该项目的启用 agent（「全体」选项已按需求移除）。
-    // 数据规则：GET /agents（已排除 user）过滤 enabled 且排除内置主脑（主脑有独立选项），
+    // 目标下拉选项：蜂后固定第一项（默认目标）+ 该项目的启用 agent（「全体」选项已按需求移除）。
+    // 数据规则：GET /agents（已排除 user）过滤 enabled 且排除内置蜂后（蜂后有独立选项），
     // 再 GET /boards/:b/participants——agentIds 非空则只列其中，为空则开放全部。
     const refreshTargets = async () => {
       let pool = agents.filter((a) => a.enabled && a.id !== BRAIN_AGENT_ID);
@@ -205,11 +205,11 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       }
       const saved = msgTarget;
       targetSelect.innerHTML =
-        `<option value="主脑">蜂后 (@Queen / @主脑)</option>` +
+        `<option value="Queen">蜂后 @Queen</option>` +
         `<option value="Bee">全体工蜂 (@Bee)</option>` +
         pool.map((a) => `<option value="${esc(a.handle)}">工蜂 @${esc(a.handle)}（${esc(a.name)}）</option>`).join('');
-      // 记住的目标不在本项目可选范围（切板/被移出参与者/已停用，含旧版存过的「全体」空值）→ 回落主脑
-      if (![...targetSelect.options].some((o) => o.value === saved)) msgTarget = '主脑';
+      // 记住的目标不在本项目可选范围（切板/被移出参与者/已停用，含旧版存过的「全体」空值）→ 回落蜂后
+      if (![...targetSelect.options].some((o) => o.value === saved)) msgTarget = 'Queen';
       targetSelect.value = msgTarget;
     };
     refreshTargetsImpl = () => void refreshTargets();
@@ -233,19 +233,19 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     });
 
     // ---- 功能C：发送/停止按钮切换 ----
-    // 主脑活跃 = 思考指示行或流式气泡任一可见（复用功能A/B 维护的显隐状态，不另设标志位——
+    // 蜂后活跃 = 思考指示行或流式气泡任一可见（复用功能A/B 维护的显隐状态，不另设标志位——
     // 显隐路径是唯一事实源，syncSendButton 挂在其收尾处即全覆盖）。活跃期间 .composer-send
     // 变停止按钮（--danger 底 + stop 图标，样式见 styles.css .composer-send.stopping）：
-    // 点击 POST /settings/orchestrator/abort 中止主脑当前轮次；非活跃恢复发送态。
+    // 点击 POST /settings/orchestrator/abort 中止蜂后当前轮次；非活跃恢复发送态。
     const syncSendButton = () => {
       const active = thinkingRow !== null || streamRow !== null;
       sendBtn.classList.toggle('stopping', active);
-      sendBtn.title = active ? '停止主脑当前轮次' : '发送';
+      sendBtn.title = active ? '停止蜂后当前轮次' : '发送';
       sendBtn.innerHTML = active ? icon.stop : icon.send;
     };
 
-    // ---- 功能A：主脑"思考中"指示行 ----
-    // 生命周期：brain.turn_started 显示 → brain.turn_finished / brain.error / 主脑消息到达 撤除
+    // ---- 功能A：蜂后"思考中"指示行 ----
+    // 生命周期：brain.turn_started 显示 → brain.turn_finished / brain.error / 蜂后消息到达 撤除
     //（多路撤除是防事件乱序/异常轮残留的双保险）。计时秒数每秒递增。
     let thinkingRow: HTMLElement | null = null;
     let thinkingTimer: ReturnType<typeof setInterval> | null = null;
@@ -260,7 +260,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         <div class="avatar role-${brainRole}"><span>${esc(brainName.slice(0, 1))}</span><i class="avatar-dot"></i></div>
         <div class="thinking-bubble">
           <span class="thinking-dots"><i></i><i></i><i></i></span>
-          <span>主脑思考中…</span>
+          <span>蜂后思考中…</span>
           <span class="thinking-elapsed"></span>
         </div>`;
       thinkingRow = row;
@@ -272,7 +272,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         elapsedEl.textContent = `${thinkingSeconds}s`;
       }, 1000);
       scrollToBottom();
-      syncSendButton(); // 主脑转活跃：发送按钮 → 停止按钮
+      syncSendButton(); // 蜂后转活跃：发送按钮 → 停止按钮
     };
 
     const hideThinking = () => {
@@ -286,10 +286,10 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       syncSendButton(); // 可能因此转非活跃：停止按钮 → 发送按钮（流式气泡仍活跃则保持停止态）
     };
 
-    // ---- 功能B：主脑流式回复气泡 ----
+    // ---- 功能B：蜂后流式回复气泡 ----
     // 生命周期：brain.stream phase='streaming' 创建/更新全文（每次以最新全文整体重渲
     // renderMarkdown，免乱序；服务端 300ms 尾随节流已限频，重渲代价可接受）；
-    // phase='end' 或主脑正式消息（message.created）到达 → 撤除，正式消息由既有流程照常插入。
+    // phase='end' 或蜂后正式消息（message.created）到达 → 撤除，正式消息由既有流程照常插入。
     let streamRow: HTMLElement | null = null;
     let streamContent: HTMLElement | null = null;
     let streamActivity: HTMLElement | null = null;
@@ -310,9 +310,9 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         streamContent = row.querySelector('.stream-content') as HTMLElement;
         streamActivity = row.querySelector('.stream-activity') as HTMLElement;
         list.appendChild(row);
-        syncSendButton(); // 主脑转活跃：发送按钮 → 停止按钮（仅创建时机状态变化，更新帧无需重设）
+        syncSendButton(); // 蜂后转活跃：发送按钮 → 停止按钮（仅创建时机状态变化，更新帧无需重设）
       }
-      // 工具活动面板：主脑一轮大部分时间在调工具（此阶段无 text 增量）——不展示的话
+      // 工具活动面板：蜂后一轮大部分时间在调工具（此阶段无 text 增量）——不展示的话
       // 上游在烧 token 而界面静默，用户无从判断。显示最近 8 条，最后一条为进行中
       if (streamActivity) {
         if (activity && activity.length > 0) {
@@ -340,7 +340,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       syncSendButton(); // 可能因此转非活跃：停止按钮 → 发送按钮
     };
 
-    // 中止主脑当前轮次（停止按钮点击 / 停止态 Enter）：请求在途防抖，连点只在第一发生效
+    // 中止蜂后当前轮次（停止按钮点击 / 停止态 Enter）：请求在途防抖，连点只在第一发生效
     //（服务端 abortTurn 本身幂等，这里省的是多余请求）。成功即本地撤指示行/流式气泡
     //（服务端 brain.turn_aborted / brain.turn_finished 事件兜底），并抑制本轮剩余流式增量
     //（turn_started 复位）——防中止收尾前迟到的节流帧把气泡显回来。失败 toast 且保持现状。
@@ -396,7 +396,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
           ),
         );
         scrollToBottom();
-        // 主脑正式消息已插入：撤"思考中"指示与流式气泡（与 turn_finished/end 双保险，防乱序残留）；
+        // 蜂后正式消息已插入：撤'思考中'指示与流式气泡（与 turn_finished/end 双保险，防乱序残留）；
         // 本轮剩余流式增量不再显示（正式消息已在上方），end / 下一轮 turn_started 复位
         if (String(payload.author) === BRAIN_AGENT_ID) {
           hideThinking();
@@ -428,7 +428,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
           streamSuppressed = false;
           return;
         }
-        // streaming：主脑已开始输出 → 撤"思考中"指示行，改显流式气泡
+        // streaming：蜂后已开始输出 → 撤"思考中"指示行，改显流式气泡
         hideThinking();
         if (streamSuppressed) return;
         const acts = Array.isArray(payload.activity)
@@ -447,7 +447,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       return;
     }
 
-    // 恢复检查：页面在主脑轮次中刷新/重开时 SSE 只送增量、缺起始事件——
+    // 恢复检查：页面在蜂后轮次中刷新/重开时 SSE 只送增量、缺起始事件——
     // 对比台账最近一次 brain.turn_started / brain.turn_finished，前者更新 = 轮仍活跃 → 恢复
     // 指示行（已进行秒数按事件时间补算）。brain.stream 是瞬态事件不入台账，不恢复流式文本
     //（该轮的正式消息到达时照常显示，不会丢内容）。
@@ -485,7 +485,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
         toast(`发送失败：${err instanceof Error ? err.message : ''}`, true);
       }
     };
-    // 发送按钮：主脑活跃期间它是停止按钮（点击=中止当前轮次），非活跃才是发送
+    // 发送按钮：蜂后活跃期间它是停止按钮（点击=中止当前轮次），非活跃才是发送
     sendBtn.addEventListener('click', () => {
       if (thinkingRow || streamRow) void stopBrain();
       else void send();
@@ -501,7 +501,7 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
 
     // 兼容旧 ?reply= 深链（如从卡片回复入口进入）：预填引导语并聚焦
     if (opts.replyTo) {
-      input.value = `@主脑 关于 ${opts.replyTo}：`;
+      input.value = `@Queen 关于 ${opts.replyTo}：`;
       fitInput();
       input.focus();
     }
