@@ -259,7 +259,7 @@ async function uploadBundle(cfg: WorkerConfig, boardId: string, bundle: { file: 
         } else resolvePromise(parsed);
       });
     });
-    req.setTimeout(120_000, () => req.destroy(new Error('bundle 上传超时')));
+    req.setTimeout(600_000, () => req.destroy(new Error('bundle 上传超时')));
     req.on('error', reject);
     const input = createReadStream(bundle.file);
     input.on('error', (err) => req.destroy(err));
