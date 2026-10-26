@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AsterHive（星巢）托管工蜂（Bee）一键安装脚本（Linux/macOS）
+# AsterHive（星巢）托管工蜂（Bee）一键安装脚本（Linux/macOS；Windows 原生用 install-bee.ps1）
 #
 # 一行命令（HIVE_URL 换成你的星巢服务器地址，在 Hive 部署完成的输出或 Web「Agent 接入」页可查）：
 #   curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- http://<hive-ip>:8067
@@ -29,7 +29,7 @@ die() { printf '\033[1;31m[bee]\033[0m %s\n' "$*" >&2; exit 1; }
 # 但要求 ~/.asterhive/worker.json 已含完整模型配置（重装/自动化场景），否则明确报错
 if [ ! -t 0 ] && [ -z "${ASTERHIVE_REEXEC:-}" ] && [ -e /dev/tty ] && [ -t 1 ]; then
   TMP="$(mktemp /tmp/install-bee.XXXXXX.sh)"
-  curl -fsSL "$SELF_URL" -o "$TMP"
+  fetch "$SELF_URL" "$TMP"
   log "管道模式：以交互方式重新运行安装脚本…"
   ASTERHIVE_REEXEC=1 exec bash "$TMP" "$@" < /dev/tty
 fi
@@ -42,10 +42,28 @@ fi
 HIVE_URL="${1:-}"
 [ -n "$HIVE_URL" ] || die "用法：install-bee.sh <hive服务器地址>（如 http://192.168.1.10:8067；见 Hive 部署输出或 Web「Agent 接入」页）"
 case "$HIVE_URL" in http://*|https://*) ;; *) die "hive 地址需以 http:// 或 https:// 开头：$HIVE_URL" ;; esac
-curl -fsS --max-time 10 "$HIVE_URL/health" >/dev/null 2>&1 || die "无法连接 $HIVE_URL/health ——请确认 Hive 已部署且地址可达。"
+fetch "$HIVE_URL/health" /dev/null 2>/dev/null || (curl -fsS --max-time 10 "$HIVE_URL/health" >/dev/null 2>&1) || die "无法连接 $HIVE_URL/health ——请确认 Hive 已部署且地址可达。"
 
-command -v curl >/dev/null 2>&1 || die "未检测到 curl。"
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || die "需要 curl 或 wget 之一（下载依赖用），请先安装。"
 command -v tar >/dev/null 2>&1 || die "未检测到 tar。"
+
+# 下载辅助：自动检测 curl / wget（全脚本下载统一走这里，零手动依赖配置）
+fetch() { # fetch <url> <outfile>
+  if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2";
+  elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1";
+  else return 1; fi
+}
+fetch_pipe() { # fetch_pipe <url>（输出到 stdout，供管道解压）
+  if command -v curl >/dev/null 2>&1; then curl -fsSL "$1";
+  elif command -v wget >/dev/null 2>&1; then wget -qO- "$1";
+  else return 1; fi
+}
+fetch_header() { # fetch_header <url> <header>（带鉴权头的 API 调用）
+  local url="$1" hdr="$2"
+  if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 20 "$url" -H "$hdr" 2>/dev/null || true;
+  elif command -v wget >/dev/null 2>&1; then wget -qO- --timeout=20 --header="$hdr" "$url" 2>/dev/null || true;
+  else true; fi
+}
 
 node_ok() {
   command -v node >/dev/null 2>&1 || return 1
@@ -60,17 +78,17 @@ if node_ok; then
 else
   log "系统 Node 缺失或 < $NODE_MIN，安装便携版 Node 24 到 $NODE_DIR …"
   mkdir -p "$NODE_DIR"
-  NODE_VERSION="$(curl -fsSL https://nodejs.org/dist/index.json | grep -o '"version":"v24[^"]*"' | head -1 | grep -o 'v24[0-9.]*')"
+  NODE_VERSION="$(fetch_pipe https://nodejs.org/dist/index.json | grep -o '"version":"v24[^"]*"' | head -1 | grep -o 'v24[0-9.]*')"
   [ -n "$NODE_VERSION" ] || die "无法确定 Node 24 版本号（nodejs.org 不可达？）。请手动安装 Node ≥ $NODE_MIN 后重试。"
   case "$(uname -s)/$(uname -m)" in
     Linux/x86_64) NODE_DIST="linux-x64" ;;
     Linux/aarch64|Linux/arm64) NODE_DIST="linux-arm64" ;;
     Darwin/arm64) NODE_DIST="darwin-arm64" ;;
     Darwin/x86_64) NODE_DIST="darwin-x64" ;;
-    *) die "暂不支持的平台：$(uname -s)/$(uname -m)（Windows 请用 WSL/Git Bash，原生支持在路线图中）" ;;
+    *) die "暂不支持的平台：$(uname -s)/$(uname -m)。Windows 原生请用 PowerShell 版：iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/$REF/scripts/install-bee.ps1)" ;;
   esac
   log "下载 Node $NODE_VERSION ($NODE_DIST)…"
-  curl -fsSL "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-$NODE_DIST.tar.gz" \
+  fetch_pipe "https://nodejs.org/dist/$NODE_VERSION/node-$NODE_VERSION-$NODE_DIST.tar.gz" \
     | tar -xz -C "$NODE_DIR" --strip-components=1
   export PATH="$NODE_DIR/bin:$PATH"
   NODE_BIN="$NODE_DIR/bin/node"
@@ -82,8 +100,8 @@ fi
 log "下载 worker 源码（$REPO @$REF）…"
 mkdir -p "$APP_DIR"
 TMP_TGZ="$(mktemp /tmp/asterhive-worker.XXXXXX.tar.gz)"
-curl -fsSL "$REPO/archive/refs/heads/$REF.tar.gz" -o "$TMP_TGZ" \
-  || curl -fsSL "$REPO/archive/refs/tags/$REF.tar.gz" -o "$TMP_TGZ" \
+fetch "$REPO/archive/refs/heads/$REF.tar.gz" "$TMP_TGZ" \
+  || fetch "$REPO/archive/refs/tags/$REF.tar.gz" "$TMP_TGZ" \
   || die "源码下载失败：请检查网络与 ASTERHIVE_REF=$REF。"
 tar -xzf "$TMP_TGZ" -C "$APP_DIR" --strip-components=1
 rm -f "$TMP_TGZ"
@@ -107,7 +125,7 @@ echo
 [ -n "$API_KEY" ] || die "API Key 不能为空（工蜂没有可用模型无法执行任务）。"
 
 log "拉取模型清单（同时校验 Base URL 与 Key）…"
-MODEL_JSON="$(curl -fsS --max-time 20 "${BASE_URL%/}/models" -H "Authorization: Bearer $API_KEY" 2>/dev/null || true)"
+MODEL_JSON="$(fetch_header "${BASE_URL%/}/models" "Authorization: Bearer $API_KEY")"
 [ -n "$MODEL_JSON" ] || die "模型清单拉取失败：请检查 Base URL 与 Key 是否正确。"
 
 MODEL_FILE="$(mktemp /tmp/bee-models.XXXXXX)"

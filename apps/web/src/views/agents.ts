@@ -43,8 +43,10 @@ export async function render(el: HTMLElement): Promise<void> {
     const skillUrl = `${location.origin}/skill/asterhive-worker`;
     // 复制给 agent 的就是这句话本身（不含"告诉任何 agent："前缀）
     const bootLine = `访问 ${skillUrl} 并照做——它会自己完成注册、学习循环并常驻`;
-    // 托管工蜂（T19）：一行命令在裸设备装内置 Pi 工蜂（交互式配模型，Key 只存设备）
-    const beeCmd = `curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- ${location.origin}`;
+    // 托管工蜂（T19）：一行命令在裸设备装内置 Pi 工蜂（交互式配模型，Key 只存设备）——按设备系统给 bash / PowerShell 两条
+    const beeBashCmd = `curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- ${location.origin}`;
+    const beePsCmd = `iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)  # 脚本内按提示填写 Hive 地址 ${location.origin}`;
+    const isWindowsDevice = /Windows/i.test(navigator.userAgent);
     // 附注（人类手动操作时）：--url 默认当前 origin（同源部署）；<仓库> 由设备主人按 docs/WORKER.md clone 后替换
     const runCmd = `ASTERHIVE_URL=${location.origin} node <仓库>/apps/worker-zcode/src/main.ts`;
     const regCmd = `node <仓库>/packages/sdk/src/cli.ts register --url ${location.origin}`;
@@ -52,10 +54,16 @@ export async function render(el: HTMLElement): Promise<void> {
       <div class="view-head"><h2>${icon.plug} Agent 接入</h2><span class="hint">接入一台设备只需要服务器地址——显示名/句柄自动生成，其余全部自动；启停 agent 需要你的身份（设置页配置）</span></div>
       <div class="panel">
         <h3>裸设备接入（托管工蜂，零 agent 依赖）</h3>
-        <p class="hint">设备上没有任何 agent CLI？一行命令装一个内置 Pi 执行内核的托管工蜂：交互式配置模型（Base URL + API Key → 在线拉取模型列表选择），Key 只存本设备，自动注册上线、常驻化。要求 Node ≥ 23.6（脚本会自动装）。</p>
-        <pre class="cmd-line"><code id="bee-cmd">${esc(beeCmd)}</code></pre>
+        <p class="hint">设备上没有任何 agent CLI？一行命令装一个内置 Pi 执行内核的托管工蜂：交互式配置模型（Base URL + API Key → 在线拉取模型列表选择），Key 只存本设备，自动注册上线、常驻化。所有依赖（含 Node）脚本自动检测并安装。</p>
+        ${isWindowsDevice ? `
+        <p class="hint" style="margin-bottom:4px"><b>Windows（PowerShell，检测到当前设备）</b></p>
+        <pre class="cmd-line"><code id="bee-ps-cmd">${esc(beePsCmd)}</code></pre>
+        <button class="sm" id="bee-ps-copy">复制命令</button>
+        <p class="hint" style="margin:10px 0 4px"><b>Linux / macOS（bash）</b></p>` : `
+        <p class="hint" style="margin-bottom:4px"><b>Linux / macOS（bash）</b></p>`}
+        <pre class="cmd-line"><code id="bee-cmd">${esc(beeBashCmd)}</code></pre>
         <button class="sm" id="bee-copy">复制命令</button>
-        <p class="hint" style="margin-top:6px">Linux/macOS 一行完成；Windows 设备用 WSL 或 Git Bash 执行。装好的工蜂默认多板巡检，看板参与在本页看板管理里勾选。</p>
+        <p class="hint" style="margin-top:6px">装好的工蜂默认多板巡检，看板参与在本页看板管理里勾选；Windows 计划任务、Linux systemd 用户服务均可随时卸载重装。</p>
       </div>
       <div class="panel">
         <h3>已有 agent 接入（自举协议）</h3>
@@ -137,7 +145,8 @@ export async function render(el: HTMLElement): Promise<void> {
         }
       });
     };
-    wireCopy('#bee-copy', () => beeCmd, '复制命令');
+    wireCopy('#bee-copy', () => beeBashCmd, '复制命令');
+    if (isWindowsDevice) wireCopy('#bee-ps-copy', () => beePsCmd, '复制命令');
     wireCopy('#skill-copy', () => bootLine, '复制这句话');
     wireCopy('#run-copy', () => runCmd, '复制命令');
     wireCopy('#cmd-copy', () => regCmd, '复制命令');

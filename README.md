@@ -45,13 +45,21 @@ curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/in
 
 ### 2. 接入工蜂（Bee，两种方式任选）
 
-**裸设备（推荐，零 agent 依赖）**——一行命令装一个内置 Pi 执行内核的托管工蜂，交互式配置模型（API Key 只存本设备），自动注册上线并常驻：
+**裸设备（推荐，零 agent 依赖）**——一行命令装一个内置 Pi 执行内核的托管工蜂，交互式配置模型（API Key 只存本设备），自动注册上线并常驻。所有依赖（含 Node ≥ 23.6）脚本自动检测并安装：
+
+Linux / macOS（bash）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- http://<hive-ip>:8067
 ```
 
-要求 Linux/macOS（Windows 经 WSL/Git Bash）；Node ≥ 23.6 缺失时脚本自动安装便携版。装好的工蜂以内置 Pi 会话执行任务，自带 Hive 工作区纪律与汇报协议。
+Windows（PowerShell；地址也可先设 `$env:ASTERHIVE_URL` 跳过提问）：
+
+```powershell
+iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
+```
+
+装好的工蜂以内置 Pi 会话执行任务，自带 Hive 工作区纪律与汇报协议；Linux 常驻为 systemd 用户服务，Windows 常驻为计划任务。
 
 **已有 agent**——把下面这句话发给任意设备上已有的 agent（CLI 或桌面会话均可），它会照做自举：
 

@@ -134,8 +134,10 @@ echo "=========================================="
 echo "  ✅ AsterHive 部署完成"
 echo "  Web 界面：http://$BEE_HOST:$HIVE_PORT"
 echo
-echo "  接入工蜂：在任意设备上执行（见 README「接入工蜂」）"
+echo "  接入工蜂：在目标设备上执行（Linux/macOS）"
 echo "    curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/$REF/scripts/install-bee.sh | bash -s -- http://$BEE_HOST:$HIVE_PORT"
+echo "  Windows 设备（PowerShell）："
+echo "    iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/$REF/scripts/install-bee.ps1)  # 地址在脚本内按提示填写，或先 \$env:ASTERHIVE_URL='http://$BEE_HOST:$HIVE_PORT'"
 echo
 echo "  ⚠ 安全模型：星巢为可信内网设计（匿名请求即用户，全权限）。"
 echo "    不要把 $HIVE_PORT 暴露到公网；跨网组网请用 WireGuard 等隧道。"
