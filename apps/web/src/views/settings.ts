@@ -86,6 +86,28 @@ export async function render(el: HTMLElement): Promise<void> {
       </div>
       <div id="rt-result"></div>
       <p class="muted small">社区插件挂载点：<code id="rt-extdir">…</code><br />把社区插件放到该目录（每个插件一个子目录）即可被主脑会话加载；服务器不预装任何插件。</p>
+    </div>
+    <div class="panel">
+      <h3>主脑扩展与技能</h3>
+      <p class="muted">管理主脑的 Pi 扩展插件与技能：npm 包名安装（服务器代装入数据卷）、启停、删除；技能直接写 SKILL.md。变更不打断运行中的会话，主脑下个会话生效。</p>
+      <div id="ext-list" class="muted small">加载中…</div>
+      <div class="inline-form">
+        <input id="ext-pkg" placeholder="npm 包名，如 @scope/some-pi-ext" style="flex:1;min-width:220px" />
+        <button class="primary" id="ext-install">安装扩展</button>
+      </div>
+      <div id="ext-result" class="muted small"></div>
+      <div style="margin-top:12px"><b class="small">技能（skills/）</b></div>
+      <div id="skill-list" class="muted small">加载中…</div>
+      <div class="inline-form">
+        <input id="skill-name" placeholder="技能目录名，如 deep-review" style="min-width:180px" />
+        <button id="skill-refresh">刷新</button>
+      </div>
+      <textarea id="skill-markdown" rows="6" placeholder="SKILL.md 全文（Markdown，可含 frontmatter）" style="width:100%;margin-top:6px"></textarea>
+      <div class="inline-form">
+        <button class="primary" id="skill-save">保存 / 覆盖技能</button>
+        <button class="danger" id="skill-delete">删除该技能</button>
+      </div>
+      <div id="skill-result" class="muted small"></div>
     </div>`;
 
   // ---- 用户：回填用户名；保存只是改名 ----
@@ -556,4 +578,126 @@ export async function render(el: HTMLElement): Promise<void> {
     }
     refreshRuntime();
   });
+
+  // ---- 主脑扩展与技能卡片：列表/安装/启停/删除 + 技能写入/删除 ----
+  const extList = el.querySelector('#ext-list') as HTMLElement;
+  const extResult = el.querySelector('#ext-result') as HTMLElement;
+  const skillList = el.querySelector('#skill-list') as HTMLElement;
+  const skillResult = el.querySelector('#skill-result') as HTMLElement;
+  const skillNameInput = el.querySelector('#skill-name') as HTMLInputElement;
+  const skillMd = el.querySelector('#skill-markdown') as HTMLTextAreaElement;
+
+  async function refreshExtensions(): Promise<void> {
+    try {
+      const r = await api.get<{ extensions: { name: string; enabled: boolean; source: string }[] }>('/settings/runtime/extensions');
+      extList.innerHTML = r.extensions.length
+        ? r.extensions.map((x) => `
+            <div class="inline-form" style="margin:4px 0;align-items:center">
+              <code>${esc(x.name)}</code>
+              <span class="muted small">（${x.source === 'npm' ? 'npm 安装' : '手工目录'} · ${x.enabled ? '已启用' : '已停用'}）</span>
+              <button data-toggle="${esc(x.name)}" data-to="${x.enabled ? '0' : '1'}">${x.enabled ? '停用' : '启用'}</button>
+              <button class="danger" data-del-ext="${esc(x.name)}">删除</button>
+            </div>`).join('')
+        : '暂无扩展——填 npm 包名安装，或把插件目录放入挂载点。';
+    } catch (err) {
+      extList.textContent = `读取失败：${err instanceof Error ? err.message : ''}`;
+    }
+  }
+
+  extList.addEventListener('click', async (ev) => {
+    const t = ev.target as HTMLElement;
+    const toggle = t.dataset.toggle;
+    const del = t.dataset.delExt;
+    try {
+      if (toggle) {
+        await api.post(`/settings/runtime/extensions/${encodeURIComponent(toggle)}/enabled`, { enabled: t.dataset.to === '1' });
+        extResult.textContent = `已切换：${toggle}`;
+      } else if (del && confirm(`确认删除扩展 ${del}？目录将被整个移除。`)) {
+        await api.del(`/settings/runtime/extensions/${encodeURIComponent(del)}`);
+        extResult.textContent = `已删除：${del}`;
+      }
+    } catch (err) {
+      extResult.innerHTML = `<span class="warn">操作失败：${esc(err instanceof Error ? err.message : '')}</span>`;
+    }
+    refreshExtensions();
+  });
+
+  (el.querySelector('#ext-install') as HTMLElement).addEventListener('click', async () => {
+    const pkg = (el.querySelector('#ext-pkg') as HTMLInputElement).value.trim();
+    if (!pkg) return;
+    extResult.textContent = `安装中：${pkg}（npm install，可能需要一两分钟）…`;
+    try {
+      await api.post<{ name: string }>('/settings/runtime/extensions/install', { package: pkg });
+      extResult.innerHTML = `已安装：<b>${esc(pkg)}</b>（默认启用，主脑下个会话生效）`;
+      (el.querySelector('#ext-pkg') as HTMLInputElement).value = '';
+    } catch (err) {
+      extResult.innerHTML = `<span class="warn">安装失败：${esc(err instanceof Error ? err.message : '')}</span>`;
+    }
+    refreshExtensions();
+  });
+
+  async function refreshSkills(): Promise<void> {
+    try {
+      const r = await api.get<{ skills: { name: string; updatedAt: number | null }[] }>('/settings/runtime/skills');
+      skillList.innerHTML = r.skills.length
+        ? r.skills.map((s) => `
+            <div class="inline-form" style="margin:4px 0;align-items:center">
+              <code>${esc(s.name)}</code>
+              ${s.updatedAt ? `<span class="muted small">${fmtTime(s.updatedAt)}</span>` : ''}
+              <button data-load-skill="${esc(s.name)}">载入编辑</button>
+            </div>`).join('')
+        : '暂无技能——填目录名并写 SKILL.md 保存即可。';
+    } catch (err) {
+      skillList.textContent = `读取失败：${err instanceof Error ? err.message : ''}`;
+    }
+  }
+
+  skillList.addEventListener('click', async (ev) => {
+    const t = ev.target as HTMLElement;
+    const name = t.dataset.loadSkill;
+    if (!name) return;
+    skillNameInput.value = name;
+    try {
+      // 读取现有技能内容：经扩展端点拿不到文件体，技能内容用文本下载端点
+      const res = await fetch(`/settings/runtime/skills/${encodeURIComponent(name)}/content`);
+      if (res.ok) skillMd.value = await res.text();
+      else skillMd.value = '';
+      skillResult.textContent = `已载入：${name}`;
+    } catch {
+      skillMd.value = '';
+    }
+  });
+
+  (el.querySelector('#skill-save') as HTMLElement).addEventListener('click', async () => {
+    const name = skillNameInput.value.trim();
+    const markdown = skillMd.value;
+    if (!name || !markdown.trim()) {
+      skillResult.innerHTML = '<span class="warn">需要目录名与 SKILL.md 内容</span>';
+      return;
+    }
+    try {
+      await api.put<{ name: string }>(`/settings/runtime/skills/${encodeURIComponent(name)}`, { markdown });
+      skillResult.innerHTML = `已保存：<b>${esc(name)}</b>（主脑下个会话生效）`;
+    } catch (err) {
+      skillResult.innerHTML = `<span class="warn">保存失败：${esc(err instanceof Error ? err.message : '')}</span>`;
+    }
+    refreshSkills();
+  });
+
+  (el.querySelector('#skill-delete') as HTMLElement).addEventListener('click', async () => {
+    const name = skillNameInput.value.trim();
+    if (!name || !confirm(`确认删除技能 ${name}？`)) return;
+    try {
+      await api.del(`/settings/runtime/skills/${encodeURIComponent(name)}`);
+      skillResult.textContent = `已删除：${name}`;
+      skillMd.value = '';
+    } catch (err) {
+      skillResult.innerHTML = `<span class="warn">删除失败：${esc(err instanceof Error ? err.message : '')}</span>`;
+    }
+    refreshSkills();
+  });
+
+  (el.querySelector('#skill-refresh') as HTMLElement).addEventListener('click', refreshSkills);
+  refreshExtensions();
+  refreshSkills();
 }

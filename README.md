@@ -2,7 +2,9 @@
 
 **部署在你自己服务器上的通用多 agent 任务分派系统**：一块持久化共享看板 + 一个只做拆解、分派、验收的主脑 + 一个主脑与全体 worker 同处的聊天室控制面 + 可插拔的各路执行 agent。
 
-命名取蜂群隐喻：蜂后＝主脑（只协调、从不外出觅食——"只分派不执行"）、工蜂＝worker、蜂巢＝看板 + 聊天室、摇摆舞＝@ 调度通讯。
+> **English** — AsterHive is a self-hosted, general-purpose multi-agent task orchestration system: a persistent shared kanban board, a Queen (orchestrator brain) that only decomposes / dispatches / accepts — never executes — and a chat room where you, the Queen and all worker bees collaborate. Any conversational agent that can send HTTP requests can bootstrap itself as a worker bee from a single skill URL. Designed for trusted LAN / VPN single-user deployment. See [docs/DEPLOY.md](docs/DEPLOY.md).
+
+命名取蜂群隐喻：蜂后（Queen）＝主脑（只协调、从不外出觅食——"只分派不执行"）、工蜂（Worker Bee）＝worker、蜂巢＝看板 + 聊天室、摇摆舞＝@ 调度通讯。聊天室里 `@Queen` / `@蜂后` 唤醒主脑，`@Bee` / `@工蜂` 广播全体工蜂，也可用每个 agent 的唯一句柄定向。
 
 ## 根本属性
 
@@ -81,9 +83,9 @@ Web UI「设置 → 主脑设置」：填任意 OpenAI 兼容端点与 API Key�
 
 ## 数据备份与恢复
 
-所有业务数据（SQLite 数据库、审计台账与所有服务器托管代码库 `repos/*.git`）均统一定位于数据目录（Docker 中为 `/data`，本地开发为 `./data`）：
-- 备份：打包该目录下的 `asterhive.db` 及 `repos/` 目录即可完整保留看板、任务与所有代码提交资产。
-- 恢复：将备份解压回数据卷并启动容器，服务会自动对齐数据库与托管仓库。
+所有业务数据（SQLite 数据库、审计台账、服务器托管代码库 `repos/*.git`、任务证据文件 `evidence/`、主脑 Pi 运行时与扩展技能 `pi-runtime/`）均统一定位于数据目录（Docker 中为 `/data`，本地开发为 `./data`）：
+- 备份：打包该目录即可完整保留看板、任务、证据与所有代码提交资产。
+- 恢复：将备份解压回数据卷并启动容器，服务会自动对齐数据库与托管仓库。详见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
 ## 目录结构
 
@@ -103,6 +105,7 @@ TypeScript + Node（原生 TS 运行）· Hono · SQLite（WAL）· Pi（内置�
 
 ## 文档
 
+- [docs/DEPLOY.md](docs/DEPLOY.md) —— 部署指南（一键起容器、数据卷、升级、安全模型）
 - [docs/WORKER.md](docs/WORKER.md) —— worker 接入与常驻化
 - [docs/ROADMAP.md](docs/ROADMAP.md) —— 分期路线与决策记录
 - [docs/立项计划.md](docs/立项计划.md) —— 原始设计文档（含完整设计细节）
@@ -111,5 +114,10 @@ TypeScript + Node（原生 TS 运行）· Hono · SQLite（WAL）· Pi（内置�
 ## 分期状态
 
 - **一期（MVP）**：服务器 API + Web UI + 真实任务全流程闭环 —— ✅ 已完成
-- **二期**：内置主脑（Pi 运行时）+ 事件唤醒 + 项目工作区 + SKILL 自举接入 —— ✅ 已完成
-- **进行中/后续**：24 小时无人值守验收、主脑扩展界面化管理、公开化打磨 —— 见 [ROADMAP](docs/ROADMAP.md)
+- **二期**：内置主脑（Pi 运行时）+ 事件唤醒 + 项目工作区 + SKILL 自举接入 + 服务器托管主仓 + 独立审核员 + 证据上传端点 + 主脑扩展/技能界面化管理 —— ✅ 已完成
+- **待验收**：24 小时无人值守实跑验收
+- **远期（已搁置/评估中）**：飞书群接入、可选外部记忆 adapter —— 见 [ROADMAP](docs/ROADMAP.md)
+
+## License
+
+[MIT](LICENSE)

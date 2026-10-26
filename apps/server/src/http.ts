@@ -1,4 +1,5 @@
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { Context } from 'hono';
@@ -62,6 +63,7 @@ import { probeWorker, restartWorkerService, releaseStuckTask } from './worker-co
 import { inferAndApplyTaskDependencies } from './dependencies.ts';
 import { handleChatToCard } from './webhook.ts';
 import { getFleetRadar } from './fleet-radar.ts';
+import { storeEvidenceFile, listEvidenceFiles, readEvidenceContent, deleteEvidenceFile } from './evidence.ts';
 import { Brain } from './brain.ts';
 import { fileURLToPath } from 'node:url';
 import { serveStatic } from '@hono/node-server/serve-static';
@@ -614,6 +616,46 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json(result);
   });
 
+  // ---- 证据上传端点（T15：小文件入库、大文件登记校验和）----
+  app.post('/tasks/:id/evidence', async (c) => {
+    const actor = requireActor(ctx, c);
+    const taskId = c.req.param('id');
+    const rawName = c.req.header('x-filename') || c.req.query('filename') || '';
+    let filename = rawName;
+    try { filename = decodeURIComponent(rawName); } catch { /* 原样使用 */ }
+    const rawNote = c.req.header('x-note') || c.req.query('note') || '';
+    let note = rawNote;
+    try { note = decodeURIComponent(rawNote); } catch { /* 原样使用 */ }
+    const expectedSha = c.req.header('x-content-sha256') || '';
+    const buf = new Uint8Array(await c.req.arrayBuffer());
+    const file = storeEvidenceFile(ctx, actor, taskId, filename, buf, note, expectedSha);
+    return c.json({ file }, 201);
+  });
+
+  app.get('/tasks/:id/evidence', (c) => {
+    requireActor(ctx, c);
+    return c.json({ files: listEvidenceFiles(ctx, c.req.param('id')) });
+  });
+
+  app.get('/tasks/:id/evidence/:fileId', (c) => {
+    requireActor(ctx, c);
+    const { file, content } = readEvidenceContent(ctx, c.req.param('id'), Number(c.req.param('fileId')));
+    return new Response(content as unknown as BodyInit, {
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': String(content.byteLength),
+        'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`,
+        'x-content-sha256': file.sha256,
+      },
+    });
+  });
+
+  app.delete('/tasks/:id/evidence/:fileId', (c) => {
+    const actor = requireElevated(ctx, c);
+    deleteEvidenceFile(ctx, actor, c.req.param('id'), Number(c.req.param('fileId')));
+    return c.json({ ok: true });
+  });
+
   // ---- 聊天室（§6：统一控制面）----
 
   app.get('/boards/:b/messages', (c) =>
@@ -800,6 +842,60 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.post('/settings/runtime/rollback', async (c) => {
     requireElevated(ctx, c);
     return c.json({ ok: true, ...(await piRuntime.rollback()) });
+  });
+
+  // ---- 主脑扩展 / 技能界面化管理（T17：user/orchestrator 可管理，worker 403）----
+
+  app.get('/settings/runtime/extensions', (c) => {
+    requireElevated(ctx, c);
+    return c.json({ extensions: piRuntime.listExtensions() });
+  });
+
+  app.post('/settings/runtime/extensions/install', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { package?: string; version?: string };
+    if (!body.package?.trim()) throw new HttpError(422, 'package required');
+    const result = await piRuntime.installExtension(body.package, body.version);
+    return c.json(result, 201);
+  });
+
+  app.post('/settings/runtime/extensions/:name/enabled', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { enabled?: boolean };
+    if (typeof body.enabled !== 'boolean') throw new HttpError(422, 'enabled:boolean required');
+    return c.json(piRuntime.setExtensionEnabled(c.req.param('name'), body.enabled));
+  });
+
+  app.delete('/settings/runtime/extensions/:name', (c) => {
+    requireElevated(ctx, c);
+    return c.json(piRuntime.deleteExtension(c.req.param('name')));
+  });
+
+  app.get('/settings/runtime/skills', (c) => {
+    requireElevated(ctx, c);
+    return c.json({ skills: piRuntime.listSkills() });
+  });
+
+  app.put('/settings/runtime/skills/:name', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { markdown?: string };
+    if (typeof body.markdown !== 'string' || !body.markdown.trim()) throw new HttpError(422, 'markdown required');
+    return c.json(piRuntime.writeSkill(c.req.param('name'), body.markdown));
+  });
+
+  // 读取技能 SKILL.md 全文（UI「载入编辑」用；限 skills/ 内，防目录穿越）
+  app.get('/settings/runtime/skills/:name/content', (c) => {
+    requireElevated(ctx, c);
+    const name = c.req.param('name');
+    if (!/^[\w][\w.-]*$/.test(name)) throw new HttpError(422, `invalid skill name: ${name}`);
+    const file = join(piRuntime.skillsDir, name, 'SKILL.md');
+    if (!existsSync(file)) throw new HttpError(404, `skill not found: ${name}`);
+    return c.text(readFileSync(file, 'utf8'));
+  });
+
+  app.delete('/settings/runtime/skills/:name', (c) => {
+    requireElevated(ctx, c);
+    return c.json(piRuntime.deleteSkill(c.req.param('name')));
   });
 
   // ---- 单用户身份（设置页"用户名"；浏览器写操作以该身份 token 作 Bearer）----

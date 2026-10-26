@@ -1093,7 +1093,7 @@ export class Brain {
     const loader = new pi.DefaultResourceLoader({
       cwd: workspace,
       agentDir,
-      additionalExtensionPaths: this.#runtime.communityExtensionPaths(),
+      additionalExtensionPaths: this.#runtime.enabledExtensionPaths(),
       additionalSkillPaths: [this.#runtime.skillsDir],
     });
     await loader.reload();

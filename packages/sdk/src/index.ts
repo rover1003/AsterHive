@@ -3,6 +3,7 @@
 // 七个调用：register（一次性）/ next / claim / checkpoint / submit / release / heartbeat
 // 附：inbox / postMessage（聊天室）、getTask 与 getBoards / getBoard（看板元数据，含 repo）。
 
+import { createHash } from 'node:crypto';
 import { platform, arch, cpus, totalmem } from 'node:os';
 
 /** 工蜂设备硬件能力规格（Phase 4：隐私最小化，仅上报调度相关指标） */
@@ -319,4 +320,63 @@ export class Worker {
     }
     return (await res.json()) as { taskRef: string; headCommit: string };
   }
+
+  /** 上传证据文件（小文件入库、大文件登记校验和；<= 50MiB） */
+  async uploadEvidence(taskId: string, filename: string, content: Uint8Array, note = ''): Promise<EvidenceFileInfo> {
+    const headers: Record<string, string> = {
+      'content-type': 'application/octet-stream',
+      'content-length': String(content.byteLength),
+      'x-filename': encodeURIComponent(filename),
+      'x-content-sha256': createHash('sha256').update(content).digest('hex'),
+    };
+    if (note) headers['x-note'] = encodeURIComponent(note);
+    if (this.#token) headers.authorization = `Bearer ${this.#token}`;
+    const res = await fetch(`${this.#baseUrl}/tasks/${taskId}/evidence`, {
+      method: 'POST',
+      headers,
+      body: content,
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => '');
+      throw new SdkError(res.status, err || `HTTP ${res.status}`);
+    }
+    const r = (await res.json()) as { file: EvidenceFileInfo };
+    return r.file;
+  }
+
+  /** 列出任务的证据文件元数据（不含内容） */
+  async listEvidence(taskId: string): Promise<EvidenceFileInfo[]> {
+    const r = await call<{ files: EvidenceFileInfo[] }>(this.#baseUrl, this.#token, 'GET', `/tasks/${taskId}/evidence`);
+    return r.files;
+  }
+
+  /** 下载证据文件内容并校验 SHA-256 */
+  async downloadEvidence(taskId: string, fileId: number): Promise<{ file: EvidenceFileInfo; content: Uint8Array }> {
+    const res = await fetch(`${this.#baseUrl}/tasks/${taskId}/evidence/${fileId}`, {
+      headers: this.#token ? { authorization: `Bearer ${this.#token}` } : undefined,
+    });
+    if (!res.ok) throw new SdkError(res.status, await res.text().catch(() => `HTTP ${res.status}`));
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const file = {
+      id: fileId,
+      taskId,
+      filename: decodeURIComponent(res.headers.get('content-disposition')?.split("''")[1] ?? `file-${fileId}`),
+      size: buf.byteLength,
+      sha256: res.headers.get('x-content-sha256') ?? '',
+    } as EvidenceFileInfo;
+    return { file, content: buf };
+  }
+}
+
+export interface EvidenceFileInfo {
+  id: number;
+  taskId: string;
+  boardId?: string;
+  filename: string;
+  size: number;
+  sha256: string;
+  storage?: 'db' | 'disk';
+  note?: string;
+  uploadedBy?: string;
+  createdAt?: number;
 }

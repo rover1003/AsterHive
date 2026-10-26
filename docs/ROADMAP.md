@@ -22,11 +22,11 @@
 
 | id | 任务 | 说明 | 状态 |
 |---|---|---|---|
-| T14 | 内置主脑（Pi 运行时） | Pi SDK 嵌入（earendil-works/pi，MIT）；**运行时装数据卷 /data/pi-runtime 由服务器自管理**（不进镜像，保持容器不可变）；主脑设置页"Pi 运行时"卡片：当前版本 ↔ 上游最新，一键更新（装新版→原子切换→重启主脑子进程）、旧版保留一键回滚、版本变更入台账；事件唤醒（新消息/进 Review/阻塞上报）。**接入方案已定**（docs/research/pi-plugins.md）：① 主脑协议工具 = Pi 原生 MCP client 直连 /mcp（exposure:direct，SDK 侧 createMcpExtension）零胶水；② 自写 30–50 行 tool_call allowlist 门控扩展，"只分派不执行"做成硬约束；③ 记忆做服务器侧 remember/recall MCP 工具（事件台账为唯一事实源），不装 engram；④ 不装 cron/todo/goal/subagents 类（与服务器状态双源或违反主脑约束）；⑤ 崩溃恢复先原生 SessionManager JSONL，pi-durable 留作升级项 | Backlog→**InProgress**（2026-10-25 用户指令提前开做；含社区插件挂载点 /data/pi-runtime/extensions） |
-| T15 | pull 型 worker 心跳 TTL 完整化 + 证据上传端点 | 小文件入库、大文件登记校验和；干预消息注入运行中会话。**首项"项目工作区持久化"已完成**（2026-10-25，a0ca6e5）：board.repo 驱动每设备每项目工作区（clone→pull --rebase→任务分支 asterhive/<任务号>→本地 commit 留痕，hash 进证据；push 需 WORKER_PUSH=1 显式开启；失败阻塞上报不静默改道） | InProgress（余 TTL/证据增强/干预注入） |
-| T16 | 24 小时无人值守验收 | 用户离开 24h，多任务多依赖目标被自动拆解、分派、执行、验收（人工抽查证据） | Backlog |
-| T17 | 主脑插件/技能界面化管理（公开化前置） | 设置页"主脑扩展"卡片：列表/启停/删除 + 上传 zip 或填 npm 包名安装（服务器代跑 pi install 装入数据卷）；Pi skills 挂载目录；运行中变更下会话生效不打断当前轮 | Backlog |
-| T18 | 项目公开化准备 | LICENSE 定稿（建议 MIT）；面向陌生部署者的文档：compose 一键部署、**"匿名请求即用户"的内网信任模型必须显式说明**、示例看板与 worker 接入样例；README 双语评估 | Backlog |
+| T14 | 内置主脑（Pi 运行时） | Pi SDK 嵌入（earendil-works/pi，MIT）；**运行时装数据卷 /data/pi-runtime 由服务器自管理**（不进镜像，保持容器不可变）；主脑设置页"Pi 运行时"卡片：当前版本 ↔ 上游最新，一键更新（装新版→原子切换→重启主脑子进程）、旧版保留一键回滚、版本变更入台账；事件唤醒（新消息/进 Review/阻塞上报）。**接入方案已定**（docs/research/pi-plugins.md）：① 主脑协议工具 = Pi 原生 MCP client 直连 /mcp（exposure:direct，SDK 侧 createMcpExtension）零胶水；② 自写 30–50 行 tool_call allowlist 门控扩展，"只分派不执行"做成硬约束；③ 记忆做服务器侧 remember/recall MCP 工具（事件台账为唯一事实源），不装 engram；④ 不装 cron/todo/goal/subagents 类（与服务器状态双源或违反主脑约束）；⑤ 崩溃恢复先原生 SessionManager JSONL，pi-durable 留作升级项 | **Done**（2026-10-26：运行时更新/回滚、社区扩展挂载点、多模型组、独立审核员全部落地并有测试覆盖） |
+| T15 | pull 型 worker 心跳 TTL 完整化 + 证据上传端点 | 小文件入库、大文件登记校验和；干预消息注入运行中会话。**首项"项目工作区持久化"已完成**（2026-10-25，a0ca6e5）：board.repo 驱动每设备每项目工作区（clone→pull --rebase→任务分支 asterhive/<任务号>→本地 commit 留痕，hash 进证据；push 需 WORKER_PUSH=1 显式开启；失败阻塞上报不静默改道） | **Done**（2026-10-26：证据上传端点落地——≤512KiB 入 SQLite、≤50MiB 落数据卷磁盘登记 SHA-256，SDK uploadEvidence/listEvidence/downloadEvidence，worker 参与者门禁与路径消毒；干预注入经 checkpoint 响应带回已可用） |
+| T16 | 24 小时无人值守验收 | 用户离开 24h，多任务多依赖目标被自动拆解、分派、执行、验收（人工抽查证据） | Backlog（零件已齐，待实跑） |
+| T17 | 主脑插件/技能界面化管理（公开化前置） | 设置页"主脑扩展"卡片：列表/启停/删除 + 上传 zip 或填 npm 包名安装（服务器代跑 pi install 装入数据卷）；Pi skills 挂载目录；运行中变更下会话生效不打断当前轮 | **Done**（2026-10-26：npm 包名安装 + 启停 + 删除 + 技能 SKILL.md 写入/删除，注册表数据卷自管理，设置页卡片完成；zip 上传后置——npm 已覆盖主路径） |
+| T18 | 项目公开化准备 | LICENSE 定稿（建议 MIT）；面向陌生部署者的文档：compose 一键部署、**"匿名请求即用户"的内网信任模型必须显式说明**、示例看板与 worker 接入样例；README 双语评估 | **Done**（2026-10-26：LICENSE(MIT)、docs/DEPLOY.md、README 英文摘要与信任模型章节、备份文档覆盖 evidence/pi-runtime） |
 
 ## 决策记录（原 §13 开放决策，随用户拍板收敛）
 
@@ -42,4 +42,7 @@
 - **SKILL 自举协议**：已定（2026-10-25，实施中）——SKILL.md 定位为"agent 启动盘"：获取文档的 origin 即服务器地址，注册/循环/纪律全自包含，宿主特有能力写成条件句式（不限 CLI/桌面端形态）；用户唯一动作 = 把 SKILL 地址递给 agent；agent 定期重报模型清单，自动名是占位符由用户在列表中改名。
 - **主脑人格 v2**：已定（2026-10-25，57fc380）——系统提示词强化：建卡前四问澄清真实意图（模糊则带选项追问一次问全）、拆解必须边界化（禁模糊 title/写明不做范围/acceptance 逐条可检验/粒度一次可完成）、回收证据对照验收（退回写明差距、主观判断请用户拍板）、禁执行升格为身份推论（顺手能做也必须建卡分派）。
 - **Git 托管中立与敏感分层**：已定（2026-10-25）——board.repo 不绑定任何托管商（GitHub/自建 Gitea/局域网裸仓库皆为普通 git remote，worker 协作模型一致）；通用做法：完整主仓放内网自建 git 服务，公开 GitHub 仅作开源镜像出口，密钥与私有配置永不入 git；此原则写进主脑提示词（纪律七：验收发现凭据一律打回并提醒轮换）。
-- **外部记忆系统接入**：方向已定/实施待排（2026-10-26）——Anima 仅作为用户自管的可选 adapter/provider，不植入默认核心；启用必须由用户配置 service URL/key、principal 与项目 binding。无 Anima 时 AsterHive 主流程完全独立；服务不可用时记忆读写旁路、不阻断派活/验收。记忆只存可复用经验，不默认上传任务全文/代码/密钥；候选版须由用户明确启用并接受数据边界后再集成，不写入任何特定实例地址或凭据。
+- **外部记忆系统接入**：搁置（2026-10-26 用户拍板）——Anima 仅作为用户自管的可选 adapter/provider，不植入默认核心；启用必须由用户配置 service URL/key、principal 与项目 binding。无 Anima 时 AsterHive 主流程完全独立；服务不可用时记忆读写旁路、不阻断派活/验收。记忆只存可复用经验，不默认上传任务全文/代码/密钥；候选版须由用户明确启用并接受数据边界后再集成，不写入任何特定实例地址或凭据。**当前优先级让位给基础功能完备与 24h 无人值守验收，实施时间待定。**
+- **DSH 插件层集成取消**（2026-10-26 用户拍板）——本项目主脑使用 Pi 核心（非 DSH），Pi 自身的扩展/技能生态（additionalExtensionPaths / additionalSkillPaths + T17 界面化管理）已无缝覆盖原 DSH 集成设想的全部能力（worker 唤醒插件、SubagentProvider 式注册等），不再做 DSH 侧适配。
+- **飞书接入搁置**（2026-10-26 用户拍板）——三期飞书群第二表面（入站事件订阅 + 验签、@ 双向映射、出站播报、卡片渲染）保留设计，实施让位给基础功能；多端派活当前由通用 Chat-to-Card Webhook（T8，Phase 8）覆盖。
+- **同类项目能力吸收批次完成**（2026-10-26，Phase 3-9 全部落地，commit 8034c56）：蜂群命名与 @Queen/@Bee 别名路由、工蜂设备能力自报（specs）、Nomad 风格资源感知调度（requirements + 评分匹配）、蜂后直接受控诊断（probe/restart/release_stuck_task，凭据不出服务端）、文件级读写所有权与依赖自动推导（RAW/WAW + 环路保护）、Chat-to-Card 多端 Webhook、舰队体检雷达（算力池/停滞预警/干预审计）。X5800 工蜂执行链修复（--print 参数顺序、--no-prewalk 防模型漂移、stdio ignore 防挂起、保活 checkpoint）随批落地。
