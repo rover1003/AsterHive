@@ -24,12 +24,19 @@ log() { printf '\033[1;36m[bee]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bee]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[bee]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# curl | bash 时 stdin 是脚本本身，交互式 read 会读不到——重新以真实 stdin 执行自己
-if [ ! -t 0 ]; then
+# curl | bash 时 stdin 是脚本本身，交互式 read 会读不到——
+# 有真实终端（tty）时以 /dev/tty 重跑自己；纯非交互环境继续执行，
+# 但要求 ~/.asterhive/worker.json 已含完整模型配置（重装/自动化场景），否则明确报错
+if [ ! -t 0 ] && [ -z "${ASTERHIVE_REEXEC:-}" ] && [ -e /dev/tty ] && [ -t 1 ]; then
   TMP="$(mktemp /tmp/install-bee.XXXXXX.sh)"
   curl -fsSL "$SELF_URL" -o "$TMP"
-  log "管道模式：重新以交互方式运行安装脚本…"
-  exec bash "$TMP" "$@"
+  log "管道模式：以交互方式重新运行安装脚本…"
+  ASTERHIVE_REEXEC=1 exec bash "$TMP" "$@" < /dev/tty
+fi
+INTERACTIVE=1
+if [ ! -t 0 ]; then
+  warn "非交互环境：模型配置将复用 ~/.asterhive/worker.json 既有值（无则退出）。"
+  INTERACTIVE=0
 fi
 
 HIVE_URL="${1:-}"
@@ -86,7 +93,9 @@ log "安装依赖（npm，仅 worker + sdk 工作区；首次需数分钟）…"
     --workspace @asterhive/worker-zcode --workspace @asterhive/sdk --no-audit --no-fund ) \
   || die "npm install 失败——请检查网络后重试。"
 
-# 3. 交互式模型配置：Key 只写本设备文件（0600），服务器不经手
+# 3. 模型配置：交互式问答（Key 只写本设备文件 0600，服务器不经手）；
+#    非交互环境复用 ~/.asterhive/worker.json 既有 model 段（重装/自动化场景），无则退出
+if [ "$INTERACTIVE" = 1 ]; then
 echo
 echo "=========================================="
 echo "  模型配置（工蜂执行内核为内置 Pi，模型 Key 只存本机）"
@@ -123,6 +132,22 @@ fi
 rm -f "$MODEL_FILE"
 [ -n "$MODEL_ID" ] || die "未选择模型。"
 log "已选择：$MODEL_ID"
+else
+  EXISTING="$("$NODE_BIN" -e '
+const fs = require("fs");
+try {
+  const cfg = JSON.parse(fs.readFileSync(require("os").homedir() + "/.asterhive/worker.json", "utf8"));
+  const m = cfg.model ?? {};
+  if (cfg.url && m.baseURL && m.apiKey && m.model) {
+    console.log([cfg.url, m.baseURL, m.apiKey, m.model].join("\u0000"));
+  }
+} catch {}' || true)"
+  if [ -z "$EXISTING" ]; then
+    die "非交互环境且缺少完整既有模型配置。请交互式运行：curl -fsSL $SELF_URL -o install-bee.sh && bash install-bee.sh $HIVE_URL"
+  fi
+  IFS=$'\0' read -r -d '' HIVE_URL BASE_URL API_KEY MODEL_ID <<< "$EXISTING" || true
+  log "复用既有模型配置：$MODEL_ID（$BASE_URL）"
+fi
 
 # 4. 写注册与执行配置（worker 首次启动自助注册：开放注册，token 自动落盘）
 CONFIG="$HOME/.asterhive/worker.json"

@@ -20,12 +20,18 @@ log() { printf '\033[1;36m[hive]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[hive]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[hive]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# curl | bash 时 stdin 是脚本本身，交互式 read 会读不到——重新以真实 stdin 执行自己
-if [ ! -t 0 ]; then
+# curl | bash 时 stdin 是脚本本身，交互式 read 会读不到——
+# 有真实终端（tty）时以 /dev/tty 重跑自己；纯非交互环境（自动化）则继续执行并跳过初始设置
+if [ ! -t 0 ] && [ -z "${ASTERHIVE_REEXEC:-}" ] && [ -e /dev/tty ] && [ -t 1 ]; then
   TMP="$(mktemp /tmp/install-hive.XXXXXX.sh)"
   curl -fsSL "$SELF_URL" -o "$TMP"
-  log "管道模式：重新以交互方式运行安装脚本…"
-  exec bash "$TMP"
+  log "管道模式：以交互方式重新运行安装脚本…"
+  ASTERHIVE_REEXEC=1 exec bash "$TMP" < /dev/tty
+fi
+INTERACTIVE=1
+if [ ! -t 0 ]; then
+  warn "非交互环境：将跳过初始设置（部署完成后可在 Web 设置页配置用户名与模型组）。"
+  INTERACTIVE=0
 fi
 
 command -v docker >/dev/null 2>&1 || die "未检测到 docker。请先安装 Docker（https://docs.docker.com/engine/install/）后重试。"
@@ -71,6 +77,7 @@ log "服务已就绪：http://127.0.0.1:$HIVE_PORT"
 API="http://127.0.0.1:$HIVE_PORT"
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+if [ "$INTERACTIVE" = 1 ]; then
 echo
 read -r -p "① 用户称呼（聊天室显示名，回车跳过）：" USER_NAME
 if [ -n "$USER_NAME" ]; then
@@ -116,12 +123,12 @@ if [ -n "$API_KEY" ]; then
     fi
   fi
 fi
+fi  # INTERACTIVE
 
 # 5. 探测本机局域网地址，打印工蜂接入命令
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 [ -n "$LAN_IP" ] || LAN_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1 || true)"
 BEE_HOST="${LAN_IP:-127.0.0.1}"
-
 echo
 echo "=========================================="
 echo "  ✅ AsterHive 部署完成"
