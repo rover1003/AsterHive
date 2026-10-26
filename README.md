@@ -64,9 +64,26 @@ Web UI「设置 → 主脑设置」：填任意 OpenAI 兼容端点与 API Key�
 - 跨网络组网请使用 WireGuard 等隧道，让所有设备对服务器而言处于同一内网；
 - worker/主脑的 token 仅用于 agent 身份归属与角色分层（如 worker 无法移动任务进 Done），不用于人类鉴权。
 
-## 被管项目放哪里
+## 被管项目与代码库架构
 
-星巢只管任务流转，不托管代码：每个被管理项目是一个 git 仓库，`board.repo` 接受**任意 git 地址**——GitHub、自建 Gitea、NAS 裸仓库均可，worker 协作行为完全一致。涉及未公开内容的项目，建议完整主仓放内网自建 git 服务，公开 GitHub 仅作开源镜像出口；密钥与私有配置永不入 git。跨设备协作由服务器机制保证：`files` 清单认领互斥、任务分支与本地 commit 留痕、上交以证据验收。详见 [docs/WORKER.md](docs/WORKER.md)「项目工作区」。
+星巢支持两种代码仓库分发模式：
+
+1. **服务器托管主仓（`managed` 模式，推荐）**：
+   - 代码的唯一事实源保存在服务器的持久卷中（`ASTERHIVE_DATA/repos/<boardId>.git`）。
+   - 建板时可选择从远程 Git 克隆、新建空仓库，或由已有源码的设备通过 `cli.ts repo import` 流式导入完整历史 bundle。
+   - **零持久污染**：worker 执行任务时从服务器按需拉取轻量代码快照，在设备临时目录下独立修改与提交，回传变更 bundle 后由服务器保留在任务分支，最后自动销毁本地临时目录。
+   - **主脑结构化验收与整合**：Pi 主脑通过受限工具 `asterhive_repo_inspect_task` 检查差异，验收后调用 `asterhive_repo_integrate_task` 将变更合并到主干；主脑与外部 agent 永远不触碰主机通用 shell。
+
+2. **外部仓库持久模式（`remote-legacy` 模式）**：
+   - 兼容传统各设备持久克隆模式，填入 GitHub/Gitea 等远程地址，各设备保留本地 Git 副本。
+
+涉及未公开内容的项目，建议完整主仓放服务器托管或内网自建 git 服务，公开 GitHub 仅作开源镜像出口；密钥与私有配置永不入 git。跨设备协作由服务器机制保证：`files` 清单认领互斥、任务分支与本地 commit 留痕、上交以证据验收。详见 [docs/WORKER.md](docs/WORKER.md)「项目工作区」。
+
+## 数据备份与恢复
+
+所有业务数据（SQLite 数据库、审计台账与所有服务器托管代码库 `repos/*.git`）均统一定位于数据目录（Docker 中为 `/data`，本地开发为 `./data`）：
+- 备份：打包该目录下的 `asterhive.db` 及 `repos/` 目录即可完整保留看板、任务与所有代码提交资产。
+- 恢复：将备份解压回数据卷并启动容器，服务会自动对齐数据库与托管仓库。
 
 ## 目录结构
 

@@ -20,6 +20,22 @@ function repoHref(repo: string): string {
   return /^https?:\/\//.test(repo) ? repo : `https://${repo}`;
 }
 
+function repoBadge(board: Board): string {
+  if (board.repoMode === 'managed') {
+    const label = board.repoStatus === 'ready'
+      ? '私有代码库就绪'
+      : board.repoStatus === 'empty'
+        ? '私有空仓库'
+        : board.repoStatus === 'failed'
+          ? `初始化失败：${board.repoError}`
+          : '代码库初始化中';
+    return `<span class="repo-status repo-${board.repoStatus}" title="服务器私有代码库">${icon.link}${esc(label)}</span>`;
+  }
+  return board.repo
+    ? `<a class="board-repo" href="${esc(repoHref(board.repo))}" target="_blank" rel="noopener" title="打开 Git remote">${icon.link}${esc(board.repo)}</a>`
+    : '';
+}
+
 function cardHtml(t: Task): string {
   // 紧凑卡（176×88）：首行 P 色点 + 任务号（金色等宽）+ 负责人（蓝灰靠右），标题两行截断；
   // 依赖 / 附件 / 解锁等详情全部收进抽屉，卡面只留「扫一眼」信息
@@ -143,7 +159,7 @@ export async function render(el: HTMLElement): Promise<void> {
     <div class="view-head stack">
       <div class="view-head-row">
         <div class="view-title">${icon.folder}<span id="board-title">${esc(board.name)}</span></div>
-        <span id="board-repo-link">${board.repo ? `<a class="board-repo" href="${esc(repoHref(board.repo))}" target="_blank" rel="noopener" title="打开仓库">${icon.link}${esc(board.repo)}</a>` : ''}</span>
+        <span id="board-repo-link">${repoBadge(board)}</span>
         <div class="flex-spacer"></div>
         <button id="new-task" class="primary" title="新建任务卡">${icon.plus} 建卡</button>
       </div>
@@ -410,9 +426,7 @@ export async function render(el: HTMLElement): Promise<void> {
         board.repo = r.board.repo;
         board.description = r.board.description;
         (el.querySelector('#board-title') as HTMLElement).textContent = board.name;
-        (el.querySelector('#board-repo-link') as HTMLElement).innerHTML = board.repo
-          ? `<a class="board-repo" href="${esc(repoHref(board.repo))}" target="_blank" rel="noopener" title="打开仓库">${icon.link}${esc(board.repo)}</a>`
-          : '';
+        (el.querySelector('#board-repo-link') as HTMLElement).innerHTML = repoBadge(board);
         const opt = el.querySelector(`#board-select option[value="${board.id}"]`) as HTMLOptionElement | null;
         if (opt) opt.textContent = board.name;
         toast('看板元数据已保存');
@@ -465,23 +479,42 @@ export async function render(el: HTMLElement): Promise<void> {
         <div class="drawer-head"><h3>新建看板</h3><button class="icon-btn" id="drawer-close" title="关闭">${icon.x}</button></div>
         <div class="drawer-body">
           <div class="field"><label for="nb-name">项目名称</label><input id="nb-name" placeholder="如：演示项目" /></div>
-          <div class="field"><label for="nb-repo">Git 仓库地址</label><input id="nb-repo" placeholder="任意 git 地址，如 github.com/org/repo 或内网 Gitea（可留空）" /></div>
+          <div class="field"><label for="nb-repo-mode">代码库初始化</label>
+            <select id="nb-repo-mode"><option value="empty">在服务器新建私有空仓库</option><option value="clone">从远程 Git 仓库克隆</option><option value="import">本机目录导入（建空仓，后续用 CLI 上传）</option></select>
+          </div>
+          <div class="field" id="nb-remote-field" hidden><label for="nb-repo">远程 Git 地址</label><input id="nb-repo" placeholder="https://host/org/repo.git 或 SSH remote" /></div>
+          <div class="hint" id="nb-import-hint" hidden>创建看板后，在持有源码的设备运行：<code>node packages/sdk/src/cli.ts repo import --board &lt;看板ID&gt; --path &lt;本机项目目录&gt;</code>。仅支持工作树干净的 Git 仓库，并保留提交历史。</div>
           <div class="field"><label for="nb-desc">描述</label><textarea id="nb-desc" rows="3"></textarea></div>
           <button class="primary" id="nb-create">创建看板</button>
         </div>
       </aside>`;
+    const modeSelect = drawerHost.querySelector('#nb-repo-mode') as HTMLSelectElement;
+    const remoteField = drawerHost.querySelector('#nb-remote-field') as HTMLElement;
+    const importHint = drawerHost.querySelector('#nb-import-hint') as HTMLElement;
+    modeSelect.addEventListener('change', () => {
+      remoteField.hidden = modeSelect.value !== 'clone';
+      importHint.hidden = modeSelect.value !== 'import';
+    });
     drawerHost.querySelector('#drawer-close')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
     drawerHost.querySelector('#drawer-mask')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
     drawerHost.querySelector('#nb-create')!.addEventListener('click', async () => {
-      const g = (sel: string) => (drawerHost.querySelector(sel) as HTMLInputElement).value.trim();
-      if (!g('#nb-name')) {
+      const name = (drawerHost.querySelector('#nb-name') as HTMLInputElement).value.trim();
+      const repoInit = modeSelect.value as 'empty' | 'clone' | 'import';
+      const remote = (drawerHost.querySelector('#nb-repo') as HTMLInputElement).value.trim();
+      if (!name) {
         toast('请填写项目名称', true);
+        return;
+      }
+      if (repoInit === 'clone' && !remote) {
+        toast('远程克隆需要填写 Git 地址', true);
         return;
       }
       try {
         const r = await api.post<{ board: Board }>('/boards', {
-          name: g('#nb-name'),
-          repo: g('#nb-repo'),
+          name,
+          repo: repoInit === 'clone' ? remote : '',
+          repoMode: 'managed',
+          repoInit: repoInit === 'clone' ? 'clone' : 'empty',
           description: (drawerHost.querySelector('#nb-desc') as HTMLTextAreaElement).value.trim(),
         });
         localStorage.setItem('asterhive.board', r.board.id);
@@ -501,6 +534,26 @@ export async function render(el: HTMLElement): Promise<void> {
     remountChatPanel(); // 切板：聊天面板跟随（消息/目标下拉/SSE 过滤全部换到新板）
   });
 
+  let repoStatusTimer: ReturnType<typeof setInterval> | null = null;
+  if (board.repoMode === 'managed' && (board.repoStatus === 'queued' || board.repoStatus === 'running')) {
+    repoStatusTimer = setInterval(async () => {
+      try {
+        const status = await api.get<Pick<Board, 'repoMode' | 'repoStatus' | 'repoError' | 'repoHead'>>(`/boards/${currentBoard}/repo`);
+        board.repoMode = status.repoMode;
+        board.repoStatus = status.repoStatus;
+        board.repoError = status.repoError;
+        board.repoHead = status.repoHead;
+        (el.querySelector('#board-repo-link') as HTMLElement).innerHTML = repoBadge(board);
+        if (status.repoStatus !== 'queued' && status.repoStatus !== 'running' && repoStatusTimer) {
+          clearInterval(repoStatusTimer);
+          repoStatusTimer = null;
+          if (status.repoStatus === 'failed') toast(`服务器仓库初始化失败：${status.repoError}`, true);
+          else toast('服务器私有代码库已就绪');
+        }
+      } catch { /* 短暂请求失败交给下一次轮询 */ }
+    }, 2000);
+  }
+
   const unsub = subscribe((type) => {
     if (type.startsWith('task.') || type.startsWith('agent.')) {
       void load().then((t) => (tasks = t));
@@ -508,6 +561,7 @@ export async function render(el: HTMLElement): Promise<void> {
   });
   (el as unknown as { __cleanup?: () => void }).__cleanup = () => {
     unsub();
+    if (repoStatusTimer) clearInterval(repoStatusTimer);
     chatPanel?.destroy(); // 视图卸载：面板 SSE 订阅一并退订
   };
 

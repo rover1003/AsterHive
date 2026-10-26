@@ -294,7 +294,7 @@ function toPiTool(
     parameters: (def.shape ? zodShapeToTypeBox(def.shape) : Type.Object({})) as TSchema,
     execute: async (_toolCallId, params) => {
       try {
-        const out = def.handle(ctx, actor, params as Record<string, unknown>);
+        const out = await def.handle(ctx, actor, params as Record<string, unknown>);
         // 工具结果统一截断兜底：全量 JSON（如实测 2.58MB 的看板任务表）进上下文会把
         // 每轮请求撑到数百 KB，上游对超长上下文直接 400。主脑要完整数据应分次精确查询。
         const text = JSON.stringify(out, null, 2);
@@ -326,7 +326,7 @@ function toPiTool(
 // ---- 状态快照（每轮 prompt 注入）----
 // 直接 SQL/领域函数取：各板任务概要、Review 队列（含提交摘要与证据）、最近 20 条房间消息。
 
-function buildSnapshot(ctx: Ctx): string {
+function buildSnapshot(ctx: Ctx, focusBoardId?: string | null, triggerMessageId?: number): string {
   const lines: string[] = [];
   const { db } = ctx.holder;
   lines.push(`【看板快照】${new Date().toISOString()}`);
@@ -367,12 +367,26 @@ function buildSnapshot(ctx: Ctx): string {
     }
   }
 
-  const msgs = db
-    .prepare('SELECT id, board_id, author, kind, content FROM message ORDER BY id DESC LIMIT 20')
-    .all() as { id: number; board_id: string; author: string; kind: string; content: string }[];
-  lines.push('【最近 20 条房间消息】（旧→新）');
-  for (const m of msgs.reverse()) {
-    lines.push(`  #${m.id} [板${m.board_id}] ${m.author}(${m.kind}): ${m.content.slice(0, 200)}`);
+  type SnapshotMessage = { id: number; board_id: string; author: string; kind: string; content: string };
+  const recentRows: SnapshotMessage[] = focusBoardId
+    ? (db.prepare('SELECT id, board_id, author, kind, content FROM message WHERE board_id = ? ORDER BY id DESC LIMIT 30').all(focusBoardId) as SnapshotMessage[])
+    : (db.prepare('SELECT id, board_id, author, kind, content FROM message ORDER BY id DESC LIMIT 20').all() as SnapshotMessage[]);
+  const otherBoardRows: SnapshotMessage[] = focusBoardId
+    ? (db.prepare('SELECT id, board_id, author, kind, content FROM message WHERE board_id != ? ORDER BY id DESC LIMIT 5').all(focusBoardId) as SnapshotMessage[])
+    : [];
+  const recentIds = new Set<number>();
+  const ordered = [...recentRows, ...otherBoardRows].sort((a, b) => a.id - b.id);
+  const trigger = triggerMessageId == null ? undefined : db
+    .prepare('SELECT id, board_id, author, kind, content FROM message WHERE id = ?')
+    .get(triggerMessageId) as { id: number; board_id: string; author: string; kind: string; content: string } | undefined;
+  const msgs = trigger ? [...ordered.filter((m) => m.id !== trigger.id), trigger].sort((a, b) => a.id - b.id) : ordered;
+  if (trigger) recentIds.add(trigger.id);
+  lines.push(`【最近房间消息】${focusBoardId ? `（当前板 ${focusBoardId} 最近 30 条；其他板最近 5 条）` : '（最近 20 条）'}，按时间旧→新；触发本轮的消息单独优先保留`);
+  for (const m of msgs) {
+    const limit = m.id === triggerMessageId ? 4000 : focusBoardId && m.board_id === focusBoardId ? 1000 : 300;
+    const truncated = m.content.length > limit;
+    const content = truncated ? `${m.content.slice(0, limit)}…[消息已截断；需要时按消息 #${m.id} 查任务/消息详情]` : m.content;
+    lines.push(`  #${m.id} [板${m.board_id}] ${m.author}(${m.kind}): ${content}`);
   }
   return lines.join('\n');
 }
@@ -407,6 +421,7 @@ export class Brain {
   #timer: ReturnType<typeof setTimeout> | null = null;
   #reasons: string[] = []; // 本轮唤醒原因（下一轮 prompt 的"待处理"清单）
   #lastBoardId: string | null = null; // 最近一次唤醒事件所在板（失败提示要发回对应的房）
+  #lastMessageId: number | null = null; // 当前唤醒消息 ID：长需求优先完整带入快照
   #errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
   #consecutiveModelFailures = 0; // 连续上游失败计数：≥3 停自动重试（成功/用户新消息复位）
   #aborting = false; // 主动中止标记：abortTurn 置位，#turn 收尾据此识别"用户主动停"并与上游失败隔离（用后即清）
@@ -504,6 +519,9 @@ export class Brain {
     const wakeOn = s.wakeOn ?? {};
     if (typeof payload.boardId === 'string' && payload.boardId) {
       this.#lastBoardId = payload.boardId; // 失败提示要发回事件所在板的房间
+    }
+    if (type === 'message.created' && typeof payload.messageId === 'number') {
+      this.#lastMessageId = payload.messageId;
     }
 
     let reason: string | null = null;
@@ -625,7 +643,7 @@ export class Brain {
         '【本轮唤醒】',
         ...reasonLines,
         '',
-        buildSnapshot(this.#ctx),
+        buildSnapshot(this.#ctx, this.#lastBoardId),
         '',
         '请按纪律处理上述事项：该建卡建卡、该分派分派、该验收验收、该汇报汇报，然后直接结束本轮。',
       ].join('\n');

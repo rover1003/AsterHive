@@ -158,24 +158,30 @@ EXECUTOR_MODE=rpc ASTERHIVE_URL=http://<your-server>:8067 node apps/worker-zcode
 - 子进程工作目录即任务工作目录，环境注入 `ASTERHIVE_WORKER=1`；执行输出的末 6 行作为上交 summary。
 - 换任何其他 pi 系 CLI 只需改 `WORKER_EXECUTOR` / `OMP_BIN` 指过去——适配器只关心三件事：怎么启动、怎么组 prompt、怎么变成 submit。
 
-## 项目工作区（repo 看板）
+## 项目工作区模式（三种执行环境）
 
-这是立项计划 §9.4「git 仓库为唯一事实源，各设备自持克隆」的一期落地（ROADMAP T15）：看板管理里填了 repo 的看板，其任务在本设备获得**持久工作区**——项目在工作区层面有了跨任务连续性；没填 repo 的看板维持一次性任务目录（scratch 模式）。
+星巢支持三种工作区执行模式，适配不同项目需求：
 
-**repo 与托管商无关**：任何 git 地址都是一等公民——GitHub、局域网自建 Gitea、NAS 裸仓库（`file://` 或 SSH）、任意私有 remote，clone/pull/commit 行为完全一致。涉及未公开内容的项目，通用做法是完整主仓放内网自建 git 服务，公开 GitHub 仅作开源镜像出口；密钥与私有配置永不入 git（.gitignore + 环境变量）。主脑按此纪律建卡与验收（提示词纪律七）。
+1. **`managed` 模式（服务器托管，推荐）**：
+   - 看板设置 `repoMode: 'managed'`，代码的唯一事实源集中保存在服务器持久卷中。
+   - **执行隔离**：Worker 领取任务后自动调用 `GET /tasks/:id/repo-snapshot` 拉取本任务的代码快照 bundle，并在临时工作目录（`<WORKER_WORKDIR>/ephemeral/<看板id>-<任务号>/src`）解包执行。
+   - **提交留痕与回传**：执行结束后有改动时，自动将任务分支打包为 `result.bundle`，通过 `POST /tasks/:id/repo-result` 流式回传服务器（服务器原子存入 `refs/asterhive/tasks/<任务号>`），由主脑通过 `asterhive_repo_inspect_task` / `asterhive_repo_integrate_task` 进行验收与合并。
+   - **自动销毁**：任务提交完成后，worker 自动清空并删除临时目录，不留磁盘负担，杜绝不同设备路径冲突。
 
-| 环节 | 行为 |
-|---|---|
-| 位置 | `<WORKER_WORKDIR>/projects/<看板id>`——每台设备对每个项目持有一份 |
-| 首次接活 | `git clone <board.repo>`；clone 失败（网络/凭据）→ checkpoint 上报详情并 release，**不静默改道一次性目录** |
-| 后续每次领活 | 先切回默认分支，`git pull --rebase` 同步远端；冲突/失败同样阻塞上报（"设备工作区与远端冲突，需人工处理"），绝不静默降级 |
-| 干活前 | 切任务分支 `asterhive/<任务号>`（`git checkout -b`；同名分支已存在——如同任务重做——则复用） |
-| 任务结束 | `git add -A` 后有变更才 commit：`asterhive(<任务号>): <任务标题>`；作者用设备 git 全局配置。提交留在本地工作区，**默认不 push**——汇合（合并回主干）策略后续再定，先留痕 |
-| push | `WORKER_PUSH=1` 时 commit 后 `git push -u origin asterhive/<任务号>`；凭据完全走设备自己的 git 配置，worker 不碰凭据 |
-| evidence | repo 模式只登记本任务变更文件，并追加一条 `git:<分支>@<commit>` 定位符；scratch 模式仍是递归收集工作目录全部文件 |
+2. **`remote-legacy` repo 模式（传统持久工作区）**：
+   - 看板设置 `repoMode: 'remote-legacy'` 且填写了 `board.repo`。每台设备维护持久克隆目录 `<WORKER_WORKDIR>/projects/<看板id>`，先切回默认分支后 `git pull --rebase`，切任务分支并在本地提交。
 
-- prompt 会告知执行内核当前工作区模式与分支名，并说明"完成后由系统统一提交"——执行者无需自行 git 操作。
-- 同一任务的分支不做合并、不清理，作为跨任务留痕积累在工作区；需要人工介入的信号会经 checkpoint 直接上报到看板。
+3. **`scratch` 模式（一次性临时目录）**：
+   - 看板未绑定代码库时的兜底模式，在 `<WORKER_WORKDIR>/<任务号>` 新建目录，任务结束后保留现场。
+
+| 环节 | managed 模式 | remote-legacy repo 模式 | scratch 模式 |
+|---|---|---|---|
+| 事实源 | AsterHive 服务器 bare 仓库 | 外部 Git 远端 | 无 |
+| Worker 目录 | `<workdir>/ephemeral/<bId>-<tId>/src`（临时） | `<workdir>/projects/<bId>`（持久） | `<workdir>/<tId>`（一次性） |
+| 快照来源 | 服务器 `repo-snapshot` bundle | `git pull --rebase` | 空目录 |
+| 结果回传 | 自动上传 `repo-result` bundle 到服务器 task ref | 本地 commit（WORKER_PUSH=1 时 push） | 本地文件现场 |
+| 主脑验收合并 | `asterhive_repo_inspect_task` + `integrate` | 查看提交证据 | 查看文件证据 |
+| 本地生命周期 | 任务提交后自动清理临时目录 | 持久保留工作区 | 保留目录 |
 
 ## 取活与生命周期
 

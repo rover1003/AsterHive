@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { openDb } from './db.ts';
 import { makeCtx } from './types.ts';
 import { createApp } from './http.ts';
+import { RepoManager } from './repo-manager.ts';
 import { snapshotNow } from './backup.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -15,7 +16,9 @@ const ctx = makeCtx(db, {
   ttlMinutes: Number(process.env.ASTERHIVE_TTL_MINUTES ?? 240),
   keepSnapshots: Number(process.env.ASTERHIVE_KEEP_SNAPSHOTS ?? 3),
 });
-const app = createApp(ctx);
+const repoManager = new RepoManager(ctx);
+repoManager.recoverQueuedJobs();
+const app = createApp(ctx, repoManager);
 
 const port = Number(process.env.PORT ?? 8067);
 const hostname = process.env.HOST ?? '127.0.0.1';

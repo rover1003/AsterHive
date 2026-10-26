@@ -14,8 +14,13 @@ export const DEFAULT_WIP: Partial<Record<Lane, number>> = { InProgress: 3, Revie
 export interface Board {
   id: string;
   name: string;
-  /** GitHub 仓库地址（项目元数据，可空） */
+  /** 任意 Git 仓库地址（remote-legacy；managed 模式由服务器 bare repo 作为主仓） */
   repo: string;
+  repoMode: 'managed' | 'remote-legacy';
+  repoStatus: 'empty' | 'queued' | 'running' | 'ready' | 'failed';
+  repoError: string;
+  repoHead: string;
+  repoSource: string;
   /** 项目描述（可空） */
   description: string;
   wip: Partial<Record<Lane, number>>;
@@ -101,6 +106,11 @@ type BoardRow = {
   wip: string;
   repo: string;
   description: string;
+  repo_mode: Board['repoMode'];
+  repo_status: Board['repoStatus'];
+  repo_error: string;
+  repo_head: string;
+  repo_source: string;
   created_at: number;
   updated_at: number;
 };
@@ -110,6 +120,11 @@ function rowToBoard(r: BoardRow): Board {
     id: r.id,
     name: r.name,
     repo: r.repo,
+    repoMode: r.repo_mode,
+    repoStatus: r.repo_status,
+    repoError: r.repo_error,
+    repoHead: r.repo_head,
+    repoSource: r.repo_source,
     description: r.description,
     wip: JSON.parse(r.wip) as Board['wip'],
     createdAt: r.created_at,
@@ -126,6 +141,9 @@ export interface CreateBoardInput {
   id?: string;
   name: string;
   repo?: string;
+  repoMode?: Board['repoMode'];
+  repoStatus?: Board['repoStatus'];
+  repoSource?: string;
   description?: string;
   wip?: Board['wip'];
 }
@@ -153,9 +171,22 @@ export function createBoard(ctx: Ctx, input: CreateBoardInput): Board {
     withWrite(ctx, 'board.create', () => {
       ctx.holder.db
         .prepare(
-          'INSERT INTO board (id, name, repo, description, wip, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO board (id, name, repo, description, wip, repo_mode, repo_status, repo_error, repo_head, repo_source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         )
-        .run(id, input.name, input.repo ?? '', input.description ?? '', JSON.stringify(input.wip ?? {}), now, now);
+        .run(
+          id,
+          input.name,
+          input.repo ?? '',
+          input.description ?? '',
+          JSON.stringify(input.wip ?? {}),
+          input.repoMode ?? 'remote-legacy',
+          input.repoStatus ?? 'ready',
+          '',
+          '',
+          input.repoSource ?? '',
+          now,
+          now,
+        );
       logEvent(ctx, 'board.created', { boardId: id, name: input.name });
     });
   } catch (err) {
@@ -173,13 +204,34 @@ export function getBoard(ctx: Ctx, id: string): Board {
   return rowToBoard(row);
 }
 
+/** 服务器 RepoManager 写初始化/迁移状态；路径和 git 执行均不交给客户端。 */
+export function setBoardRepoState(
+  ctx: Ctx,
+  boardId: string,
+  input: { status: Board['repoStatus']; error?: string; head?: string; source?: string },
+): Board {
+  getBoard(ctx, boardId);
+  if (!['empty', 'queued', 'running', 'ready', 'failed'].includes(input.status)) {
+    throw new HttpError(422, `invalid repo status: ${input.status}`);
+  }
+  withWrite(ctx, 'board.repo_state', () => {
+    ctx.holder.db.prepare(
+      'UPDATE board SET repo_status = ?, repo_error = ?, repo_head = ?, repo_source = COALESCE(?, repo_source), updated_at = ? WHERE id = ?',
+    ).run(input.status, input.error ?? '', input.head ?? '', input.source ?? null, Date.now(), boardId);
+    logEvent(ctx, 'board.repo_state', { boardId, status: input.status, head: input.head ?? '' });
+  });
+  return getBoard(ctx, boardId);
+}
+
 export interface PatchBoardInput {
   name?: string;
   repo?: string;
   description?: string;
+  repoMode?: Board['repoMode'];
+  repoStatus?: Board['repoStatus'];
 }
 
-// 看板管理（"看板=项目管理"）：改项目名称 / GitHub 仓库地址 / 描述；部分更新，只落传入字段
+// 看板管理（"看板=项目管理"）：改项目名称 / GitHub 仓库地址 / 描述 / 仓库模式；部分更新，只落传入字段
 export function updateBoard(ctx: Ctx, boardId: string, patch: PatchBoardInput): Board {
   guardBoardInput(patch);
   getBoard(ctx, boardId); // 404 if missing
@@ -194,6 +246,8 @@ export function updateBoard(ctx: Ctx, boardId: string, patch: PatchBoardInput): 
     if (patch.name !== undefined) push('name', patch.name.trim());
     if (patch.repo !== undefined) push('repo', patch.repo.trim());
     if (patch.description !== undefined) push('description', patch.description);
+    if (patch.repoMode !== undefined) push('repo_mode', patch.repoMode);
+    if (patch.repoStatus !== undefined) push('repo_status', patch.repoStatus);
     push('updated_at', Date.now());
     ctx.holder.db
       .prepare(`UPDATE board SET ${sets.join(', ')} WHERE id = ?`)

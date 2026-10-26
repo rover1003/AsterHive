@@ -21,6 +21,11 @@ export function openDb(dataDir: string): DatabaseSync {
       wip         TEXT NOT NULL DEFAULT '{}',
       repo        TEXT NOT NULL DEFAULT '',
       description TEXT NOT NULL DEFAULT '',
+      repo_mode TEXT NOT NULL DEFAULT 'remote-legacy' CHECK (repo_mode IN ('managed','remote-legacy')),
+      repo_status TEXT NOT NULL DEFAULT 'ready' CHECK (repo_status IN ('empty','queued','running','ready','failed')),
+      repo_error TEXT NOT NULL DEFAULT '',
+      repo_head TEXT NOT NULL DEFAULT '',
+      repo_source TEXT NOT NULL DEFAULT '',
       created_at  INTEGER NOT NULL,
       updated_at  INTEGER NOT NULL
     );
@@ -104,6 +109,31 @@ export function openDb(dataDir: string): DatabaseSync {
   }
   try {
     db.exec("ALTER TABLE board ADD COLUMN description TEXT NOT NULL DEFAULT ''");
+  } catch {
+    /* 列已存在 */
+  }
+  try {
+    db.exec("ALTER TABLE board ADD COLUMN repo_mode TEXT NOT NULL DEFAULT 'remote-legacy'");
+  } catch {
+    /* 列已存在 */
+  }
+  try {
+    db.exec("ALTER TABLE board ADD COLUMN repo_status TEXT NOT NULL DEFAULT 'ready'");
+  } catch {
+    /* 列已存在 */
+  }
+  try {
+    db.exec("ALTER TABLE board ADD COLUMN repo_error TEXT NOT NULL DEFAULT ''");
+  } catch {
+    /* 列已存在 */
+  }
+  try {
+    db.exec("ALTER TABLE board ADD COLUMN repo_head TEXT NOT NULL DEFAULT ''");
+  } catch {
+    /* 列已存在 */
+  }
+  try {
+    db.exec("ALTER TABLE board ADD COLUMN repo_source TEXT NOT NULL DEFAULT ''");
   } catch {
     /* 列已存在 */
   }

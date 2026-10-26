@@ -1,3 +1,4 @@
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { Context } from 'hono';
@@ -24,8 +25,10 @@ import {
   createBoard,
   getBoard,
   updateBoard,
+  setBoardRepoState,
   deleteBoard,
   getParticipants,
+  requireParticipant,
   setParticipants,
   listTasks,
   getTask,
@@ -51,8 +54,8 @@ import {
 import { getUserStatus, renameUser, ensureUserAgent } from './user.ts';
 import { mountMcp } from './mcp.ts';
 import { PiRuntimeManager } from './pi-runtime.ts';
+import { RepoManager } from './repo-manager.ts';
 import { Brain } from './brain.ts';
-import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { serveStatic } from '@hono/node-server/serve-static';
 
@@ -89,7 +92,7 @@ function requireElevated(ctx: Ctx, c: Context): Agent {
   return agent;
 }
 
-export function createApp(ctx: Ctx): Hono {
+export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   const app = new Hono();
 
   // Web UI 静态托管（生产形态：单容器同时供 API 与界面）。
@@ -303,20 +306,56 @@ export function createApp(ctx: Ctx): Hono {
       id?: string;
       name?: string;
       repo?: string;
+      repoMode?: 'managed' | 'remote-legacy';
+      repoInit?: 'empty' | 'clone';
       description?: string;
     };
     if (!body.name) throw new HttpError(422, 'name required');
-    return c.json(
-      {
-        board: createBoard(ctx, {
-          id: body.id,
-          name: body.name,
-          repo: body.repo === undefined ? undefined : String(body.repo),
-          description: body.description === undefined ? undefined : String(body.description),
-        }),
-      },
-      201,
-    );
+    const repo = body.repo?.trim() ?? '';
+    const repoMode = body.repoMode ?? 'remote-legacy';
+    if (repoMode !== 'managed' && repoMode !== 'remote-legacy') throw new HttpError(422, 'repoMode must be managed or remote-legacy');
+    const repoInit = body.repoInit ?? (repoMode === 'managed' ? (repo ? 'clone' : 'empty') : undefined);
+    if (repoMode === 'managed' && repoInit !== 'empty' && repoInit !== 'clone') throw new HttpError(422, 'repoInit must be empty or clone for managed boards');
+    if (repoInit === 'clone' && !repo) throw new HttpError(422, 'repo URL required for clone initialization');
+    const board = createBoard(ctx, {
+      id: body.id,
+      name: body.name,
+      repo: repoMode === 'remote-legacy' ? repo : '',
+      repoSource: repoMode === 'managed' && repoInit === 'clone' ? repo : '',
+      repoMode,
+      repoStatus: repoMode === 'managed' ? (repoInit === 'clone' ? 'queued' : 'empty') : 'ready',
+      description: body.description === undefined ? undefined : String(body.description),
+    });
+    if (repoMode === 'managed' && repoInit) {
+      repoManager.initialize(board.id, repoInit, repo || undefined);
+      // 空 bare repo 的本地 git init 很快，建板响应直接给 ready；远程 clone 保持异步 queued。
+      if (repoInit === 'empty') await repoManager.waitForJob(board.id);
+    }
+    return c.json({ board: repoMode === 'managed' ? getBoard(ctx, board.id) : board }, 201);
+  });
+
+  // 从设备本机导入 Git bundle：Bearer worker 身份 + board participant；raw stream 有长度与 SHA-256 限额校验
+  app.post('/boards/:b/repo/import', async (c) => {
+    const actor = requireActor(ctx, c);
+    const boardId = c.req.param('b');
+    const board = getBoard(ctx, boardId);
+    if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
+    if (actor.role === 'worker') requireParticipant(ctx, boardId, actor);
+    else if (actor.role !== 'user' && actor.role !== 'orchestrator') throw new HttpError(403, 'worker/user/orchestrator identity required');
+    const length = Number(c.req.header('content-length'));
+    const sha256 = c.req.header('x-content-sha256') ?? '';
+    if (!Number.isSafeInteger(length) || length < 1) throw new HttpError(411, 'Content-Length required');
+    const body = c.req.raw.body;
+    if (!body) throw new HttpError(400, 'Git bundle body required');
+    const result = await repoManager.importBundle(boardId, body as ReadableStream<Uint8Array> & AsyncIterable<Uint8Array>, length, sha256);
+    return c.json({ status: 'imported', ...result });
+  });
+
+  // 服务器托管仓库状态（repo 本体不经此端点暴露；worker/主脑只看状态与 HEAD 摘要）
+  app.get('/boards/:b/repo', (c) => {
+    requireActor(ctx, c);
+    const board = repoManager.status(c.req.param('b'));
+    return c.json({ boardId: board.id, mode: board.repoMode, status: board.repoStatus, head: board.repoHead, error: board.repoError });
   });
 
   // 看板管理：改项目元数据（匿名即 user，requireElevated 自然放行；worker token 拒绝）
@@ -327,6 +366,8 @@ export function createApp(ctx: Ctx): Hono {
       name: body.name === undefined ? undefined : String(body.name),
       repo: body.repo === undefined ? undefined : String(body.repo),
       description: body.description === undefined ? undefined : String(body.description),
+      repoMode: body.repoMode === undefined ? undefined : (body.repoMode as 'managed' | 'remote-legacy'),
+      repoStatus: body.repoStatus === undefined ? undefined : (body.repoStatus as 'empty' | 'queued' | 'running' | 'ready' | 'failed'),
     });
     return c.json({ board });
   });
@@ -446,6 +487,52 @@ export function createApp(ctx: Ctx): Hono {
       evidence: body.evidence,
     });
     return c.json({ task, by: actor.id });
+  });
+
+  // managed 模式：Worker 领取任务代码快照 Bundle
+  app.get('/tasks/:id/repo-snapshot', async (c) => {
+    const actor = requireActor(ctx, c);
+    const taskId = c.req.param('id');
+    const task = getTask(ctx, taskId);
+    if (actor.role === 'worker') {
+      requireParticipant(ctx, task.boardId, actor);
+    }
+    const snap = await repoManager.exportTaskSnapshot(task.boardId, taskId);
+    try {
+      const stat = statSync(snap.bundlePath);
+      c.header('content-type', 'application/vnd.git.bundle');
+      c.header('content-length', String(stat.size));
+      c.header('x-base-commit', snap.baseCommit);
+      const stream = createReadStream(snap.bundlePath);
+      stream.on('close', snap.cleanup);
+      return c.body(stream as unknown as ReadableStream);
+    } catch (err) {
+      snap.cleanup();
+      throw err;
+    }
+  });
+
+  // managed 模式：Worker 回传任务结果 Git Bundle
+  app.post('/tasks/:id/repo-result', async (c) => {
+    const actor = requireActor(ctx, c);
+    const taskId = c.req.param('id');
+    const task = getTask(ctx, taskId);
+    if (actor.role === 'worker') {
+      requireParticipant(ctx, task.boardId, actor);
+    }
+    const length = Number(c.req.header('content-length'));
+    const sha256 = c.req.header('x-content-sha256') ?? '';
+    if (!Number.isSafeInteger(length) || length < 1) throw new HttpError(411, 'Content-Length required');
+    const body = c.req.raw.body;
+    if (!body) throw new HttpError(400, 'Git bundle body required');
+    const result = await repoManager.importTaskResult(
+      task.boardId,
+      taskId,
+      body as ReadableStream<Uint8Array> & AsyncIterable<Uint8Array>,
+      length,
+      sha256,
+    );
+    return c.json({ status: 'saved', ...result });
   });
 
   // ---- 聊天室（§6：统一控制面）----

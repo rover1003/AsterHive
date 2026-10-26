@@ -5,7 +5,7 @@
 // 执行面——主脑侧只注册这张表，结构性保证"只分派不执行"。
 import { z } from 'zod';
 import type { ShapeOutput } from '@modelcontextprotocol/sdk/server/zod-compat.js';
-import type { Ctx } from './types.ts';
+import { HttpError, type Ctx } from './types.ts';
 import type { Agent } from './agents.ts';
 import {
   listBoards,
@@ -20,6 +20,7 @@ import {
 import { claimTask, nextTask, checkpointTask, releaseTask, submitTask } from './verbs.ts';
 import { createMessage, inboxFor, dispatchTask, type MessageKind } from './messages.ts';
 import { getOverview } from './overview.ts';
+import { RepoManager } from './repo-manager.ts';
 
 export const MESSAGE_KINDS = [
   'dispatch',
@@ -206,6 +207,30 @@ export const TOOL_DEFS: ToolDef[] = [
     '移动指定卡到目标泳道（Review→Done 等信任边界仅主脑/用户可操作，worker 会得 403）。',
     { taskId: z.string(), lane: z.enum(LANES) },
     (ctx, a, args) => updateTask(ctx, a, args.taskId, { lane: args.lane as Lane }),
+  ),
+
+  // ---- 托管仓库整合工具（仅主脑/用户可调用，worker 403）----
+  tool(
+    'asterhive_repo_inspect_task',
+    '检查任务分支代码变更（diff/stat 与改动文件列表），仅限 managed 看板中的任务。',
+    { taskId: z.string() },
+    (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot inspect repository integration state');
+      const task = getTask(ctx, args.taskId);
+      const mgr = new RepoManager(ctx);
+      return mgr.inspectTask(task.boardId, args.taskId);
+    },
+  ),
+  tool(
+    'asterhive_repo_integrate_task',
+    '验收通过后将任务分支合并至主干（main 分支）。有冲突时返回冲突细节并拒绝合并。',
+    { taskId: z.string() },
+    async (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot integrate task branches');
+      const task = getTask(ctx, args.taskId);
+      const mgr = new RepoManager(ctx);
+      return await mgr.integrateTask(task.boardId, args.taskId);
+    },
   ),
 ];
 

@@ -12,6 +12,7 @@ RUN npm run build -w apps/web
 # ---- 阶段二：服务器 + 静态界面（单容器同供 API 与 UI）----
 FROM node:24-alpine
 WORKDIR /app
+RUN apk add --no-cache git
 
 COPY package.json package-lock.json ./
 COPY apps/server/package.json apps/server/

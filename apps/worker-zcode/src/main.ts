@@ -57,6 +57,8 @@ const CFG = {
   taskTimeoutMs: Number(process.env.TASK_TIMEOUT_MS ?? 1_800_000),
   // 模型渠道由 worker 所有者自选（§8.3 服务器不感知）；omp 模糊匹配如 gpt-5.2 / openai/gpt-5.2
   model: process.env.WORKER_MODEL,
+  // RPC 直接执行 OMP 二进制；OMP_BIN 可继续指向用户 oneshot 包装器
+  ompRpcBin: process.env.OMP_RPC_BIN,
   // 项目工作区 push 开关（T15）：默认关，成果只以本地 commit 留在工作区；=1 时任务 commit 后推送任务分支
   push: process.env.WORKER_PUSH === '1',
   executorMode: (process.env.EXECUTOR_MODE ?? 'oneshot') as 'rpc' | 'oneshot',
@@ -193,7 +195,7 @@ async function ensureRpcSession(cwd: string, model: string | undefined): Promise
   const modelKey = createHash('sha256').update(resolvedModel ?? 'default').digest('hex').slice(0, 12);
   const sessionDir = join(CFG.rpcSessionRoot, detectExecutorKind(), workspaceKey, modelKey);
   const session = new OmpRpcSession({
-    ompBin: process.env.OMP_BIN ?? 'omp',
+    ompBin: CFG.ompRpcBin ?? (process.env.OMP_BIN ?? 'omp'),
     cwd,
     sessionDir,
     model: resolvedModel,
@@ -379,16 +381,18 @@ async function main(): Promise<void> {
       .map((m) => `（${m.author}）${m.content}`);
   };
 
-  // 看板 repo 缓存（T15：board.repo 不常变，进程内 Map；boardId → repo 字符串或 null=无 repo）
-  const boardRepoCache = new Map<string, string | null>();
-  const boardRepo = async (boardId: string): Promise<string | null> => {
-    if (!boardRepoCache.has(boardId)) {
+  // 看板 repo 缓存（T15：board 元数据不常变，进程内 Map；boardId → { repo, repoMode }）
+  const boardMetaCache = new Map<string, { repo: string | null; repoMode: 'managed' | 'remote-legacy' }>();
+  const boardMeta = async (boardId: string): Promise<{ repo: string | null; repoMode: 'managed' | 'remote-legacy' }> => {
+    if (!boardMetaCache.has(boardId)) {
       const board = await worker.getBoard(boardId);
       const repo = board.repo?.trim() || null;
-      boardRepoCache.set(boardId, repo);
-      if (repo) log(`项目仓库（board.repo）：${repo}`);
+      const repoMode = board.repoMode === 'managed' ? 'managed' : 'remote-legacy';
+      boardMetaCache.set(boardId, { repo, repoMode });
+      if (repoMode === 'managed') log(`看板仓库托管模式：managed（服务器主仓）`);
+      else if (repo) log(`项目仓库（board.repo）：${repo}`);
     }
-    return boardRepoCache.get(boardId)!;
+    return boardMetaCache.get(boardId)!;
   };
 
   const poll = async () => {
@@ -447,10 +451,12 @@ async function main(): Promise<void> {
       for (const boardId of decision.poll) {
         try {
           const reworks = await listMine(boardId, 'InProgress'); // 只读查询，不触发领取/写入
-          const repo = await boardRepo(boardId);
-          // 仅持久 repo 工作区有跨任务 RPC 上下文；scratch 每任务独立目录，无旧上下文可预检。
+          const meta = await boardMeta(boardId);
+          // 仅持久 repo 工作区有跨任务 RPC 上下文；scratch / managed 每任务独立临时目录，无旧上下文可预检。
           let gate: 'ready' | 'stop' = 'ready';
-          if (repo) gate = await gateRpcSessionBeforeClaim(join(CFG.workdirRoot, 'projects', boardId), model);
+          if (meta.repoMode === 'remote-legacy' && meta.repo) {
+            gate = await gateRpcSessionBeforeClaim(join(CFG.workdirRoot, 'projects', boardId), model);
+          }
           if (gate === 'stop') {
             rpcStopBoard = boardId;
             if (reworks.length > 0) {
@@ -487,15 +493,20 @@ async function main(): Promise<void> {
       }
       log(`领取任务 ${task.id}：${task.title}`);
 
-      // 工作区准备（T15 / §9.4）：repo 模式=持久项目工作区（clone/pull --rebase/任务分支），
-      // scratch 模式=一次性目录。repo 模式失败 → checkpoint 上报详情后 release，绝不静默改道 scratch。
+      // 工作区准备（T15 / §9.4 / managed 模式）：
+      // managed 模式=临时快照（从服务器拉 bundle、本地执行、结果 bundle 回传、最后清理临时目录）；
+      // remote-legacy repo 模式=持久项目工作区（clone/pull --rebase/任务分支）；
+      // scratch 模式=一次性目录。
       let ws: PreparedWorkspace;
+      const meta = await boardMeta(task.boardId);
       try {
         ws = await prepareWorkspace({
           workdirRoot: CFG.workdirRoot,
           boardId: task.boardId,
           taskId: task.id,
-          repo: await boardRepo(task.boardId),
+          repo: meta.repo,
+          repoMode: meta.repoMode,
+          worker,
           push: CFG.push,
           log,
         });
@@ -521,15 +532,14 @@ async function main(): Promise<void> {
       const cp2 = await worker.checkpoint(task.id, code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），仍上交现场`);
       logPending(cp2.pendingMessages);
 
-      // repo 模式：成果以本地 commit 留在工作区（分支不合并——汇合策略后续再定）；push 由 WORKER_PUSH 显式开启
+      // 成果提交：repo / managed 模式统一由 commitWorkspace 处理
       let commitNote = '';
       let evidence = collectEvidence(ws.dir);
-      if (ws.mode === 'repo') {
+      if (ws.mode === 'repo' || ws.mode === 'managed') {
         try {
           const hash = await commitWorkspace(ws, task.title);
           if (hash) {
-            commitNote = `\n[workspace] 本地提交 ${ws.branch}@${hash}（${ws.changedFiles?.length ?? 0} 个文件${ws.push ? '，已推送 origin' : '，未推送'}）`;
-            // repo 模式证据只登记本任务变更文件（整仓文件开工前就存在，逐个登记是噪音），并追加 git 定位符
+            commitNote = `\n[workspace] 本地提交 ${ws.branch}@${hash}（${ws.changedFiles?.length ?? 0} 个文件${ws.mode === 'managed' ? '，已回传服务器仓库' : ws.push ? '，已推送 origin' : '，未推送'}）`;
             evidence = (ws.changedFiles ?? []).map((p) => ({ path: p, machine: hostname() }));
             evidence.push({ path: `git:${ws.branch}@${hash}`, machine: hostname() });
           } else {
@@ -537,14 +547,24 @@ async function main(): Promise<void> {
           }
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
-          commitNote = `\n[workspace] 本地提交失败：${reason}`;
-          log(`本地提交失败（仍上交现场）：${reason}`);
+          commitNote = `\n[workspace] 提交失败：${reason}`;
+          log(`提交失败（仍上交现场）：${reason}`);
         }
       }
 
       const summary = (stdout.trim().split('\n').slice(-6).join('\n') || '(无输出)') + commitNote;
       await worker.submit(task.id, summary, evidence);
       log(`已上交 ${task.id}，证据 ${evidence.length} 项`);
+
+      // managed 模式：成功交活后销毁本机临时目录
+      if (ws.mode === 'managed' && ws.cleanup) {
+        try {
+          ws.cleanup();
+          log(`已清理临时工作区：${ws.dir}`);
+        } catch (err) {
+          log('清理临时工作区警告：', err instanceof Error ? err.message : err);
+        }
+      }
     } catch (err) {
       log('轮询/执行出错：', err instanceof Error ? err.message : err);
     } finally {

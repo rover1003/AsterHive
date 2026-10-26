@@ -41,9 +41,9 @@ class JsonRpcError extends Error {
 }
 
 // 领域函数抛 HttpError → JSON-RPC error，message 带状态码前缀如 "[403] ..."
-function call<T>(fn: () => T): T {
+async function call<T>(fn: () => T | Promise<T>): Promise<T> {
   try {
-    return fn();
+    return await fn();
   } catch (err) {
     if (err instanceof HttpError) {
       throw new JsonRpcError(ERR_DOMAIN, `[${err.status}] ${err.message}`);
@@ -106,7 +106,8 @@ function buildServer(ctx: Ctx, bound: Agent | null): McpServer {
       }
       parsed = result.data as Record<string, unknown>;
     }
-    return text(call(() => def.handle(ctx, actor(), parsed)));
+    const res = await call(async () => await def.handle(ctx, actor(), parsed));
+    return text(res);
   });
 
   return server;

@@ -6,8 +6,12 @@ const USER_NAME_KEY = 'asterhive.userName'; // displayAuthor 缓存：从 GET /a
 export interface Board {
   id: string;
   name: string;
-  /** GitHub 仓库地址（项目元数据，可空） */
   repo: string;
+  repoSource: string;
+  repoMode: 'managed' | 'remote-legacy';
+  repoStatus: 'empty' | 'queued' | 'running' | 'ready' | 'failed';
+  repoError: string;
+  repoHead: string;
   /** 项目描述（可空） */
   description: string;
   wip: Record<string, number>;

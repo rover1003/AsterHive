@@ -6,10 +6,14 @@
 // 注册新身份时被顶掉的旧身份自动归档（绝不丢失），`use <handle>` 随时切回。
 // 约定：所有子命令输出单行紧凑 JSON——成功输出响应数据，失败输出 {"error": ...} 且退出码 1。
 // HTTP 全部复用 @asterhive/sdk 的 Worker 类，这里只做参数解析与配置读写。
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
-import { join } from 'node:path';
-import { SdkError, Worker, defaultWorkerIdentity, registerWithRetry } from './index.ts';
+import { createHash } from 'node:crypto';
+import { createReadStream, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { Worker, defaultWorkerIdentity, registerWithRetry, SdkError } from './index.ts';
 
 interface WorkerConfig {
   url?: string;
@@ -190,6 +194,87 @@ function parseEvidence(spec: string | undefined): { path: string; machine: strin
   });
 }
 
+async function createGitBundle(sourcePath: string): Promise<{ dir: string; file: string; bytes: number; sha256: string }> {
+  const absolute = resolve(sourcePath);
+  if (!isAbsolute(absolute) || !existsSync(absolute)) throw new Error(`项目目录不存在：${absolute}`);
+  const root = (await runLocalGit(['rev-parse', '--show-toplevel'], absolute)).trim();
+  const dirty = await runLocalGit(['status', '--porcelain', '--untracked-files=all'], root);
+  if (dirty.trim()) throw new Error('源 Git 工作树不干净；请先自行处理/提交未提交与未跟踪文件，导入不会修改源目录');
+  const temp = mkdtempSync(join(tmpdir(), 'asterhive-import-'));
+  const bundle = join(temp, 'project.bundle');
+  try {
+    await runLocalGit(['bundle', 'create', bundle, '--all'], root);
+    await runLocalGit(['bundle', 'verify', bundle], root);
+    const stat = statSync(bundle);
+    if (stat.size < 1 || stat.size > 512 * 1024 * 1024) throw new Error('Git bundle 必须在 1 byte 到 512 MiB 之间');
+    const hash = createHash('sha256');
+    for await (const chunk of createReadStream(bundle)) hash.update(chunk as Buffer);
+    return { dir: temp, file: bundle, bytes: stat.size, sha256: hash.digest('hex') };
+  } catch (err) {
+    rmSync(temp, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+async function runLocalGit(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn('git', args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.once('error', reject);
+    child.once('close', (code) => code === 0 ? resolvePromise(stdout) : reject(new Error(`git ${args[0]} 失败（exit=${code}）：${stderr.slice(-600)}`)));
+  });
+}
+
+async function uploadBundle(cfg: WorkerConfig, boardId: string, bundle: { file: string; bytes: number; sha256: string }): Promise<unknown> {
+  if (!cfg.url || !cfg.token) throw new Error(`尚未配置 worker 身份（${CONFIG_PATH}）：先执行 register`);
+  if (!/^[a-z0-9-]{1,120}$/.test(boardId)) throw new Error('看板 id 格式无效');
+  const endpoint = new URL(`/boards/${boardId}/repo/import`, cfg.url);
+  const transport = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
+  return await new Promise((resolvePromise, reject) => {
+    const req = transport(endpoint, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${cfg.token}`,
+        'content-type': 'application/vnd.git.bundle',
+        'content-length': String(bundle.bytes),
+        'x-content-sha256': bundle.sha256,
+      },
+    }, (res: IncomingMessage) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => { if (body.length < 8000) body += chunk; });
+      res.on('end', () => {
+        let parsed: unknown;
+        try { parsed = JSON.parse(body); } catch { parsed = { error: body.slice(0, 500) }; }
+        if ((res.statusCode ?? 500) < 200 || (res.statusCode ?? 500) >= 300) {
+          const status = res.statusCode ?? 500;
+          const error = typeof parsed === 'object' && parsed !== null && 'error' in parsed
+            ? String((parsed as { error: unknown }).error).slice(0, 300)
+            : 'request rejected';
+          reject(new Error(`服务器拒绝 Git bundle 导入（HTTP ${status}）：${error}`));
+        } else resolvePromise(parsed);
+      });
+    });
+    req.setTimeout(120_000, () => req.destroy(new Error('bundle 上传超时')));
+    req.on('error', reject);
+    const input = createReadStream(bundle.file);
+    input.on('error', (err) => req.destroy(err));
+    input.pipe(req);
+  });
+}
+
+async function importLocalRepository(cfg: WorkerConfig, boardId: string, sourcePath: string): Promise<unknown> {
+  const bundle = await createGitBundle(sourcePath);
+  try {
+    return await uploadBundle(cfg, boardId, bundle);
+  } finally {
+    rmSync(bundle.dir, { recursive: true, force: true });
+  }
+}
+
 function requireWorker(cfg: WorkerConfig): Worker {
   if (!cfg.url || !cfg.token) {
     throw new Error(`尚未配置身份（${CONFIG_PATH}）：先执行 register 或 configure`);
@@ -208,7 +293,7 @@ async function main(): Promise<void> {
   const cmd = rest[0];
   if (!cmd) {
     throw new Error(
-      '用法：cli.ts <configure|register|use|me|inbox|next|claim|checkpoint|submit|release|message> [参数]\n' +
+      '用法：cli.ts <configure|register|use|repo import|me|inbox|next|claim|checkpoint|submit|release|message> [参数]\n' +
         'register 只需服务器地址：node cli.ts register --url <服务器>（--name/--handle/--models/--host 可省，缺省由本机主机名自动生成，撞名自动加后缀）\n' +
         'use <handle>：从 identities/<handle>.json 归档恢复活跃身份（同机多内核各自独立身份，互不复用）',
     );
@@ -216,6 +301,13 @@ async function main(): Promise<void> {
   const cfg = readConfig();
 
   switch (cmd) {
+    case 'repo': {
+      const subcommand = rest[1];
+      if (subcommand !== 'import') throw new Error('用法：cli.ts repo import --board <看板ID> --path <本机 Git 仓库目录>');
+      const result = await importLocalRepository(cfg, need(flags, 'board'), need(flags, 'path'));
+      console.log(JSON.stringify(result));
+      break;
+    }
     case 'configure': {
       const next: WorkerConfig = { ...cfg };
       let changed = false;

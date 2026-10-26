@@ -47,6 +47,28 @@ async function setupBoardWithTasks(r: Rig, n = 3): Promise<void> {
   }
 }
 
+test('看板仓库模式: 新建 managed 空仓状态，兼容旧 repo API 仍为 remote-legacy', async () => {
+  const { rig, app } = mkBoardRig();
+  try {
+    const created = await app.request('/boards', {
+      method: 'POST', headers: JSON_H,
+      body: JSON.stringify({ id: 'empty-managed', name: '空仓', repoMode: 'managed', repoInit: 'empty' }),
+    });
+    assert.equal(created.status, 201);
+    const payload = (await created.json()) as { board: { repoMode: string; repoStatus: string; repo: string } };
+    assert.equal(payload.board.repoMode, 'managed');
+    assert.ok(['empty', 'queued', 'running', 'ready'].includes(payload.board.repoStatus));
+    assert.equal(payload.board.repo, '');
+    const status = await app.request('/boards/empty-managed/repo');
+    assert.equal(status.status, 200);
+    const projection = (await status.json()) as { mode: string; status: string };
+    assert.deepEqual(projection, { boardId: 'empty-managed', mode: 'managed', status: 'ready', head: '', error: '' });
+  } finally {
+    rig.cleanup();
+  }
+});
+
+
 test('看板管理: PATCH 改名/repo/description 落库、匿名可改、事件落账', async () => {
   const { rig, app } = mkBoardRig();
   try {
@@ -57,8 +79,10 @@ test('看板管理: PATCH 改名/repo/description 落库、匿名可改、事件
       body: JSON.stringify({ id: 'demo', name: '旧名', repo: 'github.com/old/old', description: '旧描述' }),
     });
     assert.equal(res.status, 201);
-    let body = (await res.json()) as { board: { repo: string; description: string } };
+    let body = (await res.json()) as { board: { repo: string; repoMode: string; repoStatus: string; description: string } };
     assert.equal(body.board.repo, 'github.com/old/old');
+    assert.equal(body.board.repoMode, 'remote-legacy', '旧 API 传 repo URL 默认保留 worker clone 兼容模式');
+    assert.equal(body.board.repoStatus, 'ready');
     assert.equal(body.board.description, '旧描述');
 
     // 匿名 PATCH（零令牌语义：无 Authorization 即 user，全权限）

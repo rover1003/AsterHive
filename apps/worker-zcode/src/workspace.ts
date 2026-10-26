@@ -10,19 +10,23 @@
 // 失败语义：repo 模式下 clone 失败 / pull 冲突一律抛错阻塞上报，绝不静默改道 scratch——
 // 用户明确要 repo 语义，静默降级会让"项目在工作区层面有连续性"变成假象。
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { Worker } from '@asterhive/sdk';
 
 export interface PreparedWorkspace {
-  dir: string;              // 实际执行 cwd
-  mode: 'repo' | 'scratch'; // repo=持久项目工作区；scratch=无 repo 的一次性目录（现状行为）
-  taskId: string;           // 所属任务号（commit 信息与任务分支都用）
-  branch?: string;          // repo 模式下执行前所在任务分支
-  commitHash?: string;      // 执行后提交的 hash（无变更则 undefined，由 commitWorkspace 回填）
-  pulled?: boolean;         // 本次是否执行了 pull --rebase
-  cloned?: boolean;         // 本次是否新 clone
-  changedFiles?: string[];  // 本次提交的变更文件（repo 模式 evidence 只登记变更，不整仓枚举）
-  push?: boolean;           // 内部：任务 commit 后是否自动 push（main.ts 读 WORKER_PUSH 传入）
+  dir: string;                         // 实际执行 cwd
+  mode: 'repo' | 'scratch' | 'managed'; // repo=持久克隆；scratch=无 repo 一次性目录；managed=服务端托管临时快照
+  taskId: string;                      // 所属任务号
+  branch?: string;                     // 任务分支
+  commitHash?: string;                 // 执行后提交的 hash
+  pulled?: boolean;                    // 是否执行了 pull --rebase
+  cloned?: boolean;                    // 是否新 clone
+  changedFiles?: string[];             // 变更文件
+  push?: boolean;
+  worker?: Worker;                     // managed 模式回传 bundle 用
+  cleanup?: () => void;                // 临时目录销毁钩子
   log?: (s: string) => void;
 }
 
@@ -30,7 +34,9 @@ export interface PrepareWorkspaceOptions {
   workdirRoot: string;
   boardId: string;
   taskId: string;
-  repo?: string | null; // board.repo；空 = scratch 模式
+  repo?: string | null;                // legacy repo URL
+  repoMode?: 'managed' | 'remote-legacy';
+  worker?: Worker;
   push?: boolean;
   log?: (s: string) => void;
 }
@@ -90,6 +96,31 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
   const log = opts.log ?? (() => {});
   const repo = opts.repo?.trim() || null;
 
+  // ---- managed 模式：从服务器下载代码快照 bundle，在临时工作目录执行，完成后销毁 ----
+  if (opts.repoMode === 'managed') {
+    if (!opts.worker) throw new Error('managed repository mode requires worker instance for snapshot download');
+    const baseDir = join(opts.workdirRoot, 'ephemeral', `${opts.boardId}-${opts.taskId}`);
+    mkdirSync(baseDir, { recursive: true });
+    const bundleFile = join(baseDir, 'snapshot.bundle');
+    const worktreeDir = join(baseDir, 'src');
+    log(`managed 模式：从服务器下载任务 ${opts.taskId} 的代码快照...`);
+    const snap = await opts.worker.downloadTaskSnapshot(opts.taskId);
+    writeFileSync(bundleFile, Buffer.from(snap.buffer));
+    log(`快照下载完毕（${snap.buffer.byteLength} 字节，基线 ${snap.baseCommit.slice(0, 8)}），解包工作树...`);
+    await git(['clone', bundleFile, worktreeDir], baseDir, '解包快照 bundle 失败');
+    const branch = `asterhive/${opts.taskId}`;
+    await git(['checkout', '-b', branch], worktreeDir, '创建任务分支失败');
+    return {
+      dir: worktreeDir,
+      mode: 'managed',
+      taskId: opts.taskId,
+      branch,
+      worker: opts.worker,
+      cleanup: () => rmSync(baseDir, { recursive: true, force: true }),
+      log,
+    };
+  }
+
   // ---- scratch 模式（现状行为原样保留）：无 repo 的一次性任务目录，mkdir 即用 ----
   if (!repo) {
     const dir = join(opts.workdirRoot, opts.taskId);
@@ -135,9 +166,9 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
   return { dir, mode: 'repo', taskId: opts.taskId, branch, cloned, pulled, push: opts.push, log };
 }
 
-/** 任务结束后提交成果（仅 repo 模式）：有变更才 commit，返回 hash；无变更返回 undefined。永不自动 push 除非 ws.push */
+/** 任务结束后提交成果（repo/managed 模式）：有变更才 commit，返回 hash；无变更返回 undefined。永不自动 push 除非 ws.push */
 export async function commitWorkspace(ws: PreparedWorkspace, message: string): Promise<string | undefined> {
-  if (ws.mode !== 'repo') return undefined; // scratch 模式无 git 语义
+  if (ws.mode === 'scratch') return undefined; // scratch 模式无 git 语义
   const log = ws.log ?? (() => {});
   const branch = ws.branch!;
 
@@ -157,8 +188,21 @@ export async function commitWorkspace(ws: PreparedWorkspace, message: string): P
   ws.changedFiles = changed;
   log(`已提交 ${hash.slice(0, 10)}（${changed.length} 个文件）到分支 ${branch}`);
 
-  // push 默认关闭；WORKER_PUSH=1 时推送任务分支（不合并默认分支——汇合策略后续再定，先留痕）。
-  // push 失败只告警不抛错：成果已留在本地工作区，不应因此丢掉整次任务的上交。
+  // managed 模式：打包当前任务分支并回传给服务器
+  if (ws.mode === 'managed') {
+    if (!ws.worker) throw new Error('managed mode requires worker to upload result bundle');
+    const resultBundle = join(ws.dir, 'result.bundle');
+    log(`managed 模式：正在为任务 ${ws.taskId} 生成结果 bundle...`);
+    await git(['bundle', 'create', resultBundle, branch], ws.dir, '生成任务结果 bundle 失败');
+    const buf = readFileSync(resultBundle);
+    const sha256 = createHash('sha256').update(buf).digest('hex');
+    log(`正在上传任务 ${ws.taskId} 的结果 bundle（${buf.byteLength} 字节）...`);
+    const res = await ws.worker.uploadTaskResult(ws.taskId, buf, sha256);
+    log(`任务结果已存入服务器仓库：${res.taskRef}@${res.headCommit.slice(0, 8)}`);
+    return hash;
+  }
+
+  // legacy repo 模式：push 默认关闭；WORKER_PUSH=1 时推送任务分支
   if (ws.push) {
     const p = await runGit(['push', '-u', 'origin', branch], ws.dir);
     if (p.code === 0) log(`已推送分支 ${branch} → origin`);

@@ -9,6 +9,10 @@ export interface Board {
   /** GitHub 仓库地址（项目元数据，可空——空则 worker 对该板用一次性任务目录） */
   repo: string;
   description: string;
+  repoMode?: 'managed' | 'remote-legacy';
+  repoStatus?: 'empty' | 'queued' | 'running' | 'ready' | 'failed';
+  repoHead?: string;
+  repoError?: string;
   wip: Record<string, number>;
   createdAt: number;
   updatedAt: number;
@@ -242,5 +246,37 @@ export class Worker {
   async getTask(taskId: string): Promise<Task> {
     const r = await call<{ task: Task }>(this.#baseUrl, this.#token, 'GET', `/tasks/${taskId}`);
     return r.task;
+  }
+
+  async downloadTaskSnapshot(taskId: string): Promise<{ buffer: ArrayBuffer; baseCommit: string }> {
+    const headers: Record<string, string> = {};
+    if (this.#token) headers.authorization = `Bearer ${this.#token}`;
+    const res = await fetch(`${this.#baseUrl}/tasks/${taskId}/repo-snapshot`, { headers });
+    if (!res.ok) {
+      const err = await res.text().catch(() => '');
+      throw new SdkError(res.status, err || `HTTP ${res.status}`);
+    }
+    const baseCommit = res.headers.get('x-base-commit') ?? '';
+    const buffer = await res.arrayBuffer();
+    return { buffer, baseCommit };
+  }
+
+  async uploadTaskResult(taskId: string, bundleBuffer: Uint8Array, sha256: string): Promise<{ taskRef: string; headCommit: string }> {
+    const headers: Record<string, string> = {
+      'content-type': 'application/vnd.git.bundle',
+      'content-length': String(bundleBuffer.byteLength),
+      'x-content-sha256': sha256,
+    };
+    if (this.#token) headers.authorization = `Bearer ${this.#token}`;
+    const res = await fetch(`${this.#baseUrl}/tasks/${taskId}/repo-result`, {
+      method: 'POST',
+      headers,
+      body: bundleBuffer,
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => '');
+      throw new SdkError(res.status, err || `HTTP ${res.status}`);
+    }
+    return (await res.json()) as { taskRef: string; headCommit: string };
   }
 }
