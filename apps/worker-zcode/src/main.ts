@@ -15,13 +15,20 @@
 //   POLL_MS            轮询间隔（默认 10000；每次轮询同时充当心跳）
 //   TASK_TIMEOUT_MS    单任务执行超时（默认 1800000 = 30 分钟）
 import { SdkError, Worker, defaultWorkerIdentity, registerWithRetry, type Task, type PendingMessage } from '@asterhive/sdk';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
 import { firstSkip, nextBoardsToPoll } from './polling.ts';
+import {
+  OmpRpcSession,
+  DEFAULT_THRESHOLDS,
+  contextAction,
+  type CtxThresholds,
+} from './rpc-executor.ts';
 
 const here = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -52,11 +59,17 @@ const CFG = {
   model: process.env.WORKER_MODEL,
   // 项目工作区 push 开关（T15）：默认关，成果只以本地 commit 留在工作区；=1 时任务 commit 后推送任务分支
   push: process.env.WORKER_PUSH === '1',
-  // 设备主人声明的本机可用模型（逗号分隔）：上报到服务器档案，供 UI 下拉与首选模型指派
-  models: (process.env.WORKER_MODELS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
+  executorMode: (process.env.EXECUTOR_MODE ?? 'oneshot') as 'rpc' | 'oneshot',
+  ctxThresholds: {
+    shake: Number(process.env.WORKER_CTX_SHAKE ?? DEFAULT_THRESHOLDS.shake),
+    compact: Number(process.env.WORKER_CTX_COMPACT ?? DEFAULT_THRESHOLDS.compact),
+    stop: Number(process.env.WORKER_CTX_STOP ?? DEFAULT_THRESHOLDS.stop),
+    resume: Number(process.env.WORKER_CTX_RESUME ?? DEFAULT_THRESHOLDS.resume),
+  } satisfies CtxThresholds,
+  // RPC 会话本机私有数据根（与项目仓库分离，不提交）
+  rpcSessionRoot: process.env.WORKER_RPC_SESSION_DIR ?? join(homedir(), '.asterhive', 'rpc-sessions'),
+  // 设备主人声明的本机可用模型（逗号分隔）：注册/每小时重报给服务器，供用户指派首选
+  models: (process.env.WORKER_MODELS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
 };
 
 // 探测本机执行内核名（供默认身份自报"我是什么"）：显式 WORKER_EXECUTOR 优先，
@@ -158,6 +171,120 @@ function runExecutor(prompt: string, cwd: string, model: string | undefined): Pr
       resolveRun({ stdout: stdout + String(err), code: -1 });
     });
   });
+}
+
+// ---- RPC 常驻执行（EXECUTOR_MODE=rpc 显式启用；仅 omp 内核）----
+// 每个项目工作目录 + 模型一个私有会话；任务即时推入，阈值门禁在取活前执行。
+const rpcSessions = new Map<string, OmpRpcSession>();
+let rpcDisabled = false;
+
+function rpcSessionKey(cwd: string, model: string | undefined): string {
+  const modelKey = Buffer.from(model ?? process.env.WORKER_MODEL ?? 'default').toString('base64url').slice(0, 24);
+  return `${cwd}\\u0000${modelKey}`;
+}
+
+async function ensureRpcSession(cwd: string, model: string | undefined): Promise<OmpRpcSession> {
+  const resolvedModel = model ?? process.env.WORKER_MODEL;
+  const key = rpcSessionKey(cwd, resolvedModel);
+  const existing = rpcSessions.get(key);
+  if (existing?.alive) return existing;
+  if (existing) await existing.kill();
+  const workspaceKey = createHash('sha256').update(cwd).digest('hex').slice(0, 20);
+  const modelKey = createHash('sha256').update(resolvedModel ?? 'default').digest('hex').slice(0, 12);
+  const sessionDir = join(CFG.rpcSessionRoot, detectExecutorKind(), workspaceKey, modelKey);
+  const session = new OmpRpcSession({
+    ompBin: process.env.OMP_BIN ?? 'omp',
+    cwd,
+    sessionDir,
+    model: resolvedModel,
+    timeoutMs: CFG.taskTimeoutMs,
+    log,
+  });
+  await session.start();
+  rpcSessions.set(key, session);
+  return session;
+}
+
+async function stopRpcSession(cwd: string, model: string | undefined): Promise<void> {
+  const key = rpcSessionKey(cwd, model);
+  const session = rpcSessions.get(key);
+  if (!session) return;
+  rpcSessions.delete(key);
+  await session.kill();
+}
+
+
+const COMPACT_INSTRUCTIONS =
+  '保留本任务 Spec、授权、文件所有权、基线、真实改动和未验证项；不扩大范围，不重放副作用。';
+
+
+async function gateRpcSessionBeforeClaim(cwd: string, model: string | undefined): Promise<'ready' | 'stop'> {
+  if (CFG.executorMode !== 'rpc' || detectExecutor().kind !== 'omp') return 'ready';
+  // 仅检查已存在的 session。新 repo 尚未 clone、scratch task dir 尚未知时，不能提前 spawn OMP。
+  const session = rpcSessions.get(rpcSessionKey(cwd, model));
+  if (!session?.alive) return 'ready';
+  const state = await session.getState();
+  const action = contextAction(state.contextPercent, CFG.ctxThresholds);
+  if (action === 'stop') {
+    log(`RPC 上下文占用 ${state.contextPercent}% 达 STOP ${CFG.ctxThresholds.stop}%；本板暂停领取`);
+    return 'stop';
+  }
+  if (action === 'shake') {
+    log(`RPC 上下文占用 ${state.contextPercent}% 达 SHAKE ${CFG.ctxThresholds.shake}%；OMP slash 未验证为无模型操作，仅提示`);
+  }
+  if (action === 'compact') {
+    if (state.settled !== true) {
+      log('RPC 会话未确认 settled；暂停本板领取，避免打断在途操作');
+      return 'stop';
+    }
+    const ok = await session.compact(COMPACT_INSTRUCTIONS).catch(() => false);
+    if (!ok) {
+      log('RPC compact 失败；暂停本板领取，不静默回落');
+      return 'stop';
+    }
+    const after = await session.getState();
+    if (after.contextPercent === undefined || after.contextPercent >= CFG.ctxThresholds.resume) {
+      log(`RPC compact 后占用未确认低于 RESUME ${CFG.ctxThresholds.resume}%；暂停本板领取`);
+      return 'stop';
+    }
+    log(`RPC compact 完成，当前上下文 ${after.contextPercent}%`);
+  }
+  return 'ready';
+}
+
+/** RPC 优先执行；失败（内核不支持/协议异常）回落 oneshot 并告警（进程内一次） */
+async function executeTask(prompt: string, cwd: string, model: string | undefined): Promise<{ stdout: string; code: number | null }> {
+  const projectRoot = join(CFG.workdirRoot, 'projects');
+  const relativeCwd = relative(projectRoot, cwd);
+  const isPersistentProject = relativeCwd !== '' && !relativeCwd.startsWith('..') && !isAbsolute(relativeCwd);
+  if (!isPersistentProject || CFG.executorMode !== 'rpc' || detectExecutor().kind !== 'omp') {
+    return runExecutor(prompt, cwd, model);
+  }
+  if (rpcDisabled) return { stdout: 'RPC 已禁用；请检查 OMP RPC 配置。', code: -1 };
+
+  let session: OmpRpcSession;
+  try {
+    session = await ensureRpcSession(cwd, model);
+  } catch (err) {
+    await stopRpcSession(cwd, model);
+    if (!rpcDisabled) {
+      rpcDisabled = true;
+      log(`RPC 启动/探活失败，任务尚未派发，本进程后续回落 oneshot：${err instanceof Error ? err.message : String(err)}`);
+    }
+    return runExecutor(prompt, cwd, model);
+  }
+
+  // 上下文门禁在 poll 取活前已完成；这里不 compact，不改变已 claim 任务状态。
+  try {
+    const result = await session.runPrompt(prompt);
+    if (result.status === 'completed') return { stdout: result.text, code: 0 };
+    return { stdout: `RPC 任务返回 ${result.status}；诊断保留在设备本地。`, code: 1 };
+  } catch (err) {
+    // prompt 派发后结果未知：绝不 oneshot 重跑，避免重复修改或外部副作用。
+    await stopRpcSession(cwd, model);
+    log(`RPC 执行结果未知（不重跑）：${err instanceof Error ? err.message : 'unknown error'}`);
+    return { stdout: 'RPC 执行结果未知；已停止自动重试以避免重复副作用，请检查设备本地会话。', code: -1 };
+  }
 }
 
 // 上交证据：工作目录内全部文件（相对路径 + 本机名）
@@ -316,9 +443,23 @@ async function main(): Promise<void> {
       // 参与者在页面里被勾上后无需任何处理即自动恢复。
       let reworkNotes: string[] = [];
       let task: Task | undefined;
+      let rpcStopBoard: string | null = null;
       for (const boardId of decision.poll) {
         try {
-          const reworks = await listMine(boardId, 'InProgress');
+          const reworks = await listMine(boardId, 'InProgress'); // 只读查询，不触发领取/写入
+          const repo = await boardRepo(boardId);
+          // 仅持久 repo 工作区有跨任务 RPC 上下文；scratch 每任务独立目录，无旧上下文可预检。
+          let gate: 'ready' | 'stop' = 'ready';
+          if (repo) gate = await gateRpcSessionBeforeClaim(join(CFG.workdirRoot, 'projects', boardId), model);
+          if (gate === 'stop') {
+            rpcStopBoard = boardId;
+            if (reworks.length > 0) {
+              const blocked = reworks[0]!;
+              await worker.checkpoint(blocked.id, `RPC 上下文达到 STOP ${CFG.ctxThresholds.stop}%：任务暂缓，未启动新执行；请等待当前 worker 会话整理或联系设备所有者。`);
+              log(`RPC STOP：重做任务 ${blocked.id} 保持 InProgress 并已 checkpoint，未重新执行`);
+            }
+            continue; // 不 claim/next；其他板仍可独立巡检
+          }
           if (reworks.length > 0) {
             task = reworks[0];
             reworkNotes = await taskFeedback(boardId, task.id);
@@ -337,10 +478,13 @@ async function main(): Promise<void> {
             if (firstSkip(skipped403, boardId)) log(`板 ${boardId} 非参与者，已跳过`);
             continue;
           }
-          throw err; // 其余错误交外层统一记录
+          throw err;
         }
       }
-      if (!task) return;
+      if (!task) {
+        if (rpcStopBoard) log(`RPC 上下文 STOP：暂停看板 ${rpcStopBoard} 的取活；会话整理后下轮自动恢复`);
+        return;
+      }
       log(`领取任务 ${task.id}：${task.title}`);
 
       // 工作区准备（T15 / §9.4）：repo 模式=持久项目工作区（clone/pull --rebase/任务分支），
@@ -372,7 +516,7 @@ async function main(): Promise<void> {
       const cp1 = await worker.checkpoint(task.id, reworkNotes.length ? '收到退回反馈，开始重做' : '开始执行');
       logPending(cp1.pendingMessages);
 
-      const { stdout, code } = await runExecutor(buildPrompt(task, ws, reworkNotes), ws.dir, model);
+      const { stdout, code } = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model);
       log(`执行结束（exit=${code}），输出 ${stdout.length} 字符`);
       const cp2 = await worker.checkpoint(task.id, code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），仍上交现场`);
       logPending(cp2.pendingMessages);
@@ -412,8 +556,22 @@ async function main(): Promise<void> {
     `worker ${CFG.handle} 就绪，轮询 ${CFG.url} ` +
       `${CFG.board ? `板 ${CFG.board}` : '全部看板（多板巡检，非参与者板自动跳过）'}（${CFG.pollMs}ms）`,
   );
+  let shuttingDown = false;
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (pollTimer) clearInterval(pollTimer);
+    void Promise.all([...rpcSessions.values()].map((session) => session.kill())).finally(() => {
+      rpcSessions.clear();
+      log('worker 已停止，RPC 会话已全部关闭');
+      process.exitCode = 0;
+    });
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
   await poll();
-  setInterval(() => void poll(), CFG.pollMs);
+  if (!shuttingDown) pollTimer = setInterval(() => { if (!shuttingDown) void poll(); }, CFG.pollMs);
 }
 
 void main();

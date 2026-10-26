@@ -110,7 +110,12 @@ ASTERHIVE_URL=http://<your-server-ip>:8067 node apps/worker-zcode/src/main.ts
 | `ASTERHIVE_BOARD` | 要轮询的看板 id（**可选**：缺省=巡检全部看板，非参与者板自动跳过，清单每 5 分钟刷新） | 未绑板（多板巡检） |
 | `WORKER_HANDLE` | @ 句柄，同时即 agent id（定了别改，改了等于换身份）；注册撞名时自动加 `-2/-3…` 后缀。默认自报内核：自动探测本机执行内核（omp/zcode/opencode…，WORKER_EXECUTOR 可显式指定） | `<内核>-<主机名前 8 位小写>`，如 `omp-imac`；探测不到兜底 `worker-…` |
 | `WORKER_NAME` | 显示名（默认随内核自报） | `<内核>@<主机名>`，如 `Omp@imac`；兜底 `Worker@…` |
-| `WORKER_TOKEN` | 已有 token；缺省则现场注册新 worker | — |
+| `EXECUTOR_MODE` | `oneshot` = 每任务启动/退出一次（默认）；`rpc` = 显式启用 OMP 常驻 JSONL 会话（会改变会话持久性/费用行为，只适用于 omp） | `oneshot` |
+| `WORKER_RPC_SESSION_DIR` | RPC 会话私有存储根（与项目仓库分离，含会话记录；不要提交/共享） | `~/.asterhive/rpc-sessions` |
+| `WORKER_CTX_SHAKE` | RPC 上下文轻整理提示阈值（当前只告警，不自动调用 OMP slash） | `60` |
+| `WORKER_CTX_COMPACT` | settled 会话执行原生 compact 的占用阈值（%） | `80` |
+| `WORKER_CTX_STOP` | 达到后停止领取新任务，不修改模型窗口配置（%） | `90` |
+| `WORKER_CTX_RESUME` | compact 后必须低于此值才恢复取活（%） | `60` |
 | `WORKER_WORKDIR` | 工作目录根：无 repo 看板建一次性 `<任务号>` 子目录；repo 看板的项目工作区持久化于其下 `projects/<看板id>` | `<apps/worker-zcode>/work` |
 | `WORKER_EXECUTOR` | 执行内核：`omp` 或 `zcode` | `omp` |
 | `WORKER_PUSH` | `1` = 任务 commit 后自动 push 任务分支到 origin（凭据完全用设备 git 自身配置）；默认关，成果只以本地 commit 留在工作区 | 关 |
@@ -119,6 +124,20 @@ ASTERHIVE_URL=http://<your-server-ip>:8067 node apps/worker-zcode/src/main.ts
 | `ZCODE_BIN` | zcode 可执行文件；`.cjs/.mjs/.js` 会用 node 直接运行 | ZCode Desktop 自带 `zcode.cjs`，找不到再退 PATH 的 `zcode` |
 | `POLL_MS` | 轮询间隔（ms），每次轮询同时充当心跳 | `10000` |
 | `TASK_TIMEOUT_MS` | 单任务执行超时（ms），超时强杀进程后仍上交现场 | `1800000`（30 分钟） |
+
+### OMP RPC 模式（高级可选）
+
+```bash
+EXECUTOR_MODE=rpc ASTERHIVE_URL=http://<your-server>:8067 node apps/worker-zcode/src/main.ts
+```
+
+- 默认是 `oneshot`。RPC 只对 omp 生效，改变会话持久性和费用行为，必须由设备所有者显式设置 `EXECUTOR_MODE=rpc`。
+- RPC session 私有目录按内核/项目/model 分开，worker 进程退出时关闭所有 OMP RPC 子进程。默认不跨 worker 重启恢复 transcript；同一 worker 进程内 repo 项目会话跨任务复用，scratch 仍 oneshot。项目源码事实由 Git 工作区承担。
+- 模型切换会先停止该项目旧模型 session，再按新 model key 启动独立 session。任务结束保留 session 供同项目下一任务复用；worker 收到 SIGINT/SIGTERM 时等待所有 RPC 子进程退出。
+- task 超时 / prompt_result error/aborted 后 session 会销毁；prompt 已派发但结果未知时绝不 oneshot 重跑（避免重复副作用），只提交固定错误摘要，raw stderr 仅留设备进程内存日志。
+- 上下文门禁针对已存在的持久 repo 会话，在该板任何 claim/next API 之前执行：SHAKE 只提示（OMP `/shake` 会进入 prompt，未验证为无模型操作）；COMPACT 仅在 settled 时调用原生 RPC compact，失败或 compact 后未低于 RESUME 则暂停该板取活；STOP 直接跳过该板。无 repo 的 scratch 任务不跨任务复用 RPC session。
+- RPC 启动/ready/get_state 探活失败发生在 prompt 派发前，可安全回落 oneshot；派发后的失败仅报告摘要、关闭不可信 session，不重复执行。
+- 首版不启用跨重启 transcript 恢复、不启用多并发会话、不自动执行 `/shake`（本机探针显示它会进入 prompt，尚未验证为无模型调用）。
 
 ## 首次运行：自动注册与 token
 
