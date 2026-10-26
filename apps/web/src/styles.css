@@ -151,6 +151,7 @@ svg.i { flex-shrink: 0; }
   width: 6px; height: 6px; margin: 0;
 }
 .nav-agent-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.nav-agent-status { margin-left: auto; padding-left: 4px; flex-shrink: 0; color: var(--subtle-foreground); font-size: 10px; white-space: nowrap; }
 .nav-agents-empty { margin-left: 14px; padding: 0 8px 0 22px; height: 26px; line-height: 26px; font-size: 12px; color: var(--subtle-foreground); }
 
 /* 底部在线行：12px 三级字 + 6px 状态点 */

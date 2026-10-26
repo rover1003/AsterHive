@@ -120,10 +120,12 @@ function agentsNavOpen(): boolean {
 // idle=ok、disabled/offline=dot-idle）；title 悬停给 @handle · host · 当前任务
 function agentSubsHtml(route: string, curAgent: string): string {
   return agentsCache
+    .filter((a) => a.role !== 'orchestrator')
     .map((a) => {
       const taskTitle = a.currentTask ? a.currentTask.title : '空闲——未占用任务';
-      const title = `@${a.handle}${a.host ? ` · ${a.host}` : ''} · ${taskTitle}`;
-      return `<a class="nav-sub-item nav-agent-item${route === '#/fleet' && a.id === curAgent ? ' active' : ''}" data-agent="${esc(a.id)}" title="${esc(title)}"><span class="status-dot ${a.status}"></span><span class="nav-agent-name">${esc(a.name)}</span></a>`;
+      const statusText = a.status === 'stale' ? '心跳过期/疑似离线' : a.status === 'idle' ? '在线·空闲' : a.status === 'working' ? '工作中' : '停用';
+      const title = `@${a.handle}${a.host ? ` · ${a.host}` : ''} · ${statusText} · ${taskTitle}`;
+      return `<a class="nav-sub-item nav-agent-item${route === '#/fleet' && a.id === curAgent ? ' active' : ''}" data-agent="${esc(a.id)}" title="${esc(title)}"><span class="status-dot ${a.status}"></span><span class="nav-agent-name">${esc(a.name)}</span><span class="nav-agent-status">${statusText}</span></a>`;
     })
     .join('');
 }

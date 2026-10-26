@@ -9,8 +9,8 @@ import { icon } from '../icons.ts';
 
 const STATUS_LABEL: Record<AgentOverview['status'], string> = {
   working: '工作中',
-  idle: '空闲',
-  stale: '断线候选',
+  idle: '在线·空闲',
+  stale: '心跳过期/疑似离线',
   disabled: '停用',
 };
 
@@ -28,12 +28,13 @@ function agentCardHtml(a: AgentOverview): string {
     : '<div class="fleet-task muted">空闲——未占用任务</div>';
 
   return `
-    <div class="fleet-card status-${a.status}" id="fleet-agent-${esc(a.id)}">
+    <div class="fleet-card status-${a.status}" id="fleet-agent-${esc(a.id)}" title="${a.status === 'stale' ? `心跳已超过服务器离线阈值（最近：${a.lastSeenAt ? fmtTime(a.lastSeenAt) : '从未上线'}）` : STATUS_LABEL[a.status]}">
       <div class="fleet-head">
         <span class="status-dot ${a.status}"></span>
         <b>${esc(a.name)}</b>
         <span class="handle">@${esc(a.handle)}${a.host ? ` · ${esc(a.host)}` : ''}</span>
-        <span class="role-badge role-${a.role}">${a.role === 'orchestrator' ? '主脑' : a.role === 'user' ? '用户' : 'worker'}</span>
+        <span class="role-badge role-${a.role}">worker</span>
+        <span class="fleet-status-label">${STATUS_LABEL[a.status]}</span>
         <span class="fleet-done" title="累计完成">${icon.check} ${a.doneCount}</span>
       </div>
       ${taskBlock}
@@ -63,18 +64,25 @@ export function renderFleetInto(
     try {
       const ov = await api.get<Overview>('/overview');
       if (disposed) return; // 请求在途期间已被销毁：丢弃结果
+      const workers = ov.agents.filter((a) => a.role !== 'orchestrator');
+      const counts = {
+        working: workers.filter((a) => a.status === 'working').length,
+        idle: workers.filter((a) => a.status === 'idle').length,
+        stale: workers.filter((a) => a.status === 'stale').length,
+        disabled: workers.filter((a) => a.status === 'disabled').length,
+      };
       const lanes = Object.entries(ov.aggregates.lanes)
         .map(([lane, v]) => `<span class="lane-pill">${esc(lane)} <b>${v.count}</b>${v.limit ? `/${v.limit}` : ''}</span>`)
         .join('');
       container.innerHTML = `
         <div class="agg-bar">
-          <span class="agg working">在岗 <b>${ov.aggregates.working}</b></span>
-          <span class="agg idle">空闲 <b>${ov.aggregates.idle}</b></span>
-          <span class="agg stale">断线 <b>${ov.aggregates.stale}</b></span>
-          <span class="agg disabled">停用 <b>${ov.aggregates.disabled}</b></span>
+          <span class="agg working">工作中 <b>${counts.working}</b></span>
+          <span class="agg idle">在线·空闲 <b>${counts.idle}</b></span>
+          <span class="agg stale">心跳过期 <b>${counts.stale}</b></span>
+          <span class="agg disabled">停用 <b>${counts.disabled}</b></span>
           <span class="sep"></span>${lanes}
         </div>
-        <div class="fleet">${ov.agents.length ? ov.agents.map(agentCardHtml).join('') : '<div class="empty">尚无 agent 注册——到「Agent 接入」注册第一个 worker</div>'}</div>`;
+        <div class="fleet">${workers.length ? workers.map(agentCardHtml).join('') : '<div class="empty">尚无 worker 注册——到「Agent 接入」注册第一个 worker</div>'}</div>`;
     } catch (err) {
       if (disposed) return;
       container.innerHTML = `<div class="empty">加载失败：${esc(err instanceof Error ? err.message : '')}</div>`;

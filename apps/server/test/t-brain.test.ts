@@ -33,7 +33,7 @@ interface Step {
 const SCRIPT: Step[] = [
   { kind: 'tool', name: 'asterhive_list_boards', args: {} },
   { kind: 'tool', name: 'asterhive_create_task', args: { boardId: 'b', id: 'T9', title: '主脑建卡测试', acceptance: '房间出现主脑的建卡汇报' } },
-  { kind: 'tool', name: 'asterhive_message', args: { boardId: 'b', content: '@boss 已建卡 T9：主脑建卡测试' } },
+  { kind: 'tool', name: 'asterhive_message', args: { boardId: 'b', content: '@老板 已建卡 T9：主脑建卡测试' } },
   { kind: 'text', content: '路线图已建完并向用户汇报，本轮结束。' },
 ];
 
@@ -66,8 +66,9 @@ function sseResponse(step: Step, id: string): string {
   return `${out}data: [DONE]\n\n`;
 }
 
-function startMock(): { server: Server; port: () => number; calls: () => number } {
+function startMock(): { server: Server; port: () => number; calls: () => number; systemPrompts: string[] } {
   let n = 0;
+  const systemPrompts: string[] = [];
   const server = createServer((req, res) => {
     if (req.method !== 'POST' || !(req.url ?? '').endsWith('/chat/completions')) {
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -78,6 +79,13 @@ function startMock(): { server: Server; port: () => number; calls: () => number 
     req.on('data', (d) => (body += d));
     req.on('end', () => {
       n += 1;
+      try {
+        const request = JSON.parse(body) as { messages?: { role?: string; content?: unknown }[] };
+        const promptMessages = request.messages?.filter((m) => m.role === 'system' || m.role === 'developer') ?? [];
+        systemPrompts.push(promptMessages.map((m) => String(m.content ?? '')).join('\n'));
+      } catch {
+        systemPrompts.push('');
+      }
       const step = SCRIPT[Math.min(n - 1, SCRIPT.length - 1)];
       res.writeHead(200, {
         'content-type': 'text/event-stream',
@@ -91,6 +99,7 @@ function startMock(): { server: Server; port: () => number; calls: () => number 
     server,
     port: () => (server.address() as AddressInfo).port,
     calls: () => n,
+    systemPrompts,
   };
 }
 
@@ -126,9 +135,13 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
   try {
     const app = createApp(rig.ctx);
     createBoard(rig.ctx, { id: 'b', name: '测试板' });
-    // 旧多用户时代的 user 角色行：首次匿名请求触发 ensureUserAgent 时会被迁移清理，
-    // 主脑汇报里的 '@boss' mention 是纯文本解析，不依赖该行存活。
-    registerAgent(rig.ctx, { name: '老板', handle: 'boss', role: 'user' });
+    // 用户身份固定 id='user'；通过真实设置 API 修改可自定义 handle，验证主脑提示动态使用 @handle。
+    const rename = await app.request('/api/user', {
+      method: 'PUT',
+      headers: httpHeaders(),
+      body: JSON.stringify({ handle: '老板' }),
+    });
+    assert.equal(rename.status, 200);
 
     await new Promise<void>((r) => mock.server.listen(0, '127.0.0.1', r));
 
@@ -185,7 +198,8 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
     const brainMsg = msgs.find((m) => m.author === 'asterhive-brain');
     assert.ok(brainMsg, '房间应有主脑发言');
     assert.ok(brainMsg.content.includes('已建卡'), `主脑消息内容不符：${brainMsg.content}`);
-    assert.ok(brainMsg.mentions.includes('boss'));
+    assert.ok(brainMsg.mentions.includes('老板'));
+    assert.ok(mock.systemPrompts.some((p) => p.includes('@老板')), 'Pi 系统提示必须注入当前用户 handle');
 
     // 台账关键事件齐全；mock 恰好被调 4 次（list_boards/create_task/message/收尾）
     const types = earlyTypes();

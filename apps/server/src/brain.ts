@@ -168,7 +168,8 @@ function assistantToolCalls(message: StreamAssistantMessage): BrainToolActivity[
 
 // ---- 主脑系统提示（角色纪律）----
 
-const BRAIN_SYSTEM_PROMPT = `你是 AsterHive（星巢）的内置主脑（@主脑）——舰队的大脑、唯一的调度者与验收者。
+const BRAIN_SYSTEM_PROMPT = (userHandle: string) => `你是 AsterHive（星巢）的内置主脑（@主脑）——舰队的大脑、唯一的调度者与验收者。
+当前用户的自定义称呼/handle 是「${userHandle}」；向用户发送聊天室消息时必须使用 @${userHandle}，不要写死 @user。若用户改名，下轮会提供新的 handle。向 worker 或主脑自身发消息仍按其各自 handle。
 你的产出只有五种：追问、任务卡、分派、验收结论、汇报。其余一切都不是你的工作。
 
 ## 身份边界（结构性约束，不是自觉）
@@ -378,14 +379,14 @@ function buildSnapshot(ctx: Ctx): string {
 
 // ---- 资源加载器包装：社区插件与挂载技能照常透传（getSkills），系统提示词换成主脑纪律 ----
 
-function brainResourceLoader(loader: ResourceLoader): ResourceLoader {
+function brainResourceLoader(loader: ResourceLoader, userHandle: string): ResourceLoader {
   return {
     getExtensions: () => loader.getExtensions(),
     getSkills: () => loader.getSkills(),
     getPrompts: () => loader.getPrompts(),
     getThemes: () => loader.getThemes(),
     getAgentsFiles: () => loader.getAgentsFiles(),
-    getSystemPrompt: () => BRAIN_SYSTEM_PROMPT,
+    getSystemPrompt: () => BRAIN_SYSTEM_PROMPT(userHandle),
     getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => loader.getAppendSystemPrompt(),
     getAppendSystemPromptSources: () => loader.getAppendSystemPromptSources(),
@@ -475,6 +476,14 @@ export class Brain {
   #onEvent(type: string, payload: Record<string, unknown>): void {
     // 设置开关驱动激活/停用（settings.orchestrator_updated 在 withWrite 提交后发布，
     // 此处再开事务不会嵌套）
+    if (type === 'user.configured') {
+      // 用户自定义称呼变化后重建 system prompt（@handle 是机械投递地址，不只是显示名）
+      if (this.#active) {
+        this.#disposeSession();
+        this.#markDirty();
+      }
+      return;
+    }
     if (type === 'settings.orchestrator_updated') {
       const s = getOrchestratorSettings(this.#ctx);
       if (s.enabled && !this.#active) this.#activate();
@@ -609,7 +618,8 @@ export class Brain {
     });
     try {
       const agent = ensureBrainAgent(this.#ctx);
-      const session = await this.#ensureSession(g);
+      const userAgent = this.#ctx.holder.db.prepare('SELECT handle FROM agent WHERE id = ?').get('user') as { handle?: string } | undefined;
+      const session = await this.#ensureSession(g, userAgent?.handle && userAgent.handle !== 'user' ? userAgent.handle : '用户');
       const reasonLines = reasons.length > 0 ? reasons.map((r) => `- ${r}`) : ['- （无未处理唤醒，按快照巡检）'];
       const prompt = [
         '【本轮唤醒】',
@@ -807,10 +817,10 @@ export class Brain {
    * 多模型组：入参即本轮激活组（activeGroup 已解密 KEY）；组切换经
    * settings.orchestrator_updated → #onEvent → #disposeSession 到达这里时指纹必变。
    */
-  async #ensureSession(g: ActiveOrchestratorGroup): Promise<AgentSession> {
+  async #ensureSession(g: ActiveOrchestratorGroup, userHandle: string): Promise<AgentSession> {
     const rt = this.#runtime.ensureRuntimeEntry(); // 数据卷优先，回落仓库基线；包不完整直接报错
-    // 指纹含解密后的 apiKey：仅换 KEY/换组也能触发会话重建
-    const key = JSON.stringify([rt.entryUrl, g.baseURL, g.model, g.apiKey]);
+    // 指纹含密钥和用户 handle：换组/URL/KEY/模型/用户名均重建 system prompt 会话
+    const key = JSON.stringify([rt.entryUrl, g.baseURL, g.model, g.apiKey, userHandle]);
     if (this.#session && key === this.#sessionKey) return this.#session;
     this.#disposeSession();
 
@@ -867,7 +877,7 @@ export class Brain {
       model,
       modelRuntime,
       thinkingLevel: 'off',
-      resourceLoader: brainResourceLoader(loader), // 系统提示词 = 主脑纪律
+      resourceLoader: brainResourceLoader(loader, userHandle), // 系统提示词含当前用户自定义 @handle
       settingsManager: pi.SettingsManager.inMemory({}),
       sessionManager: pi.SessionManager.continueRecent(workspace, sessionsDir),
       noTools: 'builtin', // 关闭全部内置工具（read/bash/edit/write…）
