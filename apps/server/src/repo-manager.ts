@@ -151,7 +151,7 @@ export class RepoManager {
       const init = await runGit(['init', '--bare', '--initial-branch=main', repo]);
       if (init.code !== 0) throw new HttpError(500, `failed to initialize bare repo for migration: ${safeError(init.stderr)}`);
     }
-    const maxBytes = Number(process.env.ASTERHIVE_MAX_IMPORT_BYTES ?? 536_870_912);
+    const maxBytes = Number(process.env.ASTERHIVE_MAX_IMPORT_BYTES ?? 2 * 1024 * 1024 * 1024); // 默认允许至 2GiB
     if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 1 || expectedBytes > maxBytes) {
       throw new HttpError(413, `Git bundle size must be 1..${maxBytes} bytes`);
     }
@@ -242,7 +242,7 @@ export class RepoManager {
     if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
     const repo = this.repoPath(boardId);
     if (!existsSync(repo)) throw new HttpError(409, 'server repository does not exist');
-    const maxBytes = Number(process.env.ASTERHIVE_MAX_IMPORT_BYTES ?? 536_870_912);
+    const maxBytes = Number(process.env.ASTERHIVE_MAX_IMPORT_BYTES ?? 2 * 1024 * 1024 * 1024); // 默认允许至 2GiB
     if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 1 || expectedBytes > maxBytes) {
       throw new HttpError(413, `Git bundle size must be 1..${maxBytes} bytes`);
     }

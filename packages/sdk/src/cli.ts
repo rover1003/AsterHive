@@ -206,7 +206,8 @@ async function createGitBundle(sourcePath: string): Promise<{ dir: string; file:
     await runLocalGit(['bundle', 'create', bundle, '--all'], root);
     await runLocalGit(['bundle', 'verify', bundle], root);
     const stat = statSync(bundle);
-    if (stat.size < 1 || stat.size > 512 * 1024 * 1024) throw new Error('Git bundle 必须在 1 byte 到 512 MiB 之间');
+    const maxAllowed = Number(process.env.ASTERHIVE_MAX_IMPORT_BYTES ?? 2 * 1024 * 1024 * 1024); // 默认允许至 2GiB
+    if (stat.size < 1 || stat.size > maxAllowed) throw new Error(`Git bundle 必须在 1 byte 到 ${maxAllowed / 1024 / 1024} MiB 之间`);
     const hash = createHash('sha256');
     for await (const chunk of createReadStream(bundle)) hash.update(chunk as Buffer);
     return { dir: temp, file: bundle, bytes: stat.size, sha256: hash.digest('hex') };
