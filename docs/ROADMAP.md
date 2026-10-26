@@ -27,6 +27,7 @@
 | T16 | 24 小时无人值守验收 | 用户离开 24h，多任务多依赖目标被自动拆解、分派、执行、验收（人工抽查证据） | Backlog（零件已齐，待实跑） |
 | T17 | 主脑插件/技能界面化管理（公开化前置） | 设置页"主脑扩展"卡片：列表/启停/删除 + 上传 zip 或填 npm 包名安装（服务器代跑 pi install 装入数据卷）；Pi skills 挂载目录；运行中变更下会话生效不打断当前轮 | **Done**（2026-10-26：npm 包名安装 + 启停 + 删除 + 技能 SKILL.md 写入/删除，注册表数据卷自管理，设置页卡片完成；zip 上传后置——npm 已覆盖主路径） |
 | T18 | 项目公开化准备 | LICENSE 定稿（建议 MIT）；面向陌生部署者的文档：compose 一键部署、**"匿名请求即用户"的内网信任模型必须显式说明**、示例看板与 worker 接入样例；README 双语评估 | **Done**（2026-10-26：LICENSE(MIT)、docs/DEPLOY.md、README 英文摘要与信任模型章节、备份文档覆盖 evidence/pi-runtime） |
+| T19 | 托管工蜂（零 agent 依赖接入）+ 一键部署脚本 | 裸设备一行命令装工蜂：内置 Pi 执行内核（进程内会话，无需本机任何 agent CLI）、Hive 专用系统提示词 + 随包技能（hive-skills）+ hive_checkpoint 自定义汇报工具；交互式安装脚本（Node 自举、模型组 baseURL/Key 在线拉列表选择、Key 只存设备 0600、systemd/后台常驻化、自助注册）；服务器侧对应一键部署脚本（交互式初始设置）；`--once` 单轮形态对齐未来 push 启动器；自带 agent 的 SKILL 自举路径保留（双通道） | **Done**（2026-10-27：scripts/install-hive.sh + install-bee.sh、pi 执行器、hive-skills、接入页双入口；Windows 原生脚本与 push Runner 对接留待三期） |
 
 ## 决策记录（原 §13 开放决策，随用户拍板收敛）
 
@@ -46,3 +47,4 @@
 - **DSH 插件层集成取消**（2026-10-26 用户拍板）——本项目主脑使用 Pi 核心（非 DSH），Pi 自身的扩展/技能生态（additionalExtensionPaths / additionalSkillPaths + T17 界面化管理）已无缝覆盖原 DSH 集成设想的全部能力（worker 唤醒插件、SubagentProvider 式注册等），不再做 DSH 侧适配。
 - **飞书接入搁置**（2026-10-26 用户拍板）——三期飞书群第二表面（入站事件订阅 + 验签、@ 双向映射、出站播报、卡片渲染）保留设计，实施让位给基础功能；多端派活当前由通用 Chat-to-Card Webhook（T8，Phase 8）覆盖。
 - **同类项目能力吸收批次完成**（2026-10-26，Phase 3-9 全部落地，commit 8034c56）：蜂群命名与 @Queen/@Bee 别名路由、工蜂设备能力自报（specs）、Nomad 风格资源感知调度（requirements + 评分匹配）、蜂后直接受控诊断（probe/restart/release_stuck_task，凭据不出服务端）、文件级读写所有权与依赖自动推导（RAW/WAW + 环路保护）、Chat-to-Card 多端 Webhook、舰队体检雷达（算力池/停滞预警/干预审计）。X5800 工蜂执行链修复（--print 参数顺序、--no-prewalk 防模型漂移、stdio ignore 防挂起、保活 checkpoint）随批落地。
+- **托管工蜂与接入双通道定稿**（2026-10-27 用户拍板，T19）——裸设备用 scripts/install-bee.sh 一行命令装内置 Pi 执行内核的托管工蜂（交互式配模型：baseURL/Key 在线拉列表选择即探测，Key 只存设备 0600，架构纪律"worker Key 设备自持"不变；不做预打包——设备必有外网，Key 反正要连上游）；已有 agent 保留 SKILL 自举路径；两个脚本均入 GitHub 公开仓库（hive 本体 + bee），README 收录一行命令，Agent 接入页收录 bee 命令。工蜂配套三件套专为 Hive 定制：纪律红线进系统提示词（每轮在眼前）、操作手册进 hive-skills 随包技能（按需展开省上下文）、hive_checkpoint 自定义工具作里程碑/受阻主动汇报通道；`--once` 单轮形态预留 push 启动器对接。

@@ -31,6 +31,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
 import { firstSkip, nextBoardsToPoll } from './polling.ts';
+import { runPiPrompt } from './pi-executor.ts';
 import {
   OmpRpcSession,
   DEFAULT_THRESHOLDS,
@@ -44,27 +45,57 @@ const here = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // 设备主人装了新模型后无需重启 worker，服务器档案最迟一小时内对齐
 const MODEL_REREPORT_MS = 60 * 60_000;
 
+// 托管工蜂（T19）：~/.asterhive/worker.json 可承载完整设备配置（安装脚本写入）——
+// url/board/executor 与 model{baseURL,apiKey,model}；环境变量优先级更高，兼容既有部署。
+interface WorkerFileConfig {
+  url?: string;
+  token?: string;
+  handle?: string;
+  board?: string;
+  executor?: string;
+  model?: { baseURL?: string; apiKey?: string; model?: string; thinkingLevel?: string };
+}
+
+function readWorkerFileConfig(): WorkerFileConfig {
+  try {
+    return JSON.parse(readFileSync(join(homedir(), '.asterhive', 'worker.json'), 'utf8')) as WorkerFileConfig;
+  } catch {
+    return {}; // 无配置文件 = 既有 env 驱动部署，行为不变
+  }
+}
+
+const WORKER_FILE = readWorkerFileConfig();
+
 const CFG = {
-  url: process.env.ASTERHIVE_URL ?? 'http://127.0.0.1:8067',
-  board: process.env.ASTERHIVE_BOARD ?? '', // 空 = 未绑板 → 多板巡检模式
-  // 默认身份自报内核：探测本机执行内核（omp/zcode/opencode…），写成 <内核>-<主机名短缀> /
+  url: process.env.ASTERHIVE_URL ?? WORKER_FILE.url ?? 'http://127.0.0.1:8067',
+  board: process.env.ASTERHIVE_BOARD ?? WORKER_FILE.board ?? '', // 空 = 未绑板 → 多板巡检模式
+  // 默认身份自报内核：探测本机执行内核（pi/omp/zcode/opencode…），写成 <内核>-<主机名短缀> /
   // <内核>@<主机名>——用户一眼看出"这台设备跑的是什么"；探测不到兜底 worker-（SDK 同款中性名）
-  handle: process.env.WORKER_HANDLE ?? (() => {
+  handle: process.env.WORKER_HANDLE ?? WORKER_FILE.handle ?? (() => {
     const id = defaultWorkerIdentity(hostname());
     const kind = detectExecutorKind();
     return kind === 'worker' ? id.handle : `${kind}-${id.handle.replace(/^worker-/, '')}`;
   })(),
-  name: process.env.WORKER_NAME ?? (() => {
+  name: process.env.WORKER_NAME ?? WORKER_FILE.handle ?? (() => {
     const id = defaultWorkerIdentity(hostname());
     const kind = detectExecutorKind();
     return kind === 'worker' ? id.name : `${kind[0].toUpperCase()}${kind.slice(1)}@${hostname()}`;
   })(),
-  token: process.env.WORKER_TOKEN,
+  token: process.env.WORKER_TOKEN ?? WORKER_FILE.token,
   workdirRoot: process.env.WORKER_WORKDIR ?? join(here, 'work'),
   pollMs: Number(process.env.POLL_MS ?? 10_000),
   taskTimeoutMs: Number(process.env.TASK_TIMEOUT_MS ?? 1_800_000),
   // 模型渠道由 worker 所有者自选（§8.3 服务器不感知）；omp 模糊匹配如 gpt-5.2 / openai/gpt-5.2
   model: process.env.WORKER_MODEL,
+  // 托管工蜂（pi 执行器）的设备本地模型配置：安装脚本交互式写入 worker.json，Key 设备自持
+  piModel: (() => {
+    const m = WORKER_FILE.model;
+    const baseURL = process.env.WORKER_PI_BASE_URL ?? m?.baseURL;
+    const apiKey = process.env.WORKER_PI_API_KEY ?? m?.apiKey;
+    const model = process.env.WORKER_PI_MODEL ?? m?.model;
+    if (!baseURL || !apiKey || !model) return null;
+    return { baseURL, apiKey, model, thinkingLevel: process.env.WORKER_PI_THINKING ?? m?.thinkingLevel };
+  })(),
   // RPC 直接执行 OMP 二进制；OMP_BIN 可继续指向用户 oneshot 包装器
   ompRpcBin: process.env.OMP_RPC_BIN,
   // 项目工作区 push 开关（T15）：默认关，成果只以本地 commit 留在工作区；=1 时任务 commit 后推送任务分支
@@ -82,10 +113,13 @@ const CFG = {
   models: (process.env.WORKER_MODELS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
 };
 
-// 探测本机执行内核名（供默认身份自报"我是什么"）：显式 WORKER_EXECUTOR 优先，
+// pi 执行器：模型清单缺省 = 设备配置的那个模型（注册/重报给服务器，供调度匹配 requiredModel）
+if (CFG.models.length === 0 && CFG.piModel) CFG.models.push(CFG.piModel.model);
+
+// 探测本机执行内核名（供默认身份自报"我是什么"）：显式 WORKER_EXECUTOR / worker.json 优先，
 // 否则按 PATH 逐个探测常见 CLI，兜底 worker——名字必须内核无关地反映真实内核
 function detectExecutorKind(): string {
-  const explicit = process.env.WORKER_EXECUTOR?.trim();
+  const explicit = process.env.WORKER_EXECUTOR?.trim() ?? WORKER_FILE.executor?.trim();
   if (explicit) return explicit;
   const pathDirs = (process.env.PATH ?? '').split(process.platform === 'win32' ? ';' : ':');
   const has = (bin: string) =>
@@ -273,7 +307,30 @@ async function gateRpcSessionBeforeClaim(cwd: string, model: string | undefined)
 }
 
 /** RPC 优先执行；失败（内核不支持/协议异常）回落 oneshot 并告警（进程内一次） */
-async function executeTask(prompt: string, cwd: string, model: string | undefined): Promise<{ stdout: string; code: number | null }> {
+async function executeTask(
+  prompt: string,
+  cwd: string,
+  model: string | undefined,
+  hooks?: { taskId?: string; checkpoint?: (note: string) => Promise<{ pendingMessages?: { author?: string; content?: string }[] }> },
+): Promise<{ stdout: string; code: number | null }> {
+  // 托管工蜂（T19）：pi 执行器 = 进程内 Pi 会话，零外部 CLI 依赖；
+  // 模型配置来自设备本地 worker.json（安装脚本交互式写入），服务器首选模型不适用于该内核
+  if (detectExecutorKind() === 'pi') {
+    if (!CFG.piModel) {
+      return {
+        stdout: 'Pi 执行器未配置完整模型：需要在 ~/.asterhive/worker.json 写入 model.baseURL / apiKey / model（可重跑 install-bee.sh 交互式配置）。',
+        code: -1,
+      };
+    }
+    return runPiPrompt({
+      prompt,
+      cwd,
+      config: CFG.piModel,
+      timeoutMs: CFG.taskTimeoutMs,
+      log,
+      checkpoint: hooks?.checkpoint,
+    });
+  }
   const projectRoot = join(CFG.workdirRoot, 'projects');
   const relativeCwd = relative(projectRoot, cwd);
   const isPersistentProject = relativeCwd !== '' && !relativeCwd.startsWith('..') && !isAbsolute(relativeCwd);
@@ -569,7 +626,11 @@ async function main(): Promise<void> {
 
       let execRes: { stdout: string; code: number | null };
       try {
-        execRes = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model);
+        execRes = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model, {
+          taskId: task.id,
+          // hive_checkpoint 落点：模型在里程碑/受阻时主动汇报，服务器的干预消息原样带回
+          checkpoint: (note) => worker.checkpoint(task.id, note),
+        });
       } finally {
         clearInterval(keepAliveTimer);
       }
@@ -637,6 +698,13 @@ async function main(): Promise<void> {
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
   await poll();
+  // --once（push 启动器形态）：单轮领活执行完毕即退出——最多执行一张卡；
+  // 无任务也正常退出（退出码 0），由调用方（未来的 push Runner / cron）决定何时再拉起
+  if (process.argv.includes('--once')) {
+    log('--once 模式：单轮领活完毕，进程退出');
+    process.exitCode = 0;
+    return;
+  }
   if (!shuttingDown) pollTimer = setInterval(() => { if (!shuttingDown) void poll(); }, CFG.pollMs);
 }
 

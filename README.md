@@ -33,22 +33,27 @@
 
 ## 快速开始
 
-### 1. 部署服务器（Docker）
+### 1. 部署服务器（Hive 本体，一行命令）
+
+在一台有 Docker 的内网服务器上执行（交互式：设置用户称呼、主脑模型组与 API Key）：
 
 ```bash
-git clone https://github.com/rover1003/AsterHive.git && cd AsterHive
-docker compose up -d --build        # 监听 8067，数据落在命名卷 asterhive-data
+curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-hive.sh | bash
 ```
 
-或开发模式（要求 Node ≥ 23.6，原生运行 TypeScript 无需构建）：
+脚本自动完成：源码下载 → docker compose 构建启动 → 健康检查 → 初始设置（跳过可后续在 Web 设置页配置）→ 打印工蜂接入命令。开发模式（要求 Node ≥ 23.6）：`npm install && npm run dev`。
+
+### 2. 接入工蜂（Bee，两种方式任选）
+
+**裸设备（推荐，零 agent 依赖）**——一行命令装一个内置 Pi 执行内核的托管工蜂，交互式配置模型（API Key 只存本设备），自动注册上线并常驻：
 
 ```bash
-npm install && npm run dev          # http://127.0.0.1:8067
+curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- http://<hive-ip>:8067
 ```
 
-### 2. 接入第一个 worker（一句话）
+要求 Linux/macOS（Windows 经 WSL/Git Bash）；Node ≥ 23.6 缺失时脚本自动安装便携版。装好的工蜂以内置 Pi 会话执行任务，自带 Hive 工作区纪律与汇报协议。
 
-把这句话发给任意设备上能联网的 agent（CLI 或桌面会话均可）：
+**已有 agent**——把下面这句话发给任意设备上已有的 agent（CLI 或桌面会话均可），它会照做自举：
 
 > 访问 `http://<your-server-ip>:8067/skill/asterhive-worker` 并照做
 
@@ -92,8 +97,9 @@ Web UI「设置 → 主脑设置」：填任意 OpenAI 兼容端点与 API Key�
 ```
 apps/server/       分派服务器（HTTP API + SSE + SQLite 事件台账 + 内置主脑）
 apps/web/          Web UI（Vite + 原生 TS：聊天工作台/看板/接入/设置/审计）
-apps/worker-zcode/ 官方 worker 适配器（常驻轮询 + 工作区管理）
+apps/worker-zcode/ 官方 worker 适配器（常驻轮询 + 工作区管理 + 内置 Pi 执行内核）
 packages/sdk/      worker 薄 SDK 与零依赖 CLI
+scripts/           一键部署脚本（install-hive.sh 服务器 / install-bee.sh 托管工蜂）
 skills/            asterhive-worker 技能（agent 自举启动盘）
 docs/              设计文档与路线图
 tools/             开发辅助（布局审计、预览服务器）

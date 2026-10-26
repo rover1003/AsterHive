@@ -8,6 +8,8 @@
     "start": "node src/main.ts"
   },
   "dependencies": {
-    "@asterhive/sdk": "*"
+    "@asterhive/sdk": "*",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "typebox": "1.3.27"
   }
 }
