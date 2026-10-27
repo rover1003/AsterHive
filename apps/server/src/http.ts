@@ -370,8 +370,8 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     const repo = body.repo?.trim() ?? '';
     const repoMode = body.repoMode ?? 'remote-legacy';
     if (repoMode !== 'managed' && repoMode !== 'remote-legacy') throw new HttpError(422, 'repoMode must be managed or remote-legacy');
-    const repoInit = body.repoInit ?? (repoMode === 'managed' ? (repo ? 'clone' : 'empty') : undefined);
-    if (repoMode === 'managed' && repoInit !== 'empty' && repoInit !== 'clone') throw new HttpError(422, 'repoInit must be empty or clone for managed boards');
+    const repoInit = body.repoInit ?? (repoMode === 'managed' ? (repo ? 'clone' : undefined) : undefined);
+    if (repoMode === 'managed' && repoInit && repoInit !== 'empty' && repoInit !== 'clone') throw new HttpError(422, 'repoInit must be empty or clone for managed boards');
     if (repoInit === 'clone' && !repo) throw new HttpError(422, 'repo URL required for clone initialization');
     const board = createBoard(ctx, {
       id: body.id,
