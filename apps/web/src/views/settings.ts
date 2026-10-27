@@ -180,6 +180,8 @@ export async function render(el: HTMLElement): Promise<void> {
   function fillSelect(sel: HTMLSelectElement, custom: HTMLInputElement | null, models: string[], cur: string): void {
     sel.innerHTML = modelOptionsHtml(models, cur);
     if (custom) custom.style.display = sel.value === CUSTOM_OPT ? '' : 'none';
+    const save = sel.closest('[data-id]')?.querySelector<HTMLButtonElement>('button[data-act="save-custom-model"]');
+    if (save) save.style.display = sel.value === CUSTOM_OPT ? '' : 'none';
   }
 
   // 读取某容器内「下拉 + 自定义兜底」的最终模型值
@@ -220,7 +222,7 @@ export async function render(el: HTMLElement): Promise<void> {
       <div class="field"><label>API Key</label><input data-role="f-key" type="password" autocomplete="new-password" placeholder="${g ? (g.apiKeySet ? '留空保留原 KEY' : '输入 API Key') : 'API Key（加密存储，仅提交不回显）'}" /></div>
       <div class="field"><label>模型</label>
         <select data-role="f-model" title="列表来自该组上游 /models 接口；列表缺失时选「自定义…」手填">${modelOptionsHtml(models, cur)}</select>
-        <input data-role="f-model-custom" placeholder="自定义模型名" style="display:none; margin-top:6px" />
+        <input data-role="f-model-custom" placeholder="自定义模型名" style="${!cur && models.length === 0 ? '' : 'display:none;'} margin-top:6px" />
       </div>
       <div class="field"><label>Pi 思考等级</label>
         <select data-role="f-thinking-level">${levelOptions.map((x) => `<option value="${x}"${x === level ? ' selected' : ''}>${x}</option>`).join('')}</select>
@@ -261,6 +263,7 @@ export async function render(el: HTMLElement): Promise<void> {
             <div class="field"><label>模型</label>
               <select data-role="model" title="列表来自该组上游 /models 接口，每 60 秒静默刷新；改动即保存"></select>
               <input data-role="model-custom" placeholder="自定义模型名" style="display:none; margin-top:6px" />
+              <button data-act="save-custom-model" style="display:none; margin-top:6px">保存模型</button>
               <div class="inline-form" style="margin-top:6px"><span data-role="hint" class="muted small">${hints.get(g.id) ?? '拉取模型列表…'}</span></div>
             </div>
           </div>`}
@@ -385,7 +388,10 @@ export async function render(el: HTMLElement): Promise<void> {
     const g = groups.find((x) => x.id === id);
     if (!g) return;
     const m = readModelField(card, 'model', 'model-custom');
-    if (!m) return; // 占位项（未设置）不保存
+    if (!m) {
+      setHint(id, '<span class="warn">请先填写模型 ID</span>');
+      return;
+    }
     const hadMap = !!g.thinkingLevelMap;
     try {
       await api.put(`/settings/orchestrator/groups/${encodeURIComponent(id)}`, { model: m });
@@ -436,6 +442,10 @@ export async function render(el: HTMLElement): Promise<void> {
     };
     try {
       switch (act) {
+        case 'save-custom-model': {
+          if (g && card) await saveGroupModel(g.id, card);
+          return;
+        }
         case 'refresh': {
           if (g) await loadGroupModels(g, false);
           return;
@@ -534,8 +544,10 @@ export async function render(el: HTMLElement): Promise<void> {
       custom.style.display = sel.value === CUSTOM_OPT ? '' : 'none';
       if (sel.value === CUSTOM_OPT) custom.focus();
     }
+    const save = card.querySelector<HTMLButtonElement>('button[data-act="save-custom-model"]');
+    if (save && sel.dataset.role === 'model') save.style.display = sel.value === CUSTOM_OPT ? '' : 'none';
     // 展示下拉（非编辑态）改动即保存；编辑表单的下拉只改表单值，保存时统一提交
-    if (sel.dataset.role === 'model' && card.dataset.id && card.dataset.id !== '__new__') {
+    if (sel.dataset.role === 'model' && sel.value !== CUSTOM_OPT && card.dataset.id && card.dataset.id !== '__new__') {
       void saveGroupModel(card.dataset.id, card);
     }
   });
