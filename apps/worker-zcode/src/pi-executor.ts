@@ -15,14 +15,17 @@ import { Type } from 'typebox';
 import type { ResourceLoader } from '@earendil-works/pi-coding-agent';
 import { WORKER_SYSTEM_PROMPT, HIVE_CHECKPOINT_TOOL_DESCRIPTION } from './hive-prompt.ts';
 
+export type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
 export interface PiModelConfig {
   baseURL: string;
   apiKey: string;
   model: string;
-  /** Pi thinkingLevel，缺省 medium（工蜂要动手干活，留一点推理余量） */
-  thinkingLevel?: string;
+  /** Pi thinking level; legacy configurations default to medium. */
+  thinkingLevel?: PiThinkingLevel;
+  /** Model-specific labels for Pi levels; null explicitly disables a level. */
+  thinkingLevelMap?: Partial<Record<PiThinkingLevel, string | null>>;
 }
-
 export interface PiRunOptions {
   prompt: string;
   cwd: string;
@@ -107,6 +110,11 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
     modelsPath: null,
     refreshOnCreate: false,
   });
+  const thinkingLevel = config.thinkingLevel ?? 'medium';
+  const thinkingLevelMap = { ...(config.thinkingLevelMap ?? {}) };
+  if ((thinkingLevel === 'xhigh' || thinkingLevel === 'max') && thinkingLevelMap[thinkingLevel] === undefined) {
+    thinkingLevelMap[thinkingLevel] = thinkingLevel;
+  }
   modelRuntime.registerProvider('asterhive-worker', {
     name: 'AsterHive 工蜂',
     baseUrl: config.baseURL,
@@ -117,7 +125,8 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
         type: 'chat',
         id: config.model,
         name: config.model,
-        reasoning: false,
+        ...(Object.keys(thinkingLevelMap).length ? { thinkingLevelMap } : {}),
+        reasoning: thinkingLevel !== 'off',
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128_000,
@@ -179,7 +188,7 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
     agentDir,
     model,
     modelRuntime,
-    thinkingLevel: config.thinkingLevel ?? 'medium',
+    thinkingLevel,
     resourceLoader: workerResourceLoader,
     settingsManager: pi.SettingsManager.inMemory({}),
     sessionManager: pi.SessionManager.inMemory(cwd), // 一次性会话：随卡结束即弃

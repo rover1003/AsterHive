@@ -1,5 +1,6 @@
 import './_brain-env.ts'; // 必须第一条：先设 ASTERHIVE_BRAIN_* 再加载 brain.ts（经 http.ts 传递加载）
 import { test } from 'node:test';
+import { createServer, type AddressInfo } from 'node:http';
 import assert from 'node:assert/strict';
 import { mkRig } from './helpers.ts';
 import { createApp } from '../src/http.ts';
@@ -13,8 +14,10 @@ import {
   createOrchestratorGroup,
   updateOrchestratorGroup,
   switchOrchestratorGroup,
+  reviewerGroup,
   listOrchestratorModels,
   testOrchestratorModel,
+  getCachedOrchestratorModelMetadata,
 } from '../src/settings.ts';
 import { listEvents } from '../src/write.ts';
 import { readFileSync } from 'node:fs';
@@ -91,12 +94,13 @@ test('T10: 模型组——apiKey 加密落库、明文/密文永不回显；组�
     // 零令牌：无凭据即唯一用户（user 角色），可创建
     res = await app.request('/settings/orchestrator/groups', { method: 'POST', headers: H(), body: createBody });
     assert.equal(res.status, 201);
-    const { group } = (await res.json()) as { group: { id: string; name: string; apiKeySet?: boolean; model?: string } };
+    const { group } = (await res.json()) as { group: { id: string; name: string; apiKeySet?: boolean; model?: string; thinkingLevel?: string; apiKey?: string; apiKeyCipher?: string } };
     assert.ok(group.id.startsWith('g'), `组 id 为 g+随机短码：${group.id}`);
     assert.equal(group.apiKeySet, true, 'apiKeySet=true（已加密落库）');
     assert.equal(group.model, 'gpt-6');
-    assert.equal((group as Record<string, unknown>).apiKey, undefined, '明文不回显');
-    assert.equal((group as Record<string, unknown>).apiKeyCipher, undefined, '密文不回显');
+    assert.equal(group.thinkingLevel, 'low', '新建模型组默认 low');
+    assert.equal(group.apiKey, undefined, '明文不回显');
+    assert.equal(group.apiKeyCipher, undefined, '密文不回显');
 
     // 落库内容不含明文
     const dbText = readFileSync(join(rig.ctx.cfg.dataDir, 'asterhive.db'), 'utf8');
@@ -105,7 +109,171 @@ test('T10: 模型组——apiKey 加密落库、明文/密文永不回显；组�
     // 空组态创建的第一组自动激活：activeGroup 可解密（内置主脑消费）
     assert.equal(getOrchestratorSettings(rig.ctx).activeGroupId, group.id);
     assert.equal(activeGroup(rig.ctx)?.apiKey, 'sk-very-secret');
+    const updated = await app.request(`/settings/orchestrator/groups/${group.id}`, {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ thinkingLevel: 'xhigh', thinkingLevelMap: { xhigh: 'max' } }),
+    });
+    assert.equal(updated.status, 200);
+    const updatedGroup = (await updated.json() as { group: { thinkingLevel?: string; thinkingLevelMap?: Record<string, string | null>; apiKey?: string; apiKeyCipher?: string } }).group;
+    assert.equal(updatedGroup.thinkingLevel, 'xhigh', 'Pi SDK 原生最高等级 xhigh 可保存');
+    assert.deepEqual(reviewerGroup(rig.ctx)?.thinkingLevelMap, { xhigh: 'max' }, '默认审核员跟随主脑组的档位映射');
+    const reviewerModel = await app.request('/settings/orchestrator', {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ reviewerGroupId: group.id, reviewerModel: 'review-model' }),
+    });
+    assert.equal(reviewerModel.status, 200);
+    assert.equal(reviewerGroup(rig.ctx)?.model, 'review-model');
+    assert.equal(reviewerGroup(rig.ctx)?.thinkingLevel, 'xhigh');
+    assert.equal(reviewerGroup(rig.ctx)?.thinkingLevelMap, undefined, '不同审核员模型不误用主模型专属映射');
+    assert.deepEqual(updatedGroup.thinkingLevelMap, { xhigh: 'max' }, '自定义映射应通过设置 API 保存');
+    assert.equal(updatedGroup.apiKey, undefined, '更新响应不泄露明文 KEY');
+    assert.equal(updatedGroup.apiKeyCipher, undefined, '更新响应不泄露密文 KEY');
+    assert.equal(activeGroup(rig.ctx)?.apiKey, 'sk-very-secret', '修改推理等级不破坏加密密钥');
+    const switchedModel = await app.request(`/settings/orchestrator/groups/${group.id}`, {
+      method: 'PUT',
+      headers: H(),
+      body: JSON.stringify({ model: 'gpt-6-next' }),
+    });
+    assert.equal(switchedModel.status, 200);
+    const switchedGroup = (await switchedModel.json() as { group: { thinkingLevel?: string; thinkingLevelMap?: Record<string, string | null> } }).group;
+    assert.equal(switchedGroup.thinkingLevelMap, undefined, '切换模型必须清掉旧模型的推理映射');
+    assert.equal(switchedGroup.thinkingLevel, 'xhigh', '切换模型保留用户选定 Pi 档位');
   } finally {
+    rig.cleanup();
+  }
+});
+test('T10: thinking-tier probe requires confirmation and uses only the saved model-group target', async () => {
+  const rig = mkRig();
+  const requests: { url: string; authorization: string | undefined; body: Record<string, unknown> }[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on('end', () => {
+      requests.push({
+        url: req.url ?? '',
+        authorization: req.headers.authorization,
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>,
+      });
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'reasoning_effort must be one of low, high, max' } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const app = createApp(rig.ctx);
+    const worker = registerAgent(rig.ctx, { name: '工蜂', handle: 'thinking-probe-worker' });
+    const port = (server.address() as AddressInfo).port;
+    const created = await app.request('/settings/orchestrator/groups', {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({
+        name: 'local probe',
+        baseURL: `http://127.0.0.1:${port}/v1`,
+        apiKey: 'sk-probe-saved',
+        model: 'exact-model',
+      }),
+    });
+    assert.equal(created.status, 201);
+    const { group } = (await created.json()) as { group: { id: string } };
+    const path = `/settings/orchestrator/groups/${group.id}/thinking-probe`;
+
+    const unconfirmed = await app.request(path, { method: 'POST', headers: H(), body: '{}' });
+    assert.equal(unconfirmed.status, 400, '未确认时拒绝触发可能计费的请求');
+    const forbidden = await app.request(path, { method: 'POST', headers: H(worker.token), body: JSON.stringify({ confirmed: true }) });
+    assert.equal(forbidden.status, 403, 'worker 不能调用探测');
+    assert.equal(requests.length, 0, '拒绝请求不能接触上游');
+
+    const result = await app.request(path, {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({ confirmed: true, endpoint: 'https://attacker.invalid', apiKey: 'sk-injected', model: 'other-model' }),
+    });
+    assert.equal(result.status, 200);
+    const resultBody = await result.json();
+    assert.deepEqual(resultBody, { status: 'tiers', tiers: ['low', 'high', 'max'], source: 'rejection' });
+    assert.equal((JSON.stringify(resultBody) ?? '').includes('sk-probe-saved'), false, '响应不得泄露组 API Key');
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.url, '/v1/chat/completions');
+    assert.equal(requests[0]?.authorization, 'Bearer sk-probe-saved');
+    assert.equal(requests[0]?.body.model, 'exact-model', '探测目标必须取配置组，而非请求体覆盖值');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rig.cleanup();
+  }
+});
+
+test('T10: retains exact model metadata per key without trusting an unverified proxy', async () => {
+  const rig = mkRig();
+  let modelsCalls = 0;
+  const chatBodies: Record<string, unknown>[] = [];
+  const server = createServer((req, res) => {
+    if (req.url === '/meta/v1/models') {
+      modelsCalls += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'exact-model', effort: { supported_levels: ['low', 'high', 'max'] } }] }));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on('end', () => {
+      chatBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>);
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'reasoning_effort must be one of low, high, max' } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const app = createApp(rig.ctx);
+    const baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}/meta/v1`;
+    const createGroup = async (model: string) => {
+      const response = await app.request('/settings/orchestrator/groups', {
+        method: 'POST',
+        headers: H(),
+        body: JSON.stringify({ name: model, baseURL, apiKey: 'sk-metadata-probe', model }),
+      });
+      assert.equal(response.status, 201);
+      return (await response.json() as { group: { id: string } }).group;
+    };
+    const exact = await createGroup('exact-model');
+    const modelList = await app.request(`/settings/orchestrator/models?group=${exact.id}`);
+    assert.equal(modelList.status, 200);
+    assert.deepEqual(getCachedOrchestratorModelMetadata(rig.ctx, exact.id, 'exact-model'), {
+      id: 'exact-model',
+      effort: { supported_levels: ['low', 'high', 'max'] },
+    });
+    assert.equal(getCachedOrchestratorModelMetadata(rig.ctx, exact.id, 'different-model'), undefined);
+    const metadataResult = await app.request(`/settings/orchestrator/groups/${exact.id}/thinking-probe`, {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({ confirmed: true }),
+    });
+    assert.deepEqual(await metadataResult.json(), {
+      status: 'tiers',
+      tiers: ['low', 'high', 'max'],
+      source: 'rejection',
+    }, '不可信代理的 /models 标签不能被当作官方能力证据');
+    assert.equal(modelsCalls, 1);
+    assert.equal(chatBodies.length, 1, '非官方主机的元数据不可作为能力结论');
+
+    const different = await createGroup('different-model');
+    assert.equal(getCachedOrchestratorModelMetadata(rig.ctx, different.id, 'different-model'), undefined);
+    const fallback = await app.request(`/settings/orchestrator/groups/${different.id}/thinking-probe`, {
+      method: 'POST',
+      headers: H(),
+      body: JSON.stringify({ confirmed: true }),
+    });
+    assert.deepEqual(await fallback.json(), {
+      status: 'tiers',
+      tiers: ['low', 'high', 'max'],
+      source: 'rejection',
+    });
+    assert.equal(modelsCalls, 1, '复用短期模型目录缓存');
+    assert.equal(chatBodies.length, 2, '不同模型不能复用 exact-model 的能力元数据');
+    assert.equal(chatBodies[1]?.model, 'different-model');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     rig.cleanup();
   }
 });
@@ -182,6 +350,7 @@ test('T10: 旧单配置迁移——顶层 provider/baseURL/model/apiKeyCipher �
     assert.equal(view.groups[0].baseURL, 'https://legacy.example/v1');
     assert.equal(view.groups[0].model, 'gpt-legacy');
     assert.equal(view.groups[0].apiKeySet, true, 'apiKeySet 保留');
+    assert.equal(view.groups[0].thinkingLevel, 'off', '迁移旧模型组维持原有思考关闭行为');
     assert.equal(view.activeGroupId, 'default');
     assert.equal(view.enabled, true, 'enabled 保留');
     assert.equal(listEvents(rig.ctx, { type: 'settings.groups_migrated', limit: 5 }).length, 1);

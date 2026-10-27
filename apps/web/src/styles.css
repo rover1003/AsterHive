@@ -267,7 +267,7 @@ code { background: var(--secondary); padding: 1px 6px; border-radius: 4px; font-
 
 /* 聊天面板：固定比例的窄栏（用户终裁：聊天收窄、看板放宽），气泡贴容器边 */
 .chat-panel {
-  width: 50%; min-width: 380px; flex-shrink: 0;
+  width: 56%; min-width: 420px; flex-shrink: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -457,6 +457,29 @@ time { font-size: 11px; color: var(--subtle-foreground); }
   font-size: 13px; cursor: pointer; flex-shrink: 0;
 }
 .composer-target:focus-visible { outline: none; border: none; box-shadow: none; }
+.composer-controls {
+  display: flex; align-items: end; flex-wrap: wrap; gap: 8px 12px;
+  padding: 8px 4px 0; min-width: 0;
+}
+.composer-control { display: flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 11px; }
+.composer-control select { height: 28px; min-width: 92px; max-width: 190px; padding: 0 22px 0 8px; font-size: 12px; }
+.composer-control:nth-child(2) select { min-width: 130px; }
+.composer-settings-status { flex: 1 1 160px; min-width: 0; }
+.composer-probe { flex: 0 0 auto; }
+.composer-thinking-map { flex: 1 0 100%; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 4px 0; border-top: 1px solid var(--border); }
+.composer-thinking-map[hidden] { display: none; }
+.composer-map-row { display: flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 11px; }
+.composer-map-row select { height: 28px; min-width: 110px; max-width: 180px; padding: 0 22px 0 8px; font-size: 12px; }
+@media (max-width: 600px) {
+  .composer { padding: 8px 8px 12px; }
+  .composer-row { flex-wrap: wrap; gap: 6px; padding: 8px; }
+  .composer-target { max-width: 100%; }
+  .composer-input { flex-basis: calc(100% - 40px); order: 1; }
+  .composer-send { order: 2; margin-left: auto; }
+  .composer-controls { gap: 8px; }
+  .composer-control { flex: 1 1 140px; justify-content: space-between; }
+  .composer-control select { flex: 1; max-width: none; }
+}
 /* 输入框：无边框透明底，1-3 行自适应（JS 撑高，CSS 兜底封顶） */
 .composer-input {
   flex: 1; min-width: 0;
@@ -732,3 +755,33 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 .oc-active-badge { margin-left: 8px; font-size: 12px; color: var(--primary); border: 1px solid var(--primary); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .oc-group-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
 .oc-group-form { border-top: 1px dashed var(--border); padding-top: 14px; }
+@media (max-width: 600px) {
+  .sidebar { width: 56px; padding: 8px 4px; }
+  .brand { padding: 8px 0 16px; text-align: center; font-size: 0; }
+  .brand svg.i { margin: 0; }
+  .brand span { display: none; }
+  .sidebar nav { align-items: stretch; overflow-y: auto; }
+  .nav-item { position: relative; width: 40px; justify-content: center; padding: 0; font-size: 0; }
+  .nav-item .chev { display: none; }
+  .nav-item:hover, .nav-item:focus-visible { z-index: 5; width: 200px; justify-content: flex-start; padding: 0 12px; font-size: 14px; background: var(--card); box-shadow: var(--shadow-md); }
+  .nav-sub { display: flex; margin: 4px 0 8px; }
+  .nav-sub-item { width: 40px; margin-left: 0; padding: 0; font-size: 0; }
+  .nav-sub-item:hover, .nav-sub-item:focus-visible { z-index: 5; width: 200px; padding-left: 22px; font-size: 12.5px; overflow: visible; background: var(--card); box-shadow: var(--shadow-md); }
+  .nav-item .chev { display: none; }
+  .conn { padding: 8px 0; text-align: center; font-size: 0; }
+  .dot { margin-right: 0; }
+  .main { min-width: 0; padding: 8px; }
+  .workbench { gap: 8px; }
+  .chat-panel { width: auto; min-width: 0; max-width: none; flex: 1; }
+  .composer-target { flex: 1 1 100%; min-width: 0; max-width: none; order: 0; }
+  .composer-input { flex: 1 1 calc(100% - 40px); width: 100%; order: 1; }
+  .composer-send { order: 2; margin-left: auto; }
+  .composer-controls { padding-left: 0; padding-right: 0; }
+  .composer-control { flex: 1 1 100%; min-width: 0; }
+  .composer-control select { min-width: 0; }
+  .composer-settings-status { flex-basis: 100%; }
+  .composer-thinking-map { padding-left: 0; padding-right: 0; }
+  .composer-map-row { flex: 1 1 100%; justify-content: space-between; }
+  .composer-map-row select { flex: 1; max-width: none; min-width: 0; }
+  .nav-agents-empty { width: 40px; margin-left: 0; padding: 0; overflow: hidden; font-size: 0; }
+}

@@ -40,6 +40,7 @@ import {
   addDependencies,
   type Lane,
   type Priority,
+  cancelTask,
 } from './tasks.ts';
 import { claimTask, nextTask, checkpointTask, releaseTask, submitTask } from './verbs.ts';
 import { createMessage, listMessages, inboxFor, dispatchTask, type MessageKind } from './messages.ts';
@@ -53,7 +54,10 @@ import {
   switchOrchestratorGroup,
   listOrchestratorModels,
   testOrchestratorModel,
+  getThinkingProbeTarget,
+  getCachedOrchestratorModelMetadata,
 } from './settings.ts';
+import { discoverThinkingTiers } from '../../../packages/sdk/src/thinking-discovery.ts';
 import { getUserStatus, renameUser, ensureUserAgent } from './user.ts';
 import { mountMcp } from './mcp.ts';
 import { PiRuntimeManager } from './pi-runtime.ts';
@@ -561,6 +565,12 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json({ task });
   });
 
+  app.post('/tasks/:id/cancel', async (c) => {
+    const actor = requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+    return c.json({ task: await cancelTask(ctx, actor, c.req.param('id'), body.reason ?? '') });
+  });
+
   // managed 模式：Worker 领取任务代码快照 Bundle
   app.get('/tasks/:id/repo-snapshot', async (c) => {
     const actor = requireActor(ctx, c);
@@ -782,6 +792,19 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     );
   });
 
+  // 单次思考等级探测：只允许用户主动确认，并仅使用已保存模型组的 endpoint/model/key。
+  app.post('/settings/orchestrator/groups/:id/thinking-probe', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (body.confirmed !== true) throw new HttpError(400, '思考等级探测可能产生上游费用；请明确确认后重试。');
+    const target = getThinkingProbeTarget(ctx, c.req.param('id'));
+    const modelMetadata = getCachedOrchestratorModelMetadata(ctx, c.req.param('id'), target.model);
+    return c.json(await discoverThinkingTiers({
+      ...target,
+      ...(modelMetadata !== undefined ? { modelMetadata } : {}),
+    }));
+  });
+
   // ---- 模型组 CRUD（每组独立 name/baseURL/apiKey/model；授权同全局开关）----
 
   app.post('/settings/orchestrator/groups', async (c) => {
@@ -792,6 +815,8 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       baseURL: body.baseURL === undefined ? undefined : String(body.baseURL),
       apiKey: body.apiKey === undefined ? undefined : String(body.apiKey),
       model: body.model === undefined ? undefined : String(body.model),
+      thinkingLevel: body.thinkingLevel,
+      thinkingLevelMap: body.thinkingLevelMap,
     });
     return c.json({ group }, 201);
   });
@@ -805,6 +830,8 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       baseURL: body.baseURL === undefined ? undefined : String(body.baseURL),
       apiKey: body.apiKey === undefined ? undefined : String(body.apiKey),
       model: body.model === undefined ? undefined : String(body.model),
+      thinkingLevel: body.thinkingLevel,
+      thinkingLevelMap: body.thinkingLevelMap,
     });
     return c.json({ group });
   });

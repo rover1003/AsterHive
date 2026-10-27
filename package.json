@@ -15,7 +15,7 @@
     "dev": "npm run dev -w apps/server",
     "start": "npm run start -w apps/server",
     "typecheck": "tsc --noEmit -p apps/server && tsc --noEmit -p apps/web && tsc --noEmit -p packages/sdk && tsc --noEmit -p apps/worker-zcode",
-    "test": "node --test \"apps/server/test/*.test.ts\" \"apps/worker-zcode/test/*.test.ts\""
+    "test": "node --test \"apps/server/test/*.test.ts\" \"apps/worker-zcode/test/*.test.ts\" \"packages/sdk/test/*.test.ts\""
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

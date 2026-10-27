@@ -46,7 +46,8 @@ $existingToken = $null
 $existingHandle = $null
 $existingBaseURL = $null
 $existingApiKey = $null
-$existingModel = $null
+$existingThinkingLevel = $null
+$existingThinkingMap = $null
 
 if (Test-Path $TokenFile) {
   try {
@@ -64,6 +65,8 @@ if (Test-Path $ConfigFile) {
       $existingBaseURL = [string]$cfg.model.baseURL
       $existingApiKey = [string]$cfg.model.apiKey
       $existingModel = [string]$cfg.model.model
+      $existingThinkingLevel = [string]$cfg.model.thinkingLevel
+      $existingThinkingMap = $cfg.model.thinkingLevelMap
     }
   } catch {}
 }
@@ -265,12 +268,62 @@ if (-not $pick -and $existingModel) {
 if (-not $modelId) { Die '未选择模型。' }
 Log "已选择：$modelId"
 
+Write-Host '本机有限次档位探测会请求模型供应商，可能产生费用。'
+$probeChoice = Read-Host '是否探测该模型的思考档位？[y/N]'
+  $discoveryResult = $null
+  if ($probeChoice -match '^(y|yes)$') {
+    $previousProbeKey = $env:WORKER_PI_API_KEY
+    try {
+      $env:WORKER_PI_API_KEY = $apiKey
+      $discoveryScript = Join-Path $AppDir 'apps\worker-zcode\src\thinking-discovery.ts'
+      $discoveryOutput = & $NodeExe --experimental-strip-types $discoveryScript --discover $baseURL $modelId
+      if ($LASTEXITCODE -eq 0) { try { $discoveryResult = ($discoveryOutput | Out-String | ConvertFrom-Json) } catch {} }
+      if (-not $discoveryResult -or $discoveryResult.status -eq 'unknown') { Warn '未能识别档位；可继续手动选择/配置。' }
+      else { Log "本机探测到上游档位：$($discoveryResult.tiers -join ', ')" }
+    } finally {
+      $env:WORKER_PI_API_KEY = $previousProbeKey
+    }
+  }
+  $modelIdentityChanged = $existingModel -and ($existingModel -ne $modelId -or $existingBaseURL -ne $baseURL)
+  if ($modelIdentityChanged) {
+    Warn '模型或 endpoint 已变更；不继承旧思考标签映射。'
+    $existingThinkingMap = $null
+    $existingThinkingLevel = $null
+  }
+  $currentThinking = if ($existingThinkingLevel) { $existingThinkingLevel } else { 'medium' }
+  Write-Host "可选思考等级：$($thinkingLevels -join ', ')（升级回车保留 [$currentThinking]）"
+  $thinkingPick = Read-Host '思考等级'
+  $thinkingLevel = if (-not $thinkingPick) { $currentThinking } elseif ($thinkingLevels -contains $thinkingPick) { $thinkingPick } else { Die '无效思考等级。' }
+  $hasExistingLabel = $existingThinkingMap -and $existingThinkingMap.PSObject.Properties[$thinkingLevel]
+  if ($discoveryResult.status -eq 'tiers') {
+    if (-not $hasExistingLabel -and $discoveryResult.tiers -contains $thinkingLevel) {
+      if (-not $existingThinkingMap) { $existingThinkingMap = [PSCustomObject]@{} }
+      $existingThinkingMap | Add-Member -NotePropertyName $thinkingLevel -NotePropertyValue $thinkingLevel -Force
+      Log "已按精确匹配的探测标签应用映射：$thinkingLevel"
+    } elseif (-not $hasExistingLabel) {
+      Warn "探测到档位 [$($discoveryResult.tiers -join ', ')]，与所选 Pi 档位不同；不会猜测映射，请手动设置。"
+    }
+  }
+  $existingLabel = if ($hasExistingLabel) { $existingThinkingMap.$thinkingLevel } else { $null }
+  $labelPrompt = if ($null -ne $existingLabel) { "当前等级上游标签 [$existingLabel]（回车保留；standard=恢复标准；-=禁用）" } else { "当前等级上游标签（回车=标准；-=禁用）" }
+  $labelPick = Read-Host $labelPrompt
+  if ($labelPick -eq '-') {
+    if (-not $existingThinkingMap) { $existingThinkingMap = [PSCustomObject]@{} }
+    $existingThinkingMap | Add-Member -NotePropertyName $thinkingLevel -NotePropertyValue $null -Force
+  } elseif ($labelPick -eq 'standard') {
+    if ($existingThinkingMap) { $existingThinkingMap.PSObject.Properties.Remove($thinkingLevel) }
+  } elseif ($labelPick) {
+    if (-not $existingThinkingMap) { $existingThinkingMap = [PSCustomObject]@{} }
+    $existingThinkingMap | Add-Member -NotePropertyName $thinkingLevel -NotePropertyValue $labelPick -Force
+  }
+
+
 # ---- 4. 写注册与执行配置 ----
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 $cfgObj = @{
   url = $HiveUrl
   executor = 'pi'
-  model = @{ baseURL = $baseURL; apiKey = $apiKey; model = $modelId }
+  model = @{ baseURL = $baseURL; apiKey = $apiKey; model = $modelId; thinkingLevel = $thinkingLevel; thinkingLevelMap = $existingThinkingMap }
 }
 if ($reuseIdentity -and $existingToken) {
   $cfgObj['token'] = $existingToken

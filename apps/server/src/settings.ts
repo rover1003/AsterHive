@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync } from 'node:crypto';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { withWrite, logEvent } from './write.ts';
@@ -35,6 +35,44 @@ export interface OrchestratorWakeOn {
   scheduleDigest?: boolean;
 }
 
+export const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
+
+function thinkingLevelOf(g: OrchestratorGroup): ThinkingLevel {
+  return THINKING_LEVELS.includes(g.thinkingLevel as ThinkingLevel) ? (g.thinkingLevel as ThinkingLevel) : 'off';
+}
+
+function parseThinkingLevel(value: unknown): ThinkingLevel {
+  if (typeof value !== 'string' || !THINKING_LEVELS.includes(value as ThinkingLevel)) {
+    throw new HttpError(422, `thinkingLevel 必须是以下之一：${THINKING_LEVELS.join(', ')}`);
+  }
+  return value as ThinkingLevel;
+}
+
+function parseThinkingLevelMap(value: unknown): ThinkingLevelMap {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new HttpError(422, 'thinkingLevelMap 必须是 Pi 档位到上游标签的对象');
+  }
+  const map: ThinkingLevelMap = {};
+  for (const [key, rawLabel] of Object.entries(value)) {
+    if (!THINKING_LEVELS.includes(key as ThinkingLevel)) {
+      throw new HttpError(422, `thinkingLevelMap 包含无效 Pi 档位: ${key}`);
+    }
+    if (rawLabel === null) {
+      map[key as ThinkingLevel] = null;
+      continue;
+    }
+    if (typeof rawLabel !== 'string' || !rawLabel.trim()) {
+      throw new HttpError(422, `thinkingLevelMap.${key} 必须是非空上游标签或 null`);
+    }
+    map[key as ThinkingLevel] = rawLabel.trim();
+  }
+  return map;
+}
+
+// 新建组默认为 low；旧模型组无此字段时按旧行为 off 读取，不静默改变既有通道。
+//
 // 单个模型组（存储形态，含密文；密文永不离开服务端）
 export interface OrchestratorGroup {
   id: string;
@@ -42,6 +80,8 @@ export interface OrchestratorGroup {
   baseURL: string;
   model?: string;
   apiKeyCipher?: string;
+  thinkingLevel?: ThinkingLevel;
+  thinkingLevelMap?: ThinkingLevelMap;
 }
 
 interface StoredOrchestrator {
@@ -69,6 +109,8 @@ export interface OrchestratorGroupView {
   name: string;
   baseURL: string;
   model?: string;
+  thinkingLevel: ThinkingLevel;
+  thinkingLevelMap?: ThinkingLevelMap;
   apiKeySet: boolean;
 }
 
@@ -88,6 +130,8 @@ export interface ActiveOrchestratorGroup {
   name: string;
   baseURL: string;
   model?: string;
+  thinkingLevel: ThinkingLevel;
+  thinkingLevelMap?: ThinkingLevelMap;
   apiKey: string | null; // 未设置或解不开 → null（主脑不启动轮次）
   apiKeySet: boolean;    // 密文在场（与解密是否成功无关，供 UI 展示）
   enabled: boolean;      // 主脑总开关随组一起给出，调用方少读一次
@@ -147,6 +191,8 @@ function projectGroup(g: OrchestratorGroup): OrchestratorGroupView {
     name: g.name,
     baseURL: g.baseURL,
     ...(g.model !== undefined ? { model: g.model } : {}),
+    thinkingLevel: thinkingLevelOf(g),
+    ...(g.thinkingLevelMap ? { thinkingLevelMap: g.thinkingLevelMap } : {}),
     apiKeySet: !!g.apiKeyCipher,
   };
 }
@@ -277,12 +323,14 @@ export function activeGroup(ctx: Ctx): ActiveOrchestratorGroup | null {
     name: g.name,
     baseURL: g.baseURL,
     ...(g.model !== undefined ? { model: g.model } : {}),
+    thinkingLevel: thinkingLevelOf(g),
+    ...(g.thinkingLevelMap ? { thinkingLevelMap: g.thinkingLevelMap } : {}),
     apiKeySet: !!g.apiKeyCipher,
     apiKey: g.apiKeyCipher ? decryptGroupApiKey(ctx, g.id) : null,
     enabled: st.enabled ?? false,
   };
-}
 
+}
 // 独立审核员（Reviewer Profile）运行时消费入口：
 // 若 reviewerGroupId 有值且找到有效组，则使用该组；否则自动回退到主脑激活组（activeGroup）。
 // 组内模型优先取 reviewerModel（审核员在组清单里任选），未设则用组当前 model。
@@ -296,6 +344,8 @@ export function reviewerGroup(ctx: Ctx): ActiveOrchestratorGroup | null {
       name: g.name,
       baseURL: g.baseURL,
       ...(model !== undefined ? { model } : {}),
+      thinkingLevel: thinkingLevelOf(g),
+      ...(model === g.model && g.thinkingLevelMap ? { thinkingLevelMap: g.thinkingLevelMap } : {}),
       apiKeySet: !!g.apiKeyCipher,
       apiKey: g.apiKeyCipher ? decryptGroupApiKey(ctx, g.id) : null,
       enabled: st.enabled ?? false,
@@ -303,6 +353,16 @@ export function reviewerGroup(ctx: Ctx): ActiveOrchestratorGroup | null {
   }
   return activeGroup(ctx);
 }
+export function getThinkingProbeTarget(ctx: Ctx, groupId: string): { endpoint: string; model: string; apiKey: string } {
+  const st = loadOrchestrator(ctx);
+  const group = st.groups?.find((item) => item.id === groupId);
+  if (!group) throw new HttpError(404, `模型组不存在: ${groupId}`);
+  if (!group.model) throw new HttpError(422, '请先为模型组选择模型，再探测思考等级');
+  const apiKey = decryptGroupApiKey(ctx, group.id);
+  if (!apiKey) throw new HttpError(422, '模型组 API Key 未设置或无法解密');
+  return { endpoint: group.baseURL, model: group.model, apiKey };
+}
+
 
 // 运行时解密指定组的 apiKey（groupId 缺省 = 激活组）。返回前可能触发 enc_secret 建立/
 // 旧 env 密文迁移：迁移判定不可解时密文已被置空（settings.apiKey_reset），重读后按未设置处理。
@@ -379,7 +439,7 @@ function newGroupId(existing: OrchestratorGroup[]): string {
 // 自动激活即主脑可用配置变化 → 必发 settings.orchestrator_updated（brain 侧 disposeSession 闭环）。
 export function createOrchestratorGroup(
   ctx: Ctx,
-  input: { name?: string; baseURL?: string; apiKey?: string; model?: string },
+  input: { name?: string; baseURL?: string; apiKey?: string; model?: string; thinkingLevel?: unknown; thinkingLevelMap?: unknown },
 ): OrchestratorGroupView {
   const name = input.name?.trim();
   const baseURL = input.baseURL?.trim();
@@ -387,9 +447,15 @@ export function createOrchestratorGroup(
   if (!baseURL) throw new HttpError(422, 'Base URL 必填');
   const st = loadOrchestrator(ctx);
   const groups = st.groups ?? [];
-  const group: OrchestratorGroup = { id: newGroupId(groups), name, baseURL };
+  const group: OrchestratorGroup = {
+    id: newGroupId(groups),
+    name,
+    baseURL,
+    thinkingLevel: input.thinkingLevel === undefined ? 'low' : parseThinkingLevel(input.thinkingLevel),
+  };
   const model = input.model?.trim();
   if (model) group.model = model;
+  if (input.thinkingLevelMap !== undefined) group.thinkingLevelMap = parseThinkingLevelMap(input.thinkingLevelMap);
   if (input.apiKey) group.apiKeyCipher = encrypt(input.apiKey, resolveSecret(ctx)); // 首个 KEY 即建立 enc_secret
   const autoActivate = groups.length === 0;
   const next: StoredOrchestrator = {
@@ -416,7 +482,7 @@ export function createOrchestratorGroup(
 export function updateOrchestratorGroup(
   ctx: Ctx,
   id: string,
-  input: { name?: string; baseURL?: string; apiKey?: string; model?: string },
+  input: { name?: string; baseURL?: string; apiKey?: string; model?: string; thinkingLevel?: unknown; thinkingLevelMap?: unknown },
 ): OrchestratorGroupView {
   const st = loadOrchestrator(ctx);
   const groups = st.groups ?? [];
@@ -450,6 +516,26 @@ export function updateOrchestratorGroup(
     } else if (g.model !== undefined) {
       delete g.model; // 显式空串 = 清除模型
       changed.push('model');
+    }
+  }
+  if ((changed.includes('model') || changed.includes('baseURL')) && input.thinkingLevelMap === undefined && g.thinkingLevelMap !== undefined) {
+    delete g.thinkingLevelMap;
+    changed.push('thinkingLevelMap');
+  }
+  if (input.thinkingLevel !== undefined) {
+    const level = parseThinkingLevel(input.thinkingLevel);
+    if (level !== thinkingLevelOf(g)) {
+      g.thinkingLevel = level;
+      changed.push('thinkingLevel');
+    }
+  }
+  if (input.thinkingLevelMap !== undefined) {
+    const map = parseThinkingLevelMap(input.thinkingLevelMap);
+    const normalized = Object.keys(map).length ? map : undefined;
+    if (JSON.stringify(normalized ?? {}) !== JSON.stringify(g.thinkingLevelMap ?? {})) {
+      if (normalized) g.thinkingLevelMap = normalized;
+      else delete g.thinkingLevelMap;
+      changed.push('thinkingLevelMap');
     }
   }
   if (input.apiKey) {
@@ -521,7 +607,13 @@ export function switchOrchestratorGroup(ctx: Ctx, groupId: string): Orchestrator
 // 与其让用户盲填模型名，不如把 /models 清单拉出来供选择 + 一键探测当前可用性。
 
 const MODEL_LIST_TTL_MS = 60_000;
+
 const modelListCache = new Map<string, { at: number; ids: string[] }>();
+const modelMetadataCache = new Map<string, { at: number; byId: Map<string, unknown> }>();
+
+function metadataCacheKey(baseURL: string, apiKey: string): string {
+  return createHash('sha256').update(baseURL).update('\0').update(apiKey).digest('hex');
+}
 
 function trimBase(baseURL: string): string {
   return baseURL.replace(/\/+$/, '');
@@ -535,6 +627,29 @@ function resolveTargetGroup(ctx: Ctx, groupId?: string): OrchestratorGroup {
     throw new HttpError(groupId ? 404 : 422, groupId ? `模型组不存在: ${groupId}` : '未配置任何模型组');
   }
   return g;
+}
+
+function reasoningMetadataRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  if (typeof source.id !== 'string' || !source.id) return undefined;
+  const metadata: Record<string, unknown> = { id: source.id };
+  const sourceCapabilities = source.capabilities;
+  if (sourceCapabilities && typeof sourceCapabilities === 'object' && !Array.isArray(sourceCapabilities)) {
+    const capabilities = sourceCapabilities as Record<string, unknown>;
+    const selected: Record<string, unknown> = {};
+    if (Array.isArray(capabilities.reasoning_effort)) selected.reasoning_effort = capabilities.reasoning_effort;
+    if (typeof capabilities.default_reasoning_effort === 'string') {
+      selected.default_reasoning_effort = capabilities.default_reasoning_effort;
+    }
+    if (Object.keys(selected).length) metadata.capabilities = selected;
+  }
+  const sourceEffort = source.effort;
+  if (sourceEffort && typeof sourceEffort === 'object' && !Array.isArray(sourceEffort)) {
+    const supportedLevels = (sourceEffort as Record<string, unknown>).supported_levels;
+    if (Array.isArray(supportedLevels)) metadata.effort = { supported_levels: supportedLevels };
+  }
+  return Object.keys(metadata).length > 1 ? metadata : undefined;
 }
 
 export interface OrchestratorModelsResult {
@@ -563,13 +678,32 @@ export async function listOrchestratorModels(
     signal: AbortSignal.timeout(20_000),
   });
   if (!res.ok) throw new HttpError(502, `上游 /models 返回 ${res.status}`);
-  const json = (await res.json().catch(() => ({}))) as { data?: Array<{ id?: unknown }> };
-  const ids = (json.data ?? [])
-    .map((x) => String(x.id ?? ''))
-    .filter(Boolean)
-    .sort();
-  modelListCache.set(g.baseURL, { at: Date.now(), ids });
-  return { models: ids, fetchedAt: Date.now(), cached: false };
+  const json = (await res.json().catch(() => ({}))) as { data?: { id?: unknown }[] };
+  const records = json.data ?? [];
+  const metadataById = new Map<string, unknown>();
+  for (const record of records) {
+    const metadata = reasoningMetadataRecord(record);
+    if (typeof metadata?.id === 'string') metadataById.set(metadata.id, metadata);
+  }
+  const ids = records.map((record) => String(record.id ?? '')).filter(Boolean).sort();
+  const fetchedAt = Date.now();
+  modelListCache.set(g.baseURL, { at: fetchedAt, ids });
+  for (const [cacheKey, entry] of modelMetadataCache) {
+    if (fetchedAt - entry.at >= MODEL_LIST_TTL_MS) modelMetadataCache.delete(cacheKey);
+  }
+  modelMetadataCache.set(metadataCacheKey(g.baseURL, key), { at: fetchedAt, byId: metadataById });
+  return { models: ids, fetchedAt, cached: false };
+}
+
+export function getCachedOrchestratorModelMetadata(ctx: Ctx, groupId: string, model: string): unknown | undefined {
+  const group = resolveTargetGroup(ctx, groupId);
+  const apiKey = decryptGroupApiKey(ctx, group.id);
+  if (!apiKey) return undefined;
+  const cached = modelMetadataCache.get(metadataCacheKey(group.baseURL, apiKey));
+  if (!cached || Date.now() - cached.at >= MODEL_LIST_TTL_MS) return undefined;
+  const metadata = cached.byId.get(model);
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return undefined;
+  return (metadata as Record<string, unknown>).id === model ? metadata : undefined;
 }
 
 export interface OrchestratorTestResult {

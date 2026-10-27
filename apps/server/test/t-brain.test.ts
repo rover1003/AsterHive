@@ -66,9 +66,10 @@ function sseResponse(step: Step, id: string): string {
   return `${out}data: [DONE]\n\n`;
 }
 
-function startMock(): { server: Server; port: () => number; calls: () => number; systemPrompts: string[] } {
+function startMock(): { server: Server; port: () => number; calls: () => number; systemPrompts: string[]; requestBodies: Record<string, unknown>[] } {
   let n = 0;
   const systemPrompts: string[] = [];
+  const requestBodies: Record<string, unknown>[] = [];
   const server = createServer((req, res) => {
     if (req.method !== 'POST' || !(req.url ?? '').endsWith('/chat/completions')) {
       res.writeHead(404, { 'content-type': 'application/json' });
@@ -80,7 +81,8 @@ function startMock(): { server: Server; port: () => number; calls: () => number;
     req.on('end', () => {
       n += 1;
       try {
-        const request = JSON.parse(body) as { messages?: { role?: string; content?: unknown }[] };
+        const request = JSON.parse(body) as Record<string, unknown> & { messages?: { role?: string; content?: unknown }[] };
+        requestBodies.push(request);
         const promptMessages = request.messages?.filter((m) => m.role === 'system' || m.role === 'developer') ?? [];
         systemPrompts.push(promptMessages.map((m) => String(m.content ?? '')).join('\n'));
       } catch {
@@ -100,6 +102,7 @@ function startMock(): { server: Server; port: () => number; calls: () => number;
     port: () => (server.address() as AddressInfo).port,
     calls: () => n,
     systemPrompts,
+    requestBodies,
   };
 }
 
@@ -200,6 +203,7 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
     assert.ok(brainMsg.content.includes('已建卡'), `主脑消息内容不符：${brainMsg.content}`);
     assert.ok(brainMsg.mentions.includes('老板'));
     assert.ok(mock.systemPrompts.some((p) => p.includes('@老板')), 'Pi 系统提示必须注入当前用户 handle');
+    assert.equal(mock.requestBodies[0]?.reasoning_effort, 'low', 'Pi 发给上游的真实 OpenAI 兼容请求体必须带 reasoning_effort=low');
 
     // 台账关键事件齐全；mock 恰好被调 4 次（list_boards/create_task/message/收尾）
     const types = earlyTypes();
@@ -211,7 +215,45 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
     const started = listEvents(rig.ctx, { type: 'brain.turn_started', limit: 1 })[0];
     assert.equal(started.payload.groupName, 'mock 通道');
     assert.ok(typeof started.payload.groupId === 'string' && started.payload.groupId.startsWith('g'));
+    // 自定义映射必须穿过 Pi 序列化为上游 max 标签。
+    const finishedBeforeMap = listEvents(rig.ctx, { type: 'brain.turn_finished', limit: 10 }).length;
+    const mappedLevel = await app.request(`/settings/orchestrator/groups/${started.payload.groupId}`, {
+      method: 'PUT',
+      headers: httpHeaders(),
+      body: JSON.stringify({ thinkingLevel: 'xhigh', thinkingLevelMap: { xhigh: 'max' } }),
+    });
+    assert.equal(mappedLevel.status, 200);
+    const mappedPost = await app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: httpHeaders(),
+      body: JSON.stringify({ content: '@主脑 使用新等级' }),
+    });
+    assert.equal(mappedPost.status, 201);
+    for (let i = 0; i < 300 && listEvents(rig.ctx, { type: 'brain.turn_finished', limit: 10 }).length <= finishedBeforeMap; i++) {
+      await sleep(200);
+    }
+    assert.equal(mock.calls(), 5);
+    assert.equal(mock.requestBodies[4]?.reasoning_effort, 'max', 'Pi xhigh 按显式模型组映射序列化为上游 max');
 
+    // 单独关闭思考后再重建 Pi session；真实请求体应不再包含 reasoning_effort。
+    const finishedBeforeOff = listEvents(rig.ctx, { type: 'brain.turn_finished', limit: 10 }).length;
+    const offLevel = await app.request(`/settings/orchestrator/groups/${started.payload.groupId}`, {
+      method: 'PUT',
+      headers: httpHeaders(),
+      body: JSON.stringify({ thinkingLevel: 'off' }),
+    });
+    assert.equal(offLevel.status, 200);
+    const offPost = await app.request('/boards/b/messages', {
+      method: 'POST',
+      headers: httpHeaders(),
+      body: JSON.stringify({ content: '@主脑 请继续' }),
+    });
+    assert.equal(offPost.status, 201);
+    for (let i = 0; i < 300 && listEvents(rig.ctx, { type: 'brain.turn_finished', limit: 10 }).length <= finishedBeforeOff; i++) {
+      await sleep(200);
+    }
+    assert.equal(mock.calls(), 6, '设置 off 后应重建 session 并完成下一次上游请求');
+    assert.equal(mock.requestBodies[5]?.reasoning_effort, undefined, 'thinkingLevel=off 不向上游发送 reasoning_effort');
     // ---- worker 语义不受影响：领卡/交活动词照常 ----
     const bee = registerAgent(rig.ctx, { name: '工蜂', handle: 'bee' });
     createTask(rig.ctx, 'b', { id: 'T1', title: '执行卡', lane: 'Ready' });

@@ -98,7 +98,7 @@ export function getFleetRadar(ctx: Ctx): FleetRadarReport {
   // 阈值：任务进行超过 15 分钟，且自最近一次 checkpoint 以来无进展超过 10 分钟
   const alerts: StagnationAlert[] = [];
   const activeTasks = ctx.holder.db
-    .prepare("SELECT * FROM task WHERE lane = 'InProgress' AND assignee != 'unassigned'")
+    .prepare("SELECT * FROM task WHERE status='active' AND lane = 'InProgress' AND assignee != 'unassigned'")
     .all() as {
       id: string;
       title: string;

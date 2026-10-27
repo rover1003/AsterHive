@@ -170,8 +170,8 @@ function assistantToolCalls(message: StreamAssistantMessage): BrainToolActivity[
 // ---- 主脑系统提示（角色纪律）----
 
 const BRAIN_SYSTEM_PROMPT = (userHandle: string) => `你是 AsterHive（星巢）的内置蜂后 Queen（保留句柄 @主脑、@Queen、@蜂后）——整个蜂群的大脑、唯一的调度者与验收者。
-执行节点统称为「工蜂 Worker Bee」，可使用各自唯一 handle 调度，或使用 @Bee / @工蜂 广播。
-当前用户的自定义称呼/handle 是「${userHandle}」；向用户发送聊天室消息时必须使用 @${userHandle}，不要写死 @user。若用户改名，下轮会提供新的 handle。向工蜂发消息可使用其具体 handle 或 @Bee。
+执行节点统称为「工蜂 Worker Bee」，只能使用各自唯一 handle 定向沟通，不存在全体工蜂广播句柄。
+当前用户的自定义称呼/handle 是「${userHandle}」；向用户发送聊天室消息时必须使用 @${userHandle}，不要写死 @user。向工蜂发消息须使用其具体 handle。
 你的产出只有五种：追问、任务卡、分派、验收结论、汇报。其余一切都不是你的工作。
 
 ## 身份边界（结构性约束，不是自觉）
@@ -469,6 +469,13 @@ function brainResourceLoader(loader: ResourceLoader, userHandle: string): Resour
     extendResources: (paths) => loader.extendResources(paths),
     reload: (options) => loader.reload(options),
   };
+}
+
+function piThinkingLevelMap(group: ActiveOrchestratorGroup): NonNullable<ActiveOrchestratorGroup['thinkingLevelMap']> {
+  const map: NonNullable<ActiveOrchestratorGroup['thinkingLevelMap']> = { ...group.thinkingLevelMap };
+  const level = group.thinkingLevel;
+  if ((level === 'xhigh' || level === 'max') && map[level] === undefined) map[level] = level;
+  return map;
 }
 
 type PiModule = typeof import('@earendil-works/pi-coding-agent');
@@ -795,7 +802,18 @@ export class Brain {
       baseUrl: group.baseURL,
       apiKey: group.apiKey!,
       api: 'openai-completions',
-      models: [{ type: 'chat', id: group.model!, name: group.model!, reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 8_192 }],
+      models: [{
+        type: 'chat',
+        id: group.model!,
+        name: group.model!,
+        reasoning: group.thinkingLevel !== 'off',
+        thinkingLevelMap: piThinkingLevelMap(group),
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8_192,
+        compat: { supportsReasoningEffort: true },
+      }],
     });
     const model = modelRuntime.getModel('asterhive-reviewer', group.model!);
     if (!model) throw new Error(`reviewer provider has no model ${group.model}`);
@@ -815,7 +833,7 @@ export class Brain {
       reload: async () => {},
     };
     const { session } = await pi.createAgentSession({
-      cwd: workspace, agentDir, model, modelRuntime, thinkingLevel: 'off', resourceLoader,
+      cwd: workspace, agentDir, model, modelRuntime, thinkingLevel: group.thinkingLevel === 'off' ? undefined : group.thinkingLevel, resourceLoader,
       settingsManager: pi.SettingsManager.inMemory({}),
       sessionManager: pi.SessionManager.inMemory(workspace),
       noTools: 'all',
@@ -1092,7 +1110,7 @@ export class Brain {
   async #ensureSession(g: ActiveOrchestratorGroup, userHandle: string): Promise<AgentSession> {
     const rt = this.#runtime.ensureRuntimeEntry(); // 数据卷优先，回落仓库基线；包不完整直接报错
     // 指纹含密钥和用户 handle：换组/URL/KEY/模型/用户名均重建 system prompt 会话
-    const key = JSON.stringify([rt.entryUrl, g.baseURL, g.model, g.apiKey, userHandle]);
+    const key = JSON.stringify([rt.entryUrl, g.baseURL, g.model, g.apiKey, g.thinkingLevel, g.thinkingLevelMap, userHandle]);
     if (this.#session && key === this.#sessionKey) return this.#session;
     this.#disposeSession();
 
@@ -1119,11 +1137,13 @@ export class Brain {
           type: 'chat',
           id: g.model!,
           name: g.model!,
-          reasoning: false,
+          reasoning: g.thinkingLevel !== 'off',
+          thinkingLevelMap: piThinkingLevelMap(g),
           input: ['text'],
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 128_000,
           maxTokens: 8_192,
+          compat: { supportsReasoningEffort: true },
         },
       ],
     });
@@ -1148,7 +1168,7 @@ export class Brain {
       agentDir,
       model,
       modelRuntime,
-      thinkingLevel: 'off',
+      thinkingLevel: g.thinkingLevel === 'off' ? undefined : g.thinkingLevel,
       resourceLoader: brainResourceLoader(loader, userHandle), // 系统提示词含当前用户自定义 @handle
       settingsManager: pi.SettingsManager.inMemory({}),
       sessionManager: pi.SessionManager.continueRecent(workspace, sessionsDir),

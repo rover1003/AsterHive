@@ -5,6 +5,7 @@ import { withWrite, logEvent } from './write.ts';
 import { messageInner } from './messages.ts';
 import { getAgent, type Agent } from './agents.ts';
 
+import { withTaskIntegrationLock } from './task-integration-lock.ts';
 export const LANES = ['Backlog', 'Ready', 'InProgress', 'Review', 'Done'] as const;
 export type Lane = (typeof LANES)[number];
 export type Priority = 'P0' | 'P1' | 'P2';
@@ -50,6 +51,7 @@ export interface Task {
   title: string;
   detail: string;
   lane: Lane;
+  status: 'active' | 'cancelled';
   assignee: string;
   dependsOn: string[];
   priority: Priority;
@@ -100,6 +102,7 @@ type TaskRow = {
   auto_unblocked_at: number | null;
   created_at: number;
   updated_at: number;
+  status: Task['status'];
 };
 
 export function parseRequirements(raw: string | undefined | null): TaskRequirements {
@@ -173,6 +176,7 @@ function rowToTask(r: TaskRow): Task {
     reads: JSON.parse(r.reads ?? '[]') as string[],
     evidence: JSON.parse(r.evidence) as Task['evidence'],
     protectedPaths: JSON.parse(r.protected_paths) as string[],
+    status: r.status ?? 'active',
     requirements: parseRequirements(r.requirements),
     reviewStatus: r.review_status ?? 'none',
     reviewAttempts: r.review_attempts ?? 0,
@@ -444,11 +448,12 @@ function requireTaskRow(ctx: Ctx, id: string): TaskRow {
 export function listTasks(
   ctx: Ctx,
   boardId: string,
-  opts: { lane?: Lane; assignee?: string } = {},
+  opts: { lane?: Lane; assignee?: string; includeCancelled?: boolean } = {},
 ): Task[] {
   getBoard(ctx, boardId); // 404 if missing
   const conds = ['board_id = ?'];
   const args: unknown[] = [boardId];
+  if (!opts.includeCancelled) conds.push("status = 'active'");
   if (opts.lane) {
     conds.push('lane = ?');
     args.push(opts.lane);
@@ -467,7 +472,7 @@ function depsDone(ctx: Ctx, dependsOn: string[]): boolean {
   if (dependsOn.length === 0) return true;
   const marks = ctx.holder.db
     .prepare(
-      `SELECT id, CASE WHEN lane = 'Done' THEN 1 ELSE 0 END AS done FROM task WHERE id IN (${dependsOn.map(() => '?').join(',')})`,
+      `SELECT id, CASE WHEN status='active' AND lane = 'Done' THEN 1 ELSE 0 END AS done FROM task WHERE id IN (${dependsOn.map(() => '?').join(',')})`,
     )
     .all(...(dependsOn as unknown as [])) as { id: string; done: number }[];
   if (marks.length !== dependsOn.length) return false; // 有依赖不存在（创建时已校验，此为兜底）
@@ -483,7 +488,7 @@ function assertWip(ctx: Ctx, boardId: string, lane: Lane, excludeTaskId: string)
   const limit = wipLimitFor(ctx, boardId, lane);
   if (!Number.isFinite(limit)) return;
   const row = ctx.holder.db
-    .prepare('SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND lane = ? AND id != ?')
+    .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND status='active' AND lane = ? AND id != ?")
     .get(boardId, lane, excludeTaskId) as { n: number };
   if (row.n >= limit) {
     throw new HttpError(409, `WIP limit reached for ${lane} on board ${boardId} (limit ${limit})`);
@@ -575,6 +580,7 @@ export interface PatchTaskInput {
 export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskInput): Task {
   guardTaskInput(patch as unknown as Record<string, unknown>);
   const row = requireTaskRow(ctx, id);
+  if (row.status === 'cancelled') throw new HttpError(409, `task ${id} is cancelled`);
   const laneChanges: { from: Lane; to: Lane } | null =
     patch.lane && patch.lane !== row.lane ? { from: row.lane, to: patch.lane } : null;
 
@@ -649,6 +655,23 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
   return getTask(ctx, id);
 }
 
+export async function cancelTask(ctx: Ctx, actor: Agent, id: string, reason: string): Promise<Task> {
+  if (actor.role !== 'user' && actor.role !== 'orchestrator') {
+    throw new HttpError(403, 'only user or orchestrator may cancel tasks');
+  }
+  const note = reason.trim().slice(0, 2000);
+  if (!note) throw new HttpError(422, 'cancellation reason required');
+  return withTaskIntegrationLock(id, async () => {
+    const task = getTask(ctx, id);
+    if (task.status === 'cancelled') return task;
+    return withWrite(ctx, 'task.cancel', () => {
+      ctx.holder.db.prepare("UPDATE task SET status='cancelled', updated_at=? WHERE id=? AND status='active'")
+        .run(Date.now(), id);
+      logEvent(ctx, 'task.cancelled', { taskId: id, boardId: task.boardId, by: actor.id, reason: note });
+      return getTask(ctx, id);
+    });
+  });
+}
 export function finalizeTaskReview(
   ctx: Ctx,
   actor: Agent,
@@ -660,6 +683,7 @@ export function finalizeTaskReview(
     throw new HttpError(403, 'only orchestrator/user may finalize task review');
   }
   const task = getTask(ctx, id);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${id} is cancelled`);
   if (task.lane !== 'Review' || task.reviewStatus !== 'reviewing') {
     throw new HttpError(409, `task ${id} is not being reviewed`);
   }
@@ -698,7 +722,7 @@ export function finalizeTaskReview(
 }
 
 export function recoverReviewerClaims(ctx: Ctx): number {
-  const rows = ctx.holder.db.prepare("SELECT id, board_id FROM task WHERE lane='Review' AND review_status='reviewing'").all() as { id: string; board_id: string }[];
+  const rows = ctx.holder.db.prepare("SELECT id, board_id FROM task WHERE status='active' AND lane='Review' AND review_status='reviewing'").all() as { id: string; board_id: string }[];
   if (rows.length === 0) return 0;
   return withWrite(ctx, 'task.reviewRecover', () => {
     for (const row of rows) {
@@ -713,6 +737,7 @@ export function recoverReviewerClaims(ctx: Ctx): number {
 export function retryTaskReview(ctx: Ctx, actor: Agent, taskId: string): Task {
   if (actor.role !== 'orchestrator' && actor.role !== 'user') throw new HttpError(403, 'only orchestrator/user may retry a review');
   const task = getTask(ctx, taskId);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
   if (task.lane !== 'Review' || task.reviewStatus !== 'failed') throw new HttpError(409, 'only failed Review tasks can be retried');
   const repoMode = getBoard(ctx, task.boardId).repoMode;
   const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
@@ -729,6 +754,7 @@ export function retryTaskReview(ctx: Ctx, actor: Agent, taskId: string): Task {
 
 export function claimTaskForReview(ctx: Ctx, taskId: string): Task | null {
   const task = getTask(ctx, taskId);
+  if (task.status === 'cancelled') return null;
   if (task.lane !== 'Review' || task.reviewStatus !== 'pending') return null;
   return withWrite(ctx, 'task.reviewStart', () => {
     const now = Date.now();
@@ -742,7 +768,7 @@ export function claimTaskForReview(ctx: Ctx, taskId: string): Task | null {
 
 export function failTaskReview(ctx: Ctx, taskId: string, summary: string): void {
   const task = getTask(ctx, taskId);
-  if (task.lane !== 'Review' || task.reviewStatus !== 'reviewing') return;
+  if (task.status === 'cancelled' || task.lane !== 'Review' || task.reviewStatus !== 'reviewing') return;
   const message = summary.trim().slice(0, 2000) || 'Reviewer 运行失败，未产生有效裁决。';
   withWrite(ctx, 'task.reviewFailed', () => {
     ctx.holder.db.prepare("UPDATE task SET review_status='failed', review_summary=?, updated_at=? WHERE id=?")

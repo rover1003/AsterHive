@@ -123,7 +123,7 @@ ASTERHIVE_URL=http://<your-server-ip>:8067 node apps/worker-zcode/src/main.ts
 | `OMP_BIN` | omp 可执行文件 | `omp`（取 PATH） |
 | `ZCODE_BIN` | zcode 可执行文件；`.cjs/.mjs/.js` 会用 node 直接运行 | ZCode Desktop 自带 `zcode.cjs`，找不到再退 PATH 的 `zcode` |
 | `POLL_MS` | 轮询间隔（ms），每次轮询同时充当心跳 | `10000` |
-| `TASK_TIMEOUT_MS` | 单任务执行超时（ms），超时强杀进程后仍上交现场 | `1800000`（30 分钟） |
+| `WORKER_PI_THINKING` | 托管 Pi 工蜂思考等级：`off`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`；只影响内置托管 Pi 执行器，不改变 OMP RPC/CLI | `medium`（旧配置缺省兼容） |
 
 ### OMP RPC 模式（高级可选）
 
@@ -145,6 +145,11 @@ EXECUTOR_MODE=rpc ASTERHIVE_URL=http://<your-server>:8067 node apps/worker-zcode
 - 重启会**自动读取** token.txt 复用同一身份（也可把值填进 `WORKER_TOKEN` 显式指定）；旧格式（只有 token 一行）同样可读。
 - 也可先在 Web 界面"Agent 接入"页手动预创建身份（身份壳），把拿到的 token 填到 `WORKER_TOKEN` 再启动，效果相同（见上节附录）。
 - token 等同设备身份，注意保密：不要提交进任何仓库，不要贴进聊天室。
+
+### 托管 Pi 工蜂的独立思考等级
+
+Windows、Linux 和 macOS 的 `install-bee` 一键安装/升级脚本提供思考等级选择；升级时回车保留已有档位，旧配置没有档位时默认为 `medium`。配置保存在本机 `~/.asterhive/worker.json` 的 `model.thinkingLevel`，环境变量 `WORKER_PI_THINKING` 可覆盖。支持 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。安装时可选择本机探测：脚本会明确提示可能产生上游费用，只有确认后才向已配置的模型端点请求；模型 Key 不发送到 Hive。探测只能识别上游明确提供的元数据或错误信息，无法识别时应手动配置。
+思考标签映射写在同一个本机 `model.thinkingLevelMap` 对象中，键为 Pi 档位，值为模型实际接受的标签；值 `null` 表示禁用该档位。安装器仅询问当前档位的标签：回车保留既有设置/标准标签，`standard` 删除该档位的自定义映射，`-` 将其设为 `null`。其他档位可直接编辑本机 JSON。此设置只作用于托管 Pi，不改变 omp CLI/RPC。
 
 ## 执行内核
 

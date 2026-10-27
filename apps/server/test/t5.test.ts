@@ -210,7 +210,7 @@ test('T5: 消息事件经总线实时发布（SSE 数据源）', async () => {
   }
 });
 
-test('Phase 3: 蜂群别名路由——@Queen/@蜂后到主脑，@Bee/@工蜂广播到全体worker', async () => {
+test('Phase 3: 蜂群别名路由——@Queen/@蜂后到主脑；@Bee/@工蜂不广播但真实句柄可定向', async () => {
   const r = mkRoomRig();
   try {
     await mkBoardWithTask(r);
@@ -227,17 +227,19 @@ test('Phase 3: 蜂群别名路由——@Queen/@蜂后到主脑，@Bee/@工蜂广
       headers: H(r.bee.token),
       body: JSON.stringify({ content: '@蜂后 T42 任务已准备妥当' }),
     });
-    // 3. @Bee 广播给工蜂
+    // @Bee / @工蜂 不再有广播语义
+    for (const content of ['@Bee 全体工蜂统一使用临时工作区', '@工蜂 留意代码提交证据']) {
+      await r.app.request('/boards/b/messages', {
+        method: 'POST',
+        headers: J,
+        body: JSON.stringify({ content }),
+      });
+    }
+    // 真实句柄仍可定向接收
     await r.app.request('/boards/b/messages', {
       method: 'POST',
       headers: J,
-      body: JSON.stringify({ content: '@Bee 全体工蜂统一使用临时工作区' }),
-    });
-    // 4. @工蜂 广播
-    await r.app.request('/boards/b/messages', {
-      method: 'POST',
-      headers: J,
-      body: JSON.stringify({ content: '@工蜂 留意代码提交证据' }),
+      body: JSON.stringify({ content: '@zcode 请单独处理' }),
     });
 
     const orchInbox = inboxFor(r.rig.ctx, r.orch.agent, 0);
@@ -248,11 +250,12 @@ test('Phase 3: 蜂群别名路由——@Queen/@蜂后到主脑，@Bee/@工蜂广
 
     const beeInbox = inboxFor(r.rig.ctx, r.bee.agent, 0);
     const otherInbox = inboxFor(r.rig.ctx, r.other.agent, 0);
-    // 全体 worker 都收到 @Bee 与 @工蜂
-    assert.ok(beeInbox.some((m) => m.content.includes('@Bee')), '工蜂 1 收到 @Bee');
-    assert.ok(beeInbox.some((m) => m.content.includes('@工蜂')), '工蜂 1 收到 @工蜂');
-    assert.ok(otherInbox.some((m) => m.content.includes('@Bee')), '工蜂 2 收到 @Bee');
-    assert.ok(otherInbox.some((m) => m.content.includes('@工蜂')), '工蜂 2 收到 @工蜂');
+    assert.ok(!beeInbox.some((m) => m.content.includes('全体工蜂统一')), '工蜂 1 不应收到 @Bee 广播');
+    assert.ok(!beeInbox.some((m) => m.content.includes('留意代码提交证据')), '工蜂 1 不应收到 @工蜂 广播');
+    assert.ok(!otherInbox.some((m) => m.content.includes('全体工蜂统一')), '工蜂 2 不应收到 @Bee 广播');
+    assert.ok(!otherInbox.some((m) => m.content.includes('留意代码提交证据')), '工蜂 2 不应收到 @工蜂 广播');
+    assert.ok(beeInbox.some((m) => m.content.includes('请单独处理')), '真实同名句柄可定向');
+    assert.ok(!otherInbox.some((m) => m.content.includes('请单独处理')), '定向消息不应送给其他工蜂');
     assert.ok(!beeInbox.some((m) => m.content.includes('@Queen')), '工蜂不应收到纯 @Queen');
   } finally {
     r.rig.cleanup();

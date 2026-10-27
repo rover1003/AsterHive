@@ -13,6 +13,8 @@ import {
   type OrchestratorSettings,
   type OrchestratorTestResult,
   type RuntimeStatus,
+  type ThinkingLevel,
+  type ThinkingLevelMap,
   type UserStatus,
 } from '../api.ts';
 import { esc, fmtTime } from '../ui.ts';
@@ -29,6 +31,8 @@ interface GroupVm {
   name: string;
   baseURL: string;
   model?: string;
+  thinkingLevel: ThinkingLevel;
+  thinkingLevelMap?: ThinkingLevelMap;
   apiKeySet: boolean;
 }
 
@@ -207,6 +211,8 @@ export async function render(el: HTMLElement): Promise<void> {
   function groupFormHtml(g: GroupVm | null): string {
     const models = g ? (modelCache.get(g.id)?.models ?? []) : [];
     const cur = g?.model ?? '';
+    const level = g?.thinkingLevel ?? 'low';
+    const levelOptions = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
     return `
     <div class="oc-group-form grid-form" style="margin-top:14px">
       <div class="field"><label>名称</label><input data-role="f-name" value="${g ? esc(g.name) : ''}" placeholder="如 主通道 / 备用池" /></div>
@@ -215,6 +221,13 @@ export async function render(el: HTMLElement): Promise<void> {
       <div class="field"><label>模型</label>
         <select data-role="f-model" title="列表来自该组上游 /models 接口；列表缺失时选「自定义…」手填">${modelOptionsHtml(models, cur)}</select>
         <input data-role="f-model-custom" placeholder="自定义模型名" style="display:none; margin-top:6px" />
+      </div>
+      <div class="field"><label>Pi 思考等级</label>
+        <select data-role="f-thinking-level">${levelOptions.map((x) => `<option value="${x}"${x === level ? ' selected' : ''}>${x}</option>`).join('')}</select>
+      </div>
+      <div class="field"><label>上游标签映射（可选 JSON）</label>
+        <textarea data-role="f-thinking-level-map" rows="2" placeholder='例如 {"xhigh":"max"}'>${g?.thinkingLevelMap ? esc(JSON.stringify(g.thinkingLevelMap)) : ''}</textarea>
+        <span class="muted small">按 Pi 档位映射到上游标签；不填时原名透传。更换模型或 Base URL 会清除旧映射；审核员另选模型时不复用此映射。输入 {} 可清空；上游不支持思考参数请选 off。</span>
       </div>
     </div>
     <div class="inline-form">
@@ -230,7 +243,7 @@ export async function render(el: HTMLElement): Promise<void> {
       <div class="oc-group-head">
         <div class="oc-group-title">
           <b>${esc(g.name)}</b>${isActive ? '<span class="oc-active-badge">当前使用</span>' : ''}
-          <div class="muted small">${esc(g.baseURL)}${g.apiKeySet ? ' · KEY 已设置' : ' · <span class="warn">未设 KEY</span>'}</div>
+          <div class="muted small">${esc(g.baseURL)} · 思考 ${esc(g.thinkingLevel)}${g.apiKeySet ? ' · KEY 已设置' : ' · <span class="warn">未设 KEY</span>'}</div>
         </div>
         <div class="oc-group-actions">
           <button data-act="refresh" title="立即从上游重新拉取该组的模型列表">刷新列表</button>
@@ -322,6 +335,8 @@ export async function render(el: HTMLElement): Promise<void> {
         name: g.name,
         baseURL: g.baseURL,
         ...(g.model ? { model: g.model } : {}),
+        thinkingLevel: g.thinkingLevel ?? 'off',
+        ...(g.thinkingLevelMap ? { thinkingLevelMap: g.thinkingLevelMap } : {}),
         apiKeySet: !!g.apiKeySet,
       }));
       activeGroupId = s.activeGroupId ?? null;
@@ -365,16 +380,18 @@ export async function render(el: HTMLElement): Promise<void> {
     }
   }
 
-  // 展示下拉改动即保存（激活组改模型 → 服务端 orchestrator_updated → 蜂后重建会话走新模型）
+  // 展示下拉改动即保存（换模型会使旧上游标签映射失效，服务端原子清除）。
   async function saveGroupModel(id: string, card: HTMLElement): Promise<void> {
     const g = groups.find((x) => x.id === id);
     if (!g) return;
     const m = readModelField(card, 'model', 'model-custom');
     if (!m) return; // 占位项（未设置）不保存
+    const hadMap = !!g.thinkingLevelMap;
     try {
       await api.put(`/settings/orchestrator/groups/${encodeURIComponent(id)}`, { model: m });
       g.model = m;
-      setHint(id, `<span class="ok">模型已保存：${esc(m)}${id === activeGroupId ? '（当前通道，下一轮生效）' : ''}</span>`);
+      if (hadMap) delete g.thinkingLevelMap;
+      setHint(id, `<span class="ok">模型已保存：${esc(m)}${id === activeGroupId ? '（当前通道，下一轮生效）' : ''}${hadMap ? '；旧思考标签映射已清除，请重新探测或配置' : ''}</span>`);
       updateGlobalStatus();
     } catch (err) {
       setHint(id, `<span class="warn">模型保存失败：${esc(err instanceof Error ? err.message : '')}</span>`);
@@ -382,14 +399,31 @@ export async function render(el: HTMLElement): Promise<void> {
   }
 
   // 收集编辑/新建表单字段：apiKey 仅在非空时提交（服务端缺省 = 保留原 KEY）
-  function readFormFields(card: HTMLElement): { name?: string; baseURL?: string; apiKey?: string; model?: string } {
+  function readFormFields(card: HTMLElement): {
+    name?: string;
+    baseURL?: string;
+    apiKey?: string;
+    model?: string;
+    thinkingLevel: ThinkingLevel;
+    thinkingLevelMap?: ThinkingLevelMap;
+  } {
     const val = (role: string): string =>
       (card.querySelector(`input[data-role="${role}"]`) as HTMLInputElement | null)?.value.trim() ?? '';
-    const body: { name?: string; baseURL?: string; apiKey?: string; model?: string } = {
+    const body: {
+      name?: string;
+      baseURL?: string;
+      apiKey?: string;
+      model?: string;
+      thinkingLevel: ThinkingLevel;
+      thinkingLevelMap?: ThinkingLevelMap;
+    } = {
       name: val('f-name') || undefined,
       baseURL: val('f-baseurl') || undefined,
       model: readModelField(card, 'f-model', 'f-model-custom') || undefined,
+      thinkingLevel: (card.querySelector('select[data-role="f-thinking-level"]') as HTMLSelectElement).value as ThinkingLevel,
     };
+    const rawMap = (card.querySelector('textarea[data-role="f-thinking-level-map"]') as HTMLTextAreaElement).value.trim();
+    if (rawMap) body.thinkingLevelMap = JSON.parse(rawMap) as ThinkingLevelMap;
     const key = val('f-key');
     if (key) body.apiKey = key;
     return body;
@@ -446,10 +480,15 @@ export async function render(el: HTMLElement): Promise<void> {
         }
         case 'save-edit': {
           if (!g || !card) return;
-          await api.put(`/settings/orchestrator/groups/${encodeURIComponent(g.id)}`, readFormFields(card));
+          const body = readFormFields(card);
+          const changedTarget = body.model !== g.model || body.baseURL !== g.baseURL;
+          const changedMap = JSON.stringify(body.thinkingLevelMap ?? {}) !== JSON.stringify(g.thinkingLevelMap ?? {});
+          const clearOldMap = changedTarget && !changedMap && !!g.thinkingLevelMap;
+          if (changedTarget && !changedMap) delete body.thinkingLevelMap;
+          await api.put(`/settings/orchestrator/groups/${encodeURIComponent(g.id)}`, body);
           editingId = null;
           await reload();
-          groupsStatus.innerHTML = `<span class="ok">已保存「${esc(g.name)}」</span>`;
+          groupsStatus.innerHTML = `<span class="ok">已保存「${esc(g.name)}」${clearOldMap ? '；原模型的思考标签映射已清除，请重新探测或配置' : ''}</span>`;
           return;
         }
         case 'save-new': {

@@ -4,7 +4,7 @@
 
 > **English** — AsterHive is a self-hosted, general-purpose multi-agent task orchestration system: a persistent shared kanban board, a Queen (orchestrator brain) that only decomposes / dispatches / accepts — never executes — and a chat room where you, the Queen and all worker bees collaborate. Any conversational agent that can send HTTP requests can bootstrap itself as a worker bee from a single skill URL. Designed for trusted LAN / VPN single-user deployment. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
-命名取蜂群隐喻：蜂后（Queen，即原"主脑"，只协调、从不外出觅食——"只分派不执行"）、工蜂（Worker Bee）＝worker、蜂巢＝看板 + 聊天室、摇摆舞＝@ 调度通讯。聊天室里 `@Queen` / `@蜂后` 唤醒蜂后，`@Bee` / `@工蜂` 广播全体工蜂，也可用每个 agent 的唯一句柄定向。
+命名取蜂群隐喻：蜂后（Queen，即原"主脑"，只协调、从不外出觅食——"只分派不执行"）、工蜂（Worker Bee）＝worker、蜂巢＝看板 + 聊天室、摇摆舞＝@ 调度通讯。聊天室里 `@Queen` / `@蜂后` 唤醒蜂后；工蜂需使用各 agent 的唯一句柄定向，不提供全体工蜂广播。
 
 ## 根本属性
 
@@ -12,6 +12,10 @@
 - **独立**：与任何被管理项目零代码耦合；任务面（看板/聊天/验收）在本系统，代码面只要求一个 git 仓库地址。
 - **蜂后专职**：只做目标澄清、任务拆解、分派、证据验收、向用户汇报，绝不亲自执行任务——工具面上不提供任何执行类工具，是结构性约束而非 prompt 自觉。
 - **用户只说自然语言**：聊天室内发言即可分派、干预、验收；不运行命令、不写台账。
+
+### 任务卡取消
+
+用户可在看板任务详情中使用“删除任务卡（取消并保留历史）”，或调用 `POST /tasks/:id/cancel` 并提交取消原因；蜂后也可使用 `asterhive_cancel_task`。工蜂无权取消任务。取消后任务从默认看板及工蜂领活列表隐藏，仍可通过任务详情接口查询历史；证据、事件记录与代码均保留。取消不会回滚已合并代码、自动释放依赖或将任务标为审核通过。若代码集成正在执行，取消请求会等待该集成完成后再确认取消，并明确不撤销已完成的合并。
 
 ## 架构
 

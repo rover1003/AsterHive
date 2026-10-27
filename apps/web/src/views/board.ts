@@ -15,6 +15,30 @@ const DEFAULT_WIP: Record<string, number> = { InProgress: 3, Review: 3 };
 
 let currentBoard = localStorage.getItem('asterhive.board') ?? '';
 
+// Keep destructive action handling above per-render closures: the SPA can replace an
+// entire view while an async drawer open is resolving, leaving its delegated root detached.
+document.addEventListener('click', async (event) => {
+  const button = event.target instanceof Element
+    ? event.target.closest<HTMLButtonElement>('[data-cancel-task]')
+    : null;
+  if (!button || !button.isConnected) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const id = button.dataset.cancelTask;
+  if (!id) return;
+  if (!window.confirm(`删除任务卡 ${id}？\n\n任务将标记为取消并从看板移除。历史与证据保留，已合并代码不会回滚，依赖不会自动释放。`)) return;
+  button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
+  try {
+    await api.post(`/tasks/${encodeURIComponent(id)}/cancel`, { reason: '用户在看板详情中取消' });
+    window.location.reload();
+  } catch (err) {
+    toast(`取消失败：${err instanceof Error ? err.message : ''}`, true);
+    button.disabled = false;
+    button.removeAttribute('aria-busy');
+  }
+});
+
 // 仓库地址补全协议头：填了裸域名（github.com/org/repo）也能直接点开
 function repoHref(repo: string): string {
   return /^https?:\/\//.test(repo) ? repo : `https://${repo}`;
@@ -49,6 +73,7 @@ function cardHtml(t: Task): string {
 
 function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): string {
   const actions: string[] = [];
+  if (t.status !== 'cancelled') actions.push(`<button data-cancel-task="${esc(t.id)}" class="danger">删除任务卡（取消并保留历史）…</button>`);
   if (t.lane === 'Backlog') actions.push(`<button data-move="Ready">解锁进 Ready</button>`);
   if (t.lane === 'Ready') {
     actions.push(`<button data-move="InProgress">手动开工</button>`);

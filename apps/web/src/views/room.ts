@@ -170,8 +170,16 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       <div class="composer">
         <div class="composer-row">
           <select class="composer-target" title="发送目标：选蜂后=找它拆解调度；选工蜂=直接派活/干预，蜂后仍会同步收到"></select>
-          <textarea class="composer-input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行；@某工蜂 定向，@Queen 找蜂后，@Bee 广播）"></textarea>
+          <textarea class="composer-input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行；@某工蜂 定向，@Queen 找蜂后）"></textarea>
           <button class="composer-send" title="发送">${icon.send}</button>
+        </div>
+        <div class="composer-controls" aria-label="蜂后模型控制">
+          <label class="composer-control"><span>蜂后模型组</span><select class="composer-group" aria-label="蜂后模型组" disabled><option>加载中…</option></select></label>
+          <label class="composer-control"><span>模型</span><select class="composer-model" aria-label="蜂后模型" disabled><option>加载中…</option></select></label>
+          <label class="composer-control"><span>思考等级</span><select class="composer-thinking" aria-label="蜂后思考等级" disabled></select></label>
+          <button class="sm composer-probe" type="button" disabled>探测思考能力</button>
+          <span class="composer-settings-status muted small" role="status" aria-live="polite"></span>
+          <div class="composer-thinking-map" hidden></div>
         </div>
       </div>`;
 
@@ -179,6 +187,223 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     const input = container.querySelector('.composer-input') as HTMLTextAreaElement;
     const targetSelect = container.querySelector('.composer-target') as HTMLSelectElement;
     const sendBtn = container.querySelector('.composer-send') as HTMLButtonElement;
+    const groupSelect = container.querySelector('.composer-group') as HTMLSelectElement;
+    const modelSelect = container.querySelector('.composer-model') as HTMLSelectElement;
+    const thinkingSelect = container.querySelector('.composer-thinking') as HTMLSelectElement;
+    const settingsStatus = container.querySelector('.composer-settings-status') as HTMLElement;
+    type ComposerGroup = { id: string; name: string; model?: string; thinkingLevel?: string; thinkingLevelMap?: Record<string, string | null> };
+    type ComposerSettings = { activeGroupId: string | null; groups: ComposerGroup[] };
+    type ComposerModels = { models: string[] };
+    type ThinkingProbe = { status: 'tiers'; tiers: string[]; source: 'rejection' | 'metadata' | 'official' } | { status: 'unknown'; reason: string };
+    const thinkingLevels = [['off', '关'], ['minimal', '极简'], ['low', '低'], ['medium', '中'], ['high', '高'], ['xhigh', '极高'], ['max', '最大']] as const;
+    const probeButton = container.querySelector('.composer-probe') as HTMLButtonElement;
+    const thinkingMapBox = container.querySelector('.composer-thinking-map') as HTMLElement;
+    let discoveredTiers: string[] = [];
+    let settingsBusy = false;
+    let composerGroups: ComposerGroup[] = [];
+    const setSettingsStatus = (message: string, failed = false): void => {
+      settingsStatus.textContent = message;
+      settingsStatus.classList.toggle('warn', failed);
+      settingsStatus.classList.toggle('ok', !failed && !!message);
+    };
+    const withSettingsBusy = async (run: () => Promise<void>): Promise<void> => {
+      if (settingsBusy) return;
+      settingsBusy = true;
+      groupSelect.disabled = modelSelect.disabled = thinkingSelect.disabled = true;
+      try { await run(); }
+      catch (err) {
+        const message = `保存失败：${err instanceof Error ? err.message : '请求失败'}`;
+        await loadComposerSettings();
+        setSettingsStatus(message, true);
+      }
+      finally {
+        settingsBusy = false;
+        if (!settingsStatus.classList.contains('warn')) {
+          groupSelect.disabled = !composerGroups.length;
+          modelSelect.disabled = !groupSelect.value || modelSelect.options.length <= 1 && !modelSelect.value;
+          thinkingSelect.disabled = !groupSelect.value;
+        }
+      }
+    };
+    const renderThinkingMap = (group: ComposerGroup): void => {
+      thinkingMapBox.replaceChildren();
+      if (!discoveredTiers.length) {
+        thinkingMapBox.hidden = true;
+        return;
+      }
+      thinkingMapBox.hidden = false;
+      const title = document.createElement('span');
+      title.className = 'muted small';
+      title.textContent = `探测到的上游标签（${group.model ?? '当前模型'} · ${discoveredTiers.length} 项），映射到 Pi 思考等级：`;
+      thinkingMapBox.append(title);
+      const selects: HTMLSelectElement[] = [];
+      for (const [level, label] of thinkingLevels) {
+        const row = document.createElement('label');
+        row.className = 'composer-map-row';
+        const name = document.createElement('span');
+        name.textContent = label;
+        const select = document.createElement('select');
+        select.setAttribute('aria-label', `${label}思考等级的上游标签`);
+        select.append(new Option('使用默认行为', ''));
+        select.append(new Option('禁用此档位', '__disabled__'));
+        for (const tier of discoveredTiers) select.append(new Option(tier, tier));
+        const current = group.thinkingLevelMap?.[level];
+        const exactTier = discoveredTiers.find((tier) => tier.toLowerCase() === level.toLowerCase());
+        select.value = current === null ? '__disabled__' : typeof current === 'string' && discoveredTiers.includes(current) ? current : exactTier ?? '';
+        selects.push(select);
+        row.append(name, select);
+        thinkingMapBox.append(row);
+      }
+      const saveMap = document.createElement('button');
+      saveMap.type = 'button';
+      saveMap.className = 'sm';
+      saveMap.textContent = '保存思考映射';
+      saveMap.addEventListener('click', () => void withSettingsBusy(async () => {
+        const id = groupSelect.value;
+        const map: Record<string, string | null> = {};
+        selects.forEach((select, index) => {
+          if (select.value === '__disabled__') map[thinkingLevels[index][0]] = null;
+          else if (select.value) map[thinkingLevels[index][0]] = select.value;
+        });
+        await api.put(`/settings/orchestrator/groups/${encodeURIComponent(id)}`, { thinkingLevelMap: map });
+        const currentGroup = composerGroups.find((g) => g.id === id);
+        if (currentGroup) currentGroup.thinkingLevelMap = map;
+        setSettingsStatus('思考等级映射已保存');
+      }));
+      thinkingMapBox.append(saveMap);
+    };
+    const loadComposerSettings = async (): Promise<void> => {
+      try {
+        const data = await api.get<ComposerSettings>('/settings/orchestrator');
+        if (destroyed) return;
+        composerGroups = data.groups ?? [];
+        groupSelect.replaceChildren(...composerGroups.map((g) => new Option(g.name, g.id)));
+        const active = composerGroups.find((g) => g.id === data.activeGroupId);
+        groupSelect.value = active?.id ?? '';
+        let modelListError: string | null = null;
+        let models: ComposerModels = { models: [] };
+        if (active) {
+          try {
+            models = await api.get<ComposerModels>(`/settings/orchestrator/models?group=${encodeURIComponent(active.id)}`);
+          } catch (err) {
+            modelListError = err instanceof Error ? err.message : '请求失败';
+          }
+        }
+        if (destroyed) return;
+        const modelOptions = [...(models.models ?? [])];
+        if (active?.model && !modelOptions.includes(active.model)) modelOptions.unshift(active.model);
+        modelSelect.replaceChildren(...modelOptions.map((m) => new Option(m, m)));
+        if (active?.model) modelSelect.value = active.model;
+        else if (!modelOptions.length) modelSelect.replaceChildren(new Option(active ? '无可用模型' : '尚未配置模型组', ''));
+        thinkingSelect.replaceChildren(...thinkingLevels.map(([value, label]) => new Option(label, value)));
+        thinkingSelect.value = thinkingLevels.some(([value]) => value === active?.thinkingLevel) ? active!.thinkingLevel! : 'off';
+        thinkingSelect.title = '思考等级值可手动选择；若要将 Pi 档位映射到上游真实标签，请主动探测。';
+        setSettingsStatus(modelListError
+          ? `模型列表读取失败：${modelListError}。仍可使用已保存模型与思考等级。`
+          : discoveredTiers.length ? '已探测到上游思考标签' : '思考能力未知；可手动选择或主动探测',
+          !!modelListError);
+        probeButton.disabled = !active || !active.model;
+        groupSelect.disabled = !composerGroups.length;
+        modelSelect.disabled = !active || !modelOptions.length;
+        thinkingSelect.disabled = !active;
+        if (active && discoveredTiers.length) renderThinkingMap(active);
+        else {
+          thinkingMapBox.replaceChildren();
+          thinkingMapBox.hidden = true;
+        }
+      } catch (err) {
+        if (!destroyed) {
+          groupSelect.disabled = modelSelect.disabled = thinkingSelect.disabled = true;
+          setSettingsStatus(`设置读取失败：${err instanceof Error ? err.message : '请求失败'}`, true);
+        }
+      }
+    };
+    probeButton.addEventListener('click', async () => {
+      const id = groupSelect.value;
+      const group = composerGroups.find((g) => g.id === id);
+      const model = group?.model;
+      if (!group || !model || settingsBusy) return;
+      if (!window.confirm(`将向「${group.name} · ${model}」发送少量探测请求，以识别思考标签；上游可能按请求计费。是否继续？`)) return;
+      settingsBusy = true;
+      groupSelect.disabled = modelSelect.disabled = thinkingSelect.disabled = true;
+      probeButton.disabled = true;
+      setSettingsStatus('正在探测思考能力…');
+      try {
+        const result = await api.post<ThinkingProbe>(`/settings/orchestrator/groups/${encodeURIComponent(id)}/thinking-probe`, { confirmed: true });
+        if (destroyed || groupSelect.value !== id || modelSelect.value !== model || composerGroups.find((g) => g.id === id)?.model !== model) {
+          if (!destroyed) setSettingsStatus('探测结果未应用：模型或模型组已变更，请重新探测。');
+          return;
+        }
+        if (result.status === 'tiers') {
+          discoveredTiers = result.tiers;
+          const map: Record<string, string | null> = { ...group.thinkingLevelMap };
+          let autoApplied = 0;
+          for (const [level] of thinkingLevels) {
+            if (map[level] !== undefined) continue;
+            const matchingTier = result.tiers.find((tier) => tier.toLowerCase() === level.toLowerCase());
+            if (matchingTier) {
+              map[level] = matchingTier;
+              autoApplied++;
+            }
+          }
+          if (autoApplied) {
+            await api.put(`/settings/orchestrator/groups/${encodeURIComponent(id)}`, { thinkingLevelMap: map });
+            if (destroyed || groupSelect.value !== id || modelSelect.value !== model || composerGroups.find((g) => g.id === id)?.model !== model) {
+              if (!destroyed) setSettingsStatus('映射未应用到当前选择：模型或模型组已变更，请重新探测。');
+              return;
+            }
+            group.thinkingLevelMap = map;
+          }
+          renderThinkingMap(group);
+          const source = result.source === 'metadata' ? '模型元数据' : result.source === 'official' ? '官方模型规则' : '上游拒绝响应';
+          setSettingsStatus(autoApplied
+            ? `已识别 ${result.tiers.length} 个标签（${source}），并自动应用 ${autoApplied} 个同名档位；其他映射保留，可继续调整。`
+            : `已识别 ${result.tiers.length} 个标签（${source}），没有可安全自动应用的同名档位；请手动设置。`);
+        } else {
+          discoveredTiers = [];
+          renderThinkingMap(group);
+          setSettingsStatus(`无法识别思考能力：${result.reason}；仍可手动设置。`, true);
+        }
+      } catch (err) {
+        if (!destroyed) setSettingsStatus(`思考能力探测失败：${err instanceof Error ? err.message : '请求失败'}`, true);
+      } finally {
+        settingsBusy = false;
+        if (!destroyed) {
+          const active = composerGroups.find((g) => g.id === groupSelect.value);
+          groupSelect.disabled = !composerGroups.length;
+          modelSelect.disabled = !active || modelSelect.options.length === 0;
+          thinkingSelect.disabled = !active;
+          probeButton.disabled = !active?.model;
+        }
+      }
+    });
+    void loadComposerSettings();
+    groupSelect.addEventListener('change', () => void withSettingsBusy(async () => {
+      discoveredTiers = [];
+      await api.put('/settings/orchestrator/active', { groupId: groupSelect.value });
+      await loadComposerSettings();
+      setSettingsStatus('模型组已切换');
+    }));
+    modelSelect.addEventListener('change', () => void withSettingsBusy(async () => {
+      const id = groupSelect.value;
+      await api.put(`/settings/orchestrator/groups/${encodeURIComponent(id)}`, { model: modelSelect.value });
+      const group = composerGroups.find((g) => g.id === id);
+      if (group) {
+        group.model = modelSelect.value;
+        group.thinkingLevelMap = {};
+      }
+      discoveredTiers = [];
+      renderThinkingMap(group ?? { id, name: '', model: modelSelect.value });
+      probeButton.disabled = !modelSelect.value;
+      setSettingsStatus('模型已更改；旧模型思考标签映射已清除，请重新探测或手动设置。');
+    }));
+    thinkingSelect.addEventListener('change', () => void withSettingsBusy(async () => {
+      const id = groupSelect.value;
+      await api.put(`/settings/orchestrator/groups/${encodeURIComponent(id)}`, { thinkingLevel: thinkingSelect.value });
+      const group = composerGroups.find((g) => g.id === id);
+      if (group) group.thinkingLevel = thinkingSelect.value;
+      setSettingsStatus('思考等级已保存');
+    }));
     let msgTarget = localStorage.getItem(MSG_TARGET_KEY) ?? 'Queen'; // 默认发给蜂后（@Queen 为服务端保留别名，路由同 @Queen）
 
     // 输入框自适应：输入时按内容撑高（封顶 220px ≈ 十行，让长提示词完整可读），
@@ -189,9 +414,6 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
     };
     input.addEventListener('input', fitInput);
 
-    // 目标下拉选项：蜂后固定第一项（默认目标）+ 该项目的启用 agent（「全体」选项已按需求移除）。
-    // 数据规则：GET /agents（已排除 user）过滤 enabled 且排除内置蜂后（蜂后有独立选项），
-    // 再 GET /boards/:b/participants——agentIds 非空则只列其中，为空则开放全部。
     const refreshTargets = async () => {
       let pool = agents.filter((a) => a.enabled && a.id !== BRAIN_AGENT_ID);
       try {
@@ -206,7 +428,6 @@ export function mountChatPanel(container: HTMLElement, opts: ChatPanelOpts): Cha
       const saved = msgTarget;
       targetSelect.innerHTML =
         `<option value="Queen">蜂后 @Queen</option>` +
-        `<option value="Bee">全体工蜂 (@Bee)</option>` +
         pool.map((a) => `<option value="${esc(a.handle)}">工蜂 @${esc(a.handle)}（${esc(a.name)}）</option>`).join('');
       // 记住的目标不在本项目可选范围（切板/被移出参与者/已停用，含旧版存过的「全体」空值）→ 回落蜂后
       if (![...targetSelect.options].some((o) => o.value === saved)) msgTarget = 'Queen';

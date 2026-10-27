@@ -15,6 +15,7 @@ import {
   createTask,
   updateTask,
   LANES,
+  cancelTask,
   type Lane,
   type Priority,
 } from './tasks.ts';
@@ -300,6 +301,12 @@ export const TOOL_DEFS: ToolDef[] = [
         message: '已建立初始空仓库。后续可通过工蜂开发提交首个 commit。',
       };
     },
+  ),
+  tool(
+    'asterhive_cancel_task',
+    '显式取消任务并从默认看板隐藏；保留历史、证据及已合并代码，不释放依赖。',
+    { taskId: z.string(), reason: z.string() },
+    async (ctx, a, args) => await cancelTask(ctx, a, args.taskId, args.reason),
   ),
   tool(
     'asterhive_repo_inspect_task',

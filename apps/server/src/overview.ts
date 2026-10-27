@@ -70,7 +70,7 @@ export function getOverview(ctx: Ctx): Overview {
   const currentByAssignee = new Map<string, AgentOverview['currentTask']>();
 
   const taskRows = ctx.holder.db
-    .prepare('SELECT id, board_id, title, lane, assignee, claimed_at FROM task')
+    .prepare("SELECT id, board_id, title, lane, assignee, claimed_at FROM task WHERE status='active'")
     .all() as { id: string; board_id: string; title: string; lane: Lane; assignee: string; claimed_at: number | null }[];
   for (const t of taskRows) {
     laneCounts[t.lane] = (laneCounts[t.lane] ?? 0) + 1;

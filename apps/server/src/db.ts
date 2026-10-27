@@ -63,6 +63,7 @@ export function openDb(dataDir: string): DatabaseSync {
       claimed_at       INTEGER,
       last_activity_at INTEGER,
       auto_unblocked_at INTEGER,
+      status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','cancelled')),
       created_at       INTEGER NOT NULL,
       updated_at       INTEGER NOT NULL
     );
@@ -154,6 +155,7 @@ export function openDb(dataDir: string): DatabaseSync {
     ['submit_summary', "TEXT NOT NULL DEFAULT ''"],
     ['requirements', "TEXT NOT NULL DEFAULT '{}'"],
     ['reads', "TEXT NOT NULL DEFAULT '[]'"],
+    ['status', "TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','cancelled'))"],
   ] as const) {
     try {
       db.exec(`ALTER TABLE task ADD COLUMN ${column} ${declaration}`);

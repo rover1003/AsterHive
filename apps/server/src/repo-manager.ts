@@ -7,8 +7,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
-import { getBoard, setBoardRepoState, type Board } from './tasks.ts';
+import { getBoard, getTask, setBoardRepoState, type Board } from './tasks.ts';
 import { withWrite, logEvent } from './write.ts';
+import { withTaskIntegrationLock } from './task-integration-lock.ts';
 
 export type RepoInitMode = 'empty' | 'clone';
 
@@ -337,7 +338,12 @@ export class RepoManager {
   }
 
   async integrateTask(boardId: string, taskId: string): Promise<{ mergedCommit: string }> {
+    return withTaskIntegrationLock(taskId, () => this.#integrateTask(boardId, taskId));
+  }
+
+  async #integrateTask(boardId: string, taskId: string): Promise<{ mergedCommit: string }> {
     const board = getBoard(this.#ctx, boardId);
+    if (getTask(this.#ctx, taskId).status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
     if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
     const repo = this.repoPath(boardId);
     const targetRef = `refs/asterhive/tasks/${taskId}`;

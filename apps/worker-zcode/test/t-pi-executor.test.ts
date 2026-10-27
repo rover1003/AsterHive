@@ -70,6 +70,121 @@ function stubPi(opts: {
   return { mod, captured, get session() { return sessionRef!; } };
 }
 
+test('托管 Pi: 所选思考等级启用 reasoning 注册并随真实兼容请求发送', async () => {
+  const rig = tmpCwd();
+  try {
+    const requests: { url: string; body: Record<string, unknown> }[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      requests.push({ url: String(input), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+      return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+    setPiModuleForTest(null);
+    try {
+      const result = await runPiPrompt({
+        prompt: 'request fixture',
+        cwd: rig.dir,
+        config: { ...CONFIG, thinkingLevel: 'high', thinkingLevelMap: { high: 'ultra' } },
+        log: () => {},
+        agentDir: join(rig.dir, 'agent'),
+        skillsDir: join(rig.dir, 'skills'),
+      });
+      assert.equal(result.code, 0);
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].url, `${CONFIG.baseURL}/chat/completions`);
+      assert.equal(requests[0].body.reasoning_effort, 'ultra');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  } finally {
+    setPiModuleForTest(null);
+    rig.cleanup();
+  }
+});
+
+test('托管 Pi: 自定义思考级别映射作为上游标签并正确禁用 off', async () => {
+  const rig = tmpCwd();
+  const requests: Record<string, unknown>[] = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  setPiModuleForTest(null);
+  try {
+    const result = await runPiPrompt({
+      prompt: 'request fixture',
+      cwd: rig.dir,
+      config: { ...CONFIG, thinkingLevel: 'off' },
+      timeoutMs: 60_000,
+      log: () => {},
+      agentDir: join(rig.dir, 'agent'),
+      skillsDir: join(rig.dir, 'skills'),
+    });
+    assert.equal(result.code, 0);
+    assert.equal(requests.length, 1);
+    assert.equal('reasoning_effort' in requests[0], false);
+    const messages = requests[0].messages as { role?: string }[];
+    assert.equal(messages[0]?.role, 'system', 'off uses ordinary non-reasoning model system-role semantics');
+  } finally {
+    globalThis.fetch = previousFetch;
+    setPiModuleForTest(null);
+    rig.cleanup();
+  }
+});
+
+test('托管 Pi: 未映射 max 仍作为 OpenAI 兼容 reasoning_effort 发送', async () => {
+  const rig = tmpCwd();
+  const requests: Record<string, unknown>[] = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  setPiModuleForTest(null);
+  try {
+    const result = await runPiPrompt({
+      prompt: 'request fixture',
+      cwd: rig.dir,
+      config: { ...CONFIG, thinkingLevel: 'max' },
+      timeoutMs: 60_000,
+      log: () => {},
+      agentDir: join(rig.dir, 'agent'),
+      skillsDir: join(rig.dir, 'skills'),
+    });
+    assert.equal(result.code, 0);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].reasoning_effort, 'max');
+  } finally {
+    globalThis.fetch = previousFetch;
+    setPiModuleForTest(null);
+    rig.cleanup();
+  }
+});
+
+test('托管 Pi: 旧配置缺省思考档位仍使用 medium', async () => {
+  const rig = tmpCwd();
+  try {
+    const { mod, captured } = stubPi();
+    setPiModuleForTest(mod);
+    await runPiPrompt({ prompt: 'legacy', cwd: rig.dir, config: CONFIG, timeoutMs: 60_000, log: () => {} });
+    assert.equal((captured.registerProvider?.models[0] as { reasoning?: boolean }).reasoning, true);
+    assert.equal(captured.sessionArgs?.thinkingLevel, 'medium');
+  } finally {
+    setPiModuleForTest(null);
+    rig.cleanup();
+  }
+});
+
 test('T19 pi 执行器: 会话创建参数（provider 注册、技能挂载、hive_checkpoint 工具、无 noTools）', async () => {
   const rig = tmpCwd();
   try {
@@ -84,37 +199,25 @@ test('T19 pi 执行器: 会话创建参数（provider 注册、技能挂载、hi
     });
     assert.equal(res.code, 0);
     assert.match(res.stdout, /工蜂完成/);
-
-    // provider 注册：baseURL/apiKey/model 逐项传入，Key 不落盘
     assert.equal(captured.registerProvider?.providerId, 'asterhive-worker');
     assert.equal(captured.registerProvider?.baseUrl, CONFIG.baseURL);
     assert.equal(captured.registerProvider?.apiKey, CONFIG.apiKey);
     assert.equal(captured.registerProvider?.models[0].id, CONFIG.model);
-
-    // 会话参数：技能挂载点、自定义工具含 hive_checkpoint、无 noTools（工蜂保留执行面）
     const args = captured.sessionArgs as {
-      additionalSkillPaths?: never;
       customTools?: { name: string }[];
       noTools?: unknown;
       resourceLoader?: { getSystemPrompt?: () => string };
     };
-    const loaderArgs = (args.resourceLoader && (args.resourceLoader as unknown as { __loaderArgs?: Record<string, unknown> })) || {};
-    void loaderArgs;
     assert.ok(Array.isArray(args.customTools));
     assert.equal(args.customTools!.some((t) => t.name === 'hive_checkpoint'), true, 'hive_checkpoint 工具已注册');
     assert.equal(args.noTools, undefined, '工蜂不关闭内置执行工具');
-    assert.equal(
-      typeof (args.resourceLoader as { getSystemPrompt?: () => string } | undefined)?.getSystemPrompt,
-      'function',
-      'resourceLoader 已包装（工蜂纪律系统提示词）',
-    );
-    assert.match((args.resourceLoader as { getSystemPrompt: () => string }).getSystemPrompt(), /Worker Bee/);
+    assert.equal(typeof args.resourceLoader?.getSystemPrompt, 'function');
+    assert.match(args.resourceLoader!.getSystemPrompt!(), /Worker Bee/);
   } finally {
     setPiModuleForTest(null);
     rig.cleanup();
   }
 });
-
 test('T19 pi 执行器: hive_checkpoint 工具转发 checkpoint 回调并带回干预消息', async () => {
   const rig = tmpCwd();
   try {

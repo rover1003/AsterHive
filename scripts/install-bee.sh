@@ -81,28 +81,34 @@ EXISTING_HANDLE=""
 EXISTING_BASE_URL=""
 EXISTING_API_KEY=""
 EXISTING_MODEL=""
+EXISTING_THINKING_LEVEL="medium"
+THINK_LABEL=""
+DISCOVERY=""
 
 if [ -f "$TOKEN_FILE" ]; then
   EXISTING_TOKEN="$(head -n 1 "$TOKEN_FILE" 2>/dev/null | tr -d '\r\n' || true)"
   EXISTING_HANDLE="$(head -n 2 "$TOKEN_FILE" 2>/dev/null | tail -n 1 | tr -d '\r\n' || true)"
 fi
 if [ -f "$CONFIG_FILE" ] && command -v node >/dev/null 2>&1; then
-  CFG_VALS="$(node -e '
-    try {
-      const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-      const m = c.model ?? {};
-      console.log([c.token || "", c.handle || "", m.baseURL || "", m.apiKey || "", m.model || ""].join("\u0000"));
-    } catch {}
-  ' "$CONFIG_FILE" 2>/dev/null || true)"
-  if [ -n "$CFG_VALS" ]; then
-    IFS=$'\0' read -r -d '' C_TOKEN C_HANDLE C_BASE C_KEY C_MODEL <<< "$CFG_VALS" || true
-    [ -z "$EXISTING_TOKEN" ] && EXISTING_TOKEN="$C_TOKEN"
-    [ -z "$EXISTING_HANDLE" ] && EXISTING_HANDLE="$C_HANDLE"
-    EXISTING_BASE_URL="$C_BASE"
-    EXISTING_API_KEY="$C_KEY"
-    EXISTING_MODEL="$C_MODEL"
-  fi
+  cfg_val() {
+    node -e '
+      try {
+        const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+        const m = c.model ?? {};
+        const value = process.argv[2] === "token" || process.argv[2] === "handle" ? c[process.argv[2]] : m[process.argv[2]];
+        if (value !== undefined && value !== null) process.stdout.write(String(value));
+      } catch {}
+    ' "$CONFIG_FILE" "$1" 2>/dev/null || true
+  }
+  [ -n "$EXISTING_TOKEN" ] || EXISTING_TOKEN="$(cfg_val token)"
+  [ -n "$EXISTING_HANDLE" ] || EXISTING_HANDLE="$(cfg_val handle)"
+  EXISTING_BASE_URL="$(cfg_val baseURL)"
+  EXISTING_API_KEY="$(cfg_val apiKey)"
+  EXISTING_MODEL="$(cfg_val model)"
+  EXISTING_THINKING_LEVEL="$(cfg_val thinkingLevel)"
 fi
+EXISTING_THINKING_LEVEL="${EXISTING_THINKING_LEVEL:-medium}"
+THINKING_LEVEL="$EXISTING_THINKING_LEVEL"
 
 REUSE_IDENTITY=0
 if [ -n "$EXISTING_TOKEN" ]; then
@@ -253,9 +259,30 @@ process.stdin.on("end", () => {
   else
     MODEL_ID="$MODEL_PICK"
   fi
+  if [ -n "$EXISTING_MODEL" ] && { [ "$EXISTING_MODEL" != "$MODEL_ID" ] || [ "$EXISTING_BASE_URL" != "$BASE_URL" ]; }; then
+    warn "模型或 endpoint 已变更；旧思考映射将丢弃。"
+    EXISTING_THINKING_LEVEL="medium"
+  fi
   rm -f "$MODEL_FILE"
   [ -n "$MODEL_ID" ] || die "未选择模型。"
   log "已选择：$MODEL_ID"
+
+  read -r -p "是否在本机探测该模型思考档位？会请求模型供应商并可能产生费用 [y/N]：" PROBE_CONFIRM
+  if [[ "$PROBE_CONFIRM" =~ ^[Yy]$ ]]; then
+    DISCOVERY="$(WORKER_PI_API_KEY="$API_KEY" "$NODE_BIN" --experimental-strip-types "$APP_DIR/apps/worker-zcode/src/thinking-discovery.ts" --discover "$BASE_URL" "$MODEL_ID" 2>/dev/null || true)"
+    if [ -n "$DISCOVERY" ]; then log "本机探测结果：$DISCOVERY"; else warn "探测未能识别档位；可继续手动选择/配置。"; fi
+  fi
+  read -r -p "Pi 思考等级（off/minimal/low/medium/high/xhigh/max，回车保持 [$EXISTING_THINKING_LEVEL]）：" THINK_PICK
+  THINKING_LEVEL="${THINK_PICK:-$EXISTING_THINKING_LEVEL}"
+  case "$THINKING_LEVEL" in off|minimal|low|medium|high|xhigh|max) ;; *) die "无效思考等级：$THINKING_LEVEL" ;; esac
+  if [ -n "$DISCOVERY" ]; then
+    DISCOVERED_TIERS="$(printf '%s' "$DISCOVERY" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const r=JSON.parse(s);if(r.status==="tiers")console.log(r.tiers.join(", "))}catch{}})')"
+    if [ -n "$DISCOVERED_TIERS" ] && ! printf '%s' ",$DISCOVERED_TIERS," | grep -Fq ",$THINKING_LEVEL,"; then
+      warn "探测到其它上游档位 [$DISCOVERED_TIERS]，不会猜测映射；请在下方手动输入实际标签。"
+    fi
+  fi
+  read -r -p "该等级上游标签（回车保持原映射/标准；standard=恢复标准；-=禁用）：" THINK_LABEL
+  if [ "$THINK_LABEL" = "-" ]; then THINK_LABEL="-"; fi
 else
   [ -n "$EXISTING_BASE_URL" ] && [ -n "$EXISTING_API_KEY" ] && [ -n "$EXISTING_MODEL" ] \
     || die "非交互环境且缺少完整既有模型配置。请交互式运行。"
@@ -270,20 +297,31 @@ CONFIG="$HOME/.asterhive/worker.json"
 mkdir -p "$HOME/.asterhive"
 "$NODE_BIN" -e '
 const fs = require("fs");
-const [, , url, executor, baseURL, apiKey, model, reuse, token, handle] = process.argv;
+const [, , url, executor, baseURL, apiKey, model, reuse, token, handle, thinkingLevel, thinking, label, discoveryJson] = process.argv;
 const path = require("os").homedir() + "/.asterhive/worker.json";
 let cfg = {};
 try { cfg = JSON.parse(fs.readFileSync(path, "utf8")); } catch {}
 cfg.url = url;
 cfg.executor = executor;
-cfg.model = { baseURL, apiKey, model };
+const oldModel = cfg.model ?? {};
+const sameModel = oldModel.baseURL === baseURL && oldModel.model === model;
+const map = { ...(sameModel ? (oldModel.thinkingLevelMap ?? {}) : {}) };
+if (!sameModel) console.error("模型或 endpoint 已变更；旧思考映射已丢弃。");
+if (thinking === "-" ) map[thinkingLevel] = null;
+else if (thinking === "standard") delete map[thinkingLevel];
+else if (thinking) map[thinkingLevel] = thinking;
+const discovery = (() => { try { return JSON.parse(discoveryJson); } catch { return null; } })();
+if (!Object.hasOwn(map, thinkingLevel) &&
+    discovery?.status === "tiers" && discovery.tiers.includes(thinkingLevel)) {
+  map[thinkingLevel] = thinkingLevel;
+}
 if (reuse === "1" && token) {
   cfg.token = token;
   if (handle) cfg.handle = handle;
 }
 fs.mkdirSync(require("path").dirname(path), { recursive: true });
 fs.writeFileSync(path, JSON.stringify(cfg, null, 2), { mode: 0o600 });
-' "$HIVE_URL" "pi" "$BASE_URL" "$API_KEY" "$MODEL_ID" "$REUSE_IDENTITY" "$EXISTING_TOKEN" "$EXISTING_HANDLE"
+' "$HIVE_URL" "pi" "$BASE_URL" "$API_KEY" "$MODEL_ID" "$REUSE_IDENTITY" "$EXISTING_TOKEN" "$EXISTING_HANDLE" "$THINKING_LEVEL" "$THINK_LABEL" "$THINK_LABEL" "$DISCOVERY"
 chmod 600 "$CONFIG" 2>/dev/null || true
 log "配置已写入 $CONFIG（含模型 Key，权限 0600）"
 

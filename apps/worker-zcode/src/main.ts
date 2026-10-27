@@ -31,7 +31,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canSubmitExecution, commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
 import { firstSkip, nextBoardsToPoll } from './polling.ts';
-import { runPiPrompt } from './pi-executor.ts';
+import { runPiPrompt, type PiThinkingLevel } from './pi-executor.ts';
 import {
   OmpRpcSession,
   DEFAULT_THRESHOLDS,
@@ -46,14 +46,32 @@ const here = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MODEL_REREPORT_MS = 60 * 60_000;
 
 // 托管工蜂（T19）：~/.asterhive/worker.json 可承载完整设备配置（安装脚本写入）——
-// url/board/executor 与 model{baseURL,apiKey,model}；环境变量优先级更高，兼容既有部署。
+// url/board/executor 与 model{baseURL,apiKey,model,thinkingLevel,thinkingLevelMap}；环境变量优先级更高，兼容既有部署。
 interface WorkerFileConfig {
   url?: string;
   token?: string;
   handle?: string;
   board?: string;
   executor?: string;
-  model?: { baseURL?: string; apiKey?: string; model?: string; thinkingLevel?: string };
+  model?: { baseURL?: string; apiKey?: string; model?: string; thinkingLevel?: string; thinkingLevelMap?: Record<string, string | null> };
+}
+
+const PI_THINKING_LEVELS = new Set<PiThinkingLevel>(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+function parseThinkingLevel(value: unknown): PiThinkingLevel | undefined {
+  return typeof value === 'string' && PI_THINKING_LEVELS.has(value as PiThinkingLevel)
+    ? (value as PiThinkingLevel)
+    : undefined;
+}
+
+function parseThinkingLevelMap(value: unknown): Partial<Record<PiThinkingLevel, string | null>> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const result: Partial<Record<PiThinkingLevel, string | null>> = {};
+  for (const [key, label] of Object.entries(value)) {
+    const level = parseThinkingLevel(key);
+    if (level && (typeof label === 'string' || label === null)) result[level] = label;
+  }
+  return Object.keys(result).length ? result : undefined;
 }
 
 function readWorkerFileConfig(): WorkerFileConfig {
@@ -94,7 +112,16 @@ const CFG = {
     const apiKey = process.env.WORKER_PI_API_KEY ?? m?.apiKey;
     const model = process.env.WORKER_PI_MODEL ?? m?.model;
     if (!baseURL || !apiKey || !model) return null;
-    return { baseURL, apiKey, model, thinkingLevel: process.env.WORKER_PI_THINKING ?? m?.thinkingLevel };
+    return {
+      baseURL,
+      apiKey,
+      model,
+      thinkingLevel:
+        parseThinkingLevel(process.env.WORKER_PI_THINKING) ??
+        parseThinkingLevel(m?.thinkingLevel) ??
+        'medium',
+      thinkingLevelMap: parseThinkingLevelMap(m?.thinkingLevelMap),
+    };
   })(),
   // RPC 直接执行 OMP 二进制；OMP_BIN 可继续指向用户 oneshot 包装器
   ompRpcBin: process.env.OMP_RPC_BIN,

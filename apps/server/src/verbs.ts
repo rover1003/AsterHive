@@ -31,7 +31,7 @@ function fileConflicts(ctx: Ctx, files: string[], selfActorId: string): string[]
   const mine = new Set(files.map(normalizePath).filter(Boolean));
   if (mine.size === 0) return [];
   const rows = ctx.holder.db
-    .prepare("SELECT id, assignee, files FROM task WHERE lane = 'InProgress'")
+    .prepare("SELECT id, assignee, files FROM task WHERE status='active' AND lane = 'InProgress'")
     .all() as { id: string; assignee: string; files: string }[];
   const conflicts: string[] = [];
   for (const r of rows) {
@@ -75,6 +75,7 @@ function claimInner(ctx: Ctx, task: Task, actor: Agent, files: string[] | null, 
 export function claimTask(ctx: Ctx, actor: Agent, taskId: string, files?: string[]): Task {
   const task = requireTaskRow(ctx, taskId);
   requireParticipant(ctx, task.boardId, actor); // 看板参与限制（worker 须在参与者列表内）
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${task.id} is cancelled`);
   assertClaimable(ctx, task, actor, files ?? task.files);
   return withWrite(ctx, 'task.claim', () => claimInner(ctx, task, actor, files === undefined ? null : files, 'claim'));
 }
@@ -84,13 +85,13 @@ export function claimTask(ctx: Ctx, actor: Agent, taskId: string, files?: string
 function sweepStale(ctx: Ctx, boardId: string): string[] {
   const cutoff = Date.now() - ctx.cfg.ttlMinutes * 60_000;
   const rows = ctx.holder.db
-    .prepare("SELECT id, assignee, depends_on FROM task WHERE board_id = ? AND lane = 'InProgress' AND last_activity_at < ?")
+    .prepare("SELECT id, assignee, depends_on FROM task WHERE board_id = ? AND status='active' AND lane = 'InProgress' AND last_activity_at < ?")
     .all(boardId, cutoff) as { id: string; assignee: string; depends_on: string }[];
   const released: string[] = [];
   for (const r of rows) {
     const deps = JSON.parse(r.depends_on) as string[];
     const depsOk = deps.every((d) => {
-      const dep = ctx.holder.db.prepare("SELECT lane FROM task WHERE id = ?").get(d) as { lane: string } | undefined;
+      const dep = ctx.holder.db.prepare("SELECT lane FROM task WHERE id = ? AND status='active'").get(d) as { lane: string } | undefined;
       return dep?.lane === 'Done';
     });
     const now = Date.now();
@@ -114,13 +115,13 @@ export function nextTask(ctx: Ctx, actor: Agent, boardId: string): { task: Task 
     const swept = sweepStale(ctx, boardId);
     const candidate = ctx.holder.db
       .prepare(
-        "SELECT id FROM task WHERE board_id = ? AND lane = 'Ready' AND assignee = 'unassigned' ORDER BY priority, created_at, id LIMIT 1",
+        "SELECT id FROM task WHERE board_id = ? AND status='active' AND lane = 'Ready' AND assignee = 'unassigned' ORDER BY priority, created_at, id LIMIT 1",
       )
       .get(boardId) as { id: string } | undefined;
     if (!candidate) return { task: null, swept };
     const task = getTask(ctx, candidate.id);
     const wip = ctx.holder.db
-      .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND lane = 'InProgress'")
+      .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND status='active' AND lane = 'InProgress'")
       .get(boardId) as { n: number };
     const board = getBoard(ctx, boardId);
     const limit = board.wip.InProgress ?? 3;
@@ -210,7 +211,7 @@ export function releaseTask(ctx: Ctx, actor: Agent, taskId: string, reason?: str
     throw new HttpError(403, 'only assignee or orchestrator/user may release');
   }
   const depsOk = task.dependsOn.every((d) => {
-    const dep = ctx.holder.db.prepare('SELECT lane FROM task WHERE id = ?').get(d) as { lane: string } | undefined;
+    const dep = ctx.holder.db.prepare("SELECT lane FROM task WHERE id = ? AND status='active'").get(d) as { lane: string } | undefined;
     return dep?.lane === 'Done';
   });
   return withWrite(ctx, 'task.release', () => {
@@ -234,6 +235,7 @@ export interface SubmitInput {
 export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: SubmitInput): Task {
   if (!input.summary?.trim()) throw new HttpError(422, 'summary required');
   const task = requireTaskRow(ctx, taskId);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
   if (task.lane !== 'InProgress') throw new HttpError(409, `task ${task.id} not InProgress (lane: ${task.lane})`);
   if (task.assignee !== actor.id && !isElevated(actor)) {
     throw new HttpError(403, 'only assignee or orchestrator/user may submit');
@@ -242,7 +244,7 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   const board = getBoard(ctx, task.boardId);
   const reviewLimit = board.wip.Review ?? 3;
   const reviewCount = ctx.holder.db
-    .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND lane = 'Review' AND id != ?")
+    .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND status='active' AND lane = 'Review' AND id != ?")
     .get(task.boardId, taskId) as { n: number };
   if (reviewCount.n >= reviewLimit) {
     throw new HttpError(409, `WIP limit reached for Review on board ${task.boardId} (limit ${reviewLimit})`);

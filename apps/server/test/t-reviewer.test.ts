@@ -71,7 +71,9 @@ function startReviewerMock(verdict: 'pass' | 'reject'): { server: Server; port: 
     req.on('data', (data) => (body += data));
     req.on('end', () => {
       const json = JSON.parse(body) as { messages?: { role?: string; content?: unknown }[]; tools?: unknown[] };
-      const reviewerRequest = (json.messages ?? []).some((m) => m.role === 'system' && String(m.content).includes('独立代码审核员'));
+      const reviewerRequest = (json.messages ?? []).some(
+        (message) => (message.role === 'system' || message.role === 'developer') && String(message.content).includes('独立代码审核员'),
+      );
       if (reviewerRequest) {
         reviewerRequests += 1;
         assert.equal(json.tools?.length ?? 0, 0, 'reviewer must have no tools');

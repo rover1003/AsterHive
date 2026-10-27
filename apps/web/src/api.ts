@@ -24,6 +24,7 @@ export interface Task {
   detail: string;
   lane: string;
   assignee: string;
+  status: 'active' | 'cancelled';
   dependsOn: string[];
   priority: string;
   category: string;
@@ -127,12 +128,17 @@ export interface AuditEntry {
   result: string;
   detail?: string;
 }
+export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 /** 模型组（蜂后多模型组）：GET /settings/orchestrator 的 groups 投影，cipher/明文永不回显 */
 export interface OrchestratorGroup {
   id: string;
   name: string;
   baseURL: string;
   model?: string;
+  thinkingLevel: ThinkingLevel;
+  /** Pi 档位到上游 reasoning_effort 标签映射；不含密钥。 */
+  thinkingLevelMap?: ThinkingLevelMap;
   /** 该组是否已设置 apiKey（加密存储，界面只显示"已设置"布尔） */
   apiKeySet?: boolean;
 }
