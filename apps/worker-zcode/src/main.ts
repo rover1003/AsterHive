@@ -485,14 +485,15 @@ async function main(): Promise<void> {
       .map((m) => `（${m.author}）${m.content}`);
   };
 
-  // 看板 repo 缓存（T15：board 元数据不常变，进程内 Map；boardId → { repo, repoMode }）
-  const boardMetaCache = new Map<string, { repo: string | null; repoMode: 'managed' | 'remote-legacy' }>();
+  // 看板 repo 缓存（T15：board 元数据 30s 缓存过期刷新；boardId → { repo, repoMode, cachedAt }）
+  const boardMetaCache = new Map<string, { repo: string | null; repoMode: 'managed' | 'remote-legacy'; cachedAt: number }>();
   const boardMeta = async (boardId: string): Promise<{ repo: string | null; repoMode: 'managed' | 'remote-legacy' }> => {
-    if (!boardMetaCache.has(boardId)) {
+    const cached = boardMetaCache.get(boardId);
+    if (!cached || Date.now() - cached.cachedAt > 30_000) {
       const board = await worker.getBoard(boardId);
       const repo = board.repo?.trim() || null;
       const repoMode = board.repoMode === 'managed' ? 'managed' : 'remote-legacy';
-      boardMetaCache.set(boardId, { repo, repoMode });
+      boardMetaCache.set(boardId, { repo, repoMode, cachedAt: Date.now() });
       if (repoMode === 'managed') log(`看板仓库托管模式：managed（服务器主仓）`);
       else if (repo) log(`项目仓库（board.repo）：${repo}`);
     }

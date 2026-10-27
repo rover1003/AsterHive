@@ -100,13 +100,17 @@ if ($hiveUrl -and $token) {
   Log '未检测到活跃的 Hive Token 或服务器地址，跳过远端注销。'
 }
 
-# ---- 4. 清理用户环境变量中的 Node 便携版路径 ----
+# ---- 4. 清理用户环境变量中的 Node 与 Git 便携版路径 ----
 try {
+  $gitCmdDir = Join-Path $BeeHome 'git\cmd'
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-  if ($userPath -and ($userPath -split ';') -contains $NodeDir) {
-    Log '从用户 PATH 中移除便携版 Node 路径…'
-    $newPath = ($userPath -split ';' | Where-Object { $_ -ne $NodeDir -and $_ }) -join ';'
-    [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+  if ($userPath) {
+    $toRemove = @($NodeDir, $gitCmdDir)
+    $newParts = $userPath -split ';' | Where-Object { $toRemove -notcontains $_ -and $_ }
+    if ($newParts.Count -ne ($userPath -split ';').Count) {
+      Log '从用户 PATH 中移除便携版 Node / Git 路径…'
+      [Environment]::SetEnvironmentVariable('Path', ($newParts -join ';'), 'User')
+    }
   }
 } catch {}
 

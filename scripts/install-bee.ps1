@@ -82,6 +82,44 @@ try {
   if (Test-Path $candidate) { $NpmCmd = $candidate }
 } catch { } # 系统 Node 场景 npm 在 PATH 中，直接用 npm
 
+# ---- 1.1 Git 依赖自检与自动部署（MinGit 便携版） ----
+function Test-GitOk {
+  try {
+    $v = (& git --version 2>$null)
+    return [bool]$v
+  } catch { return $false }
+}
+
+$GitDir = Join-Path $BeeHome 'git'
+$GitCmdDir = $null
+if (Test-GitOk) {
+  $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+  if ($gitCmd) { $GitCmdDir = Split-Path $gitCmd.Source }
+  Log "使用系统 Git $(& git --version)"
+} else {
+  Log "系统 Git 缺失，自动安装便携版 MinGit…"
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { '64-bit' }
+  $minGitZip = Join-Path $env:TEMP "mingit.zip"
+  $minGitUrl = "https://github.com/git-for-windows/git/releases/download/v2.48.1.windows.1/MinGit-2.48.1-$arch.zip"
+  Log "下载 MinGit 2.48.1 ($arch)…"
+  try {
+    Invoke-WebRequest -Uri $minGitUrl -OutFile $minGitZip -TimeoutSec 600
+    if (Test-Path $GitDir) { Remove-Item $GitDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $GitDir | Out-Null
+    Expand-Archive -Path $minGitZip -DestinationPath $GitDir -Force
+    Remove-Item $minGitZip -Force -ErrorAction SilentlyContinue
+    $GitCmdDir = Join-Path $GitDir 'cmd'
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (($userPath -split ';') -notcontains $GitCmdDir) {
+      [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $GitCmdDir), 'User')
+    }
+    $env:Path = "$GitCmdDir;$env:Path"
+    Log "MinGit 就绪：$(& (Join-Path $GitCmdDir 'git.exe') --version)"
+  } catch {
+    Warn "MinGit 自动安装受阻：$($_.Exception.Message)。无 Git 时工蜂将仅支持 scratch 一次性模式。"
+  }
+}
+
 # ---- 2. 源码下载：优先从 Hive 服务器直拉，外网不可用时自愈 ----
 Log "停止旧的 AsterHive worker（如有）…"
 try { Stop-ScheduledTask -TaskName 'AsterHive worker' -ErrorAction SilentlyContinue } catch {}
@@ -192,11 +230,14 @@ if ($testExit -ne 0) {
   Die "工蜂首次自测或注册失败（exit=$testExit）。请根据上方具体错误排查；本次未注册后台计划任务，避免静默失败挂起。"
 }
 
-# ---- 6. 生成常驻启动器脚本（start-worker.cmd，带日志重定向） ----
+# ---- 6. 生成常驻启动器脚本（start-worker.cmd，带环境路径锁定与日志重定向） ----
 $startCmd = Join-Path $BeeHome 'start-worker.cmd'
+$nodeBinDir = Split-Path $NodeExe
+$extraDirs = @($nodeBinDir, $GitCmdDir) | Where-Object { $_ -and (Test-Path $_) }
+$pathPrefix = if ($extraDirs.Count -gt 0) { "set `"PATH=$($extraDirs -join ';');%PATH%`"`n" } else { "" }
 $cmdContent = @"
 @echo off
-cd /d "$AppDir"
+$pathPrefix`cd /d "$AppDir"
 "$NodeExe" --experimental-strip-types "$workerMain" >> "$BeeHome\worker.log" 2>&1
 "@
 [System.IO.File]::WriteAllText($startCmd, $cmdContent, [System.Text.Encoding]::Default)
