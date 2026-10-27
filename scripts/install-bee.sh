@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# AsterHive（星巢）托管工蜂（Bee）一键安装脚本（Linux/macOS；Windows 原生用 install-bee.ps1）
+# AsterHive（星巢）托管工蜂（Bee）一键安装与升级脚本（Linux/macOS；Windows 原生用 install-bee.ps1）
 #
 # 一行命令（从 Web「Agent 接入」页复制——服务器地址已自动内嵌）：
 #   curl -fsSL http://<hive-ip>:8067/scripts/install-bee.sh | bash
 #
 # 交互式完成：自举 Node（无系统 Node 时自动装便携版）→ 优先从局域网 Hive 实例秒级拉取源码包 →
-# 模型配置（Base URL + API Key → 在线拉取模型列表选择，Key 只存本设备）→ 写入注册配置 →
-# 前台首次自测与注册（--once）→ 常驻化（systemd 用户服务；无 systemd 时后台进程）→ 自动注册上线。
-# 首次启动 worker 自助注册（开放注册）：句柄形如 pi-worker-<主机名>，撞名自动加后缀。
+# 热升级自动识别并复用本设备既有工蜂身份，绝不产生冗余的新工蜂 →
+# 模型配置（支持回车保持既有配置）→ 写入注册配置 →
+# 前台首次自测与注册（--once）→ 常驻化（systemd 用户服务；无 systemd 时后台进程）→ 自动点亮上线。
 set -euo pipefail
 
 INJECTED_HIVE_URL="__HIVE_URL_PLACEHOLDER__"
@@ -18,6 +18,8 @@ BEE_HOME="${BEE_HOME:-$HOME/.asterhive-worker}"
 NODE_MIN="23.6"
 NODE_DIR="$BEE_HOME/node"
 APP_DIR="$BEE_HOME/app"
+CONFIG_FILE="$HOME/.asterhive/worker.json"
+TOKEN_FILE="$APP_DIR/apps/worker-zcode/work/token.txt"
 
 log() { printf '\033[1;36m[bee]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bee]\033[0m %s\n' "$*"; }
@@ -53,7 +55,7 @@ if [ ! -t 0 ] && [ -z "${ASTERHIVE_REEXEC:-}" ] && [ -e /dev/tty ] && [ -t 1 ]; 
 fi
 INTERACTIVE=1
 if [ ! -t 0 ]; then
-  warn "非交互环境：模型配置将复用 ~/.asterhive/worker.json 既有值（无则退出）。"
+  warn "非交互环境：模型配置将复用既有配置（无则退出）。"
   INTERACTIVE=0
 fi
 
@@ -72,6 +74,48 @@ log "Hive 连通：$HIVE_URL"
 
 command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || die "需要 curl 或 wget 之一（下载依赖用），请先安装。"
 command -v tar >/dev/null 2>&1 || die "未检测到 tar。"
+
+# ---- 0.1 既有身份与模型配置探查（热升级复用机制） ----
+EXISTING_TOKEN=""
+EXISTING_HANDLE=""
+EXISTING_BASE_URL=""
+EXISTING_API_KEY=""
+EXISTING_MODEL=""
+
+if [ -f "$TOKEN_FILE" ]; then
+  EXISTING_TOKEN="$(head -n 1 "$TOKEN_FILE" 2>/dev/null | tr -d '\r\n' || true)"
+  EXISTING_HANDLE="$(head -n 2 "$TOKEN_FILE" 2>/dev/null | tail -n 1 | tr -d '\r\n' || true)"
+fi
+if [ -f "$CONFIG_FILE" ] && command -v node >/dev/null 2>&1; then
+  CFG_VALS="$(node -e '
+    try {
+      const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      const m = c.model ?? {};
+      console.log([c.token || "", c.handle || "", m.baseURL || "", m.apiKey || "", m.model || ""].join("\u0000"));
+    } catch {}
+  ' "$CONFIG_FILE" 2>/dev/null || true)"
+  if [ -n "$CFG_VALS" ]; then
+    IFS=$'\0' read -r -d '' C_TOKEN C_HANDLE C_BASE C_KEY C_MODEL <<< "$CFG_VALS" || true
+    [ -z "$EXISTING_TOKEN" ] && EXISTING_TOKEN="$C_TOKEN"
+    [ -z "$EXISTING_HANDLE" ] && EXISTING_HANDLE="$C_HANDLE"
+    EXISTING_BASE_URL="$C_BASE"
+    EXISTING_API_KEY="$C_KEY"
+    EXISTING_MODEL="$C_MODEL"
+  fi
+fi
+
+REUSE_IDENTITY=0
+if [ -n "$EXISTING_TOKEN" ]; then
+  CHECK_PROF="$(fetch_header "${HIVE_URL%/}/agents/me/profile" "Authorization: Bearer $EXISTING_TOKEN")"
+  if [ -n "$CHECK_PROF" ]; then
+    REUSE_IDENTITY=1
+    log "检测到本设备已有有效工蜂身份（@$EXISTING_HANDLE），热升级将保持并复用该身份。"
+  else
+    warn "本地既有工蜂凭据在当前 Hive 上未通过鉴权（可能已注销或服务器已重置），将重新注册新身份。"
+    EXISTING_TOKEN=""
+    EXISTING_HANDLE=""
+  fi
+fi
 
 # ---- 1. Node 环境自检与自动安装 ----
 node_ok() {
@@ -126,8 +170,11 @@ systemctl --user stop asterhive-worker.service 2>/dev/null || true
 pkill -f 'worker-zcode.*main.ts' 2>/dev/null || true
 
 mkdir -p "$APP_DIR"
-rm -f "$APP_DIR/apps/worker-zcode/work/token.txt" 2>/dev/null || true
-unset WORKER_TOKEN || true
+if [ "$REUSE_IDENTITY" = 0 ]; then
+  rm -f "$TOKEN_FILE" 2>/dev/null || true
+  unset WORKER_TOKEN || true
+fi
+
 TMP_TGZ="$(mktemp /tmp/asterhive-worker-bundle.XXXXXX.tar.gz)"
 SOURCE_OK=0
 
@@ -147,6 +194,12 @@ fi
 rm -f "$TMP_TGZ"
 [ "$SOURCE_OK" = 1 ] || die "源码下载失败：请检查网络与 Hive 服务器连接。"
 
+# 热升级恢复 token.txt
+if [ "$REUSE_IDENTITY" = 1 ] && [ -n "$EXISTING_TOKEN" ]; then
+  mkdir -p "$(dirname "$TOKEN_FILE")"
+  printf '%s\n%s\n' "$EXISTING_TOKEN" "$EXISTING_HANDLE" > "$TOKEN_FILE"
+fi
+
 log "安装依赖（npm，仅 worker + sdk 工作区；首次需数分钟）…"
 ( cd "$APP_DIR" && npm install --omit=dev \
     --workspace @asterhive/worker-zcode --workspace @asterhive/sdk --no-audit --no-fund ) \
@@ -158,10 +211,18 @@ if [ "$INTERACTIVE" = 1 ]; then
   echo "=========================================="
   echo "  模型配置（工蜂执行内核为内置 Pi，模型 Key 只存本机）"
   echo "=========================================="
-  read -r -p "Base URL [https://api.openai.com/v1]：" BASE_URL
-  BASE_URL="${BASE_URL:-https://api.openai.com/v1}"
-  read -rs -p "API Key：" API_KEY
-  echo
+  DEFAULT_BASE="${EXISTING_BASE_URL:-https://api.openai.com/v1}"
+  read -r -p "Base URL [$DEFAULT_BASE]：" BASE_URL
+  BASE_URL="${BASE_URL:-$DEFAULT_BASE}"
+
+  if [ -n "$EXISTING_API_KEY" ]; then
+    read -rs -p "API Key [回车保持既有密钥]：" API_KEY
+    echo
+    API_KEY="${API_KEY:-$EXISTING_API_KEY}"
+  else
+    read -rs -p "API Key：" API_KEY
+    echo
+  fi
   [ -n "$API_KEY" ] || die "API Key 不能为空（工蜂没有可用模型无法执行任务）。"
 
   log "拉取模型清单（同时校验 Base URL 与 Key）…"
@@ -181,8 +242,13 @@ process.stdin.on("end", () => {
 
   log "可用模型："
   cat -n "$MODEL_FILE"
-  read -r -p "选择模型（输入序号，或直接粘贴模型 id）：" MODEL_PICK
-  if printf '%s' "$MODEL_PICK" | grep -Eq '^[0-9]+$'; then
+  PICK_PROMPT="选择模型（输入序号，直接粘贴"
+  [ -n "$EXISTING_MODEL" ] && PICK_PROMPT="$PICK_PROMPT，或回车保持 [$EXISTING_MODEL]"
+  PICK_PROMPT="$PICK_PROMPT）："
+  read -r -p "$PICK_PROMPT" MODEL_PICK
+  if [ -z "$MODEL_PICK" ] && [ -n "$EXISTING_MODEL" ]; then
+    MODEL_ID="$EXISTING_MODEL"
+  elif printf '%s' "$MODEL_PICK" | grep -Eq '^[0-9]+$'; then
     MODEL_ID="$(sed -n "${MODEL_PICK}p" "$MODEL_FILE" | cut -f2)"
   else
     MODEL_ID="$MODEL_PICK"
@@ -191,19 +257,11 @@ process.stdin.on("end", () => {
   [ -n "$MODEL_ID" ] || die "未选择模型。"
   log "已选择：$MODEL_ID"
 else
-  EXISTING="$("$NODE_BIN" -e '
-const fs = require("fs");
-try {
-  const cfg = JSON.parse(fs.readFileSync(require("os").homedir() + "/.asterhive/worker.json", "utf8"));
-  const m = cfg.model ?? {};
-  if (cfg.url && m.baseURL && m.apiKey && m.model) {
-    console.log([cfg.url, m.baseURL, m.apiKey, m.model].join("\u0000"));
-  }
-} catch {}' || true)"
-  if [ -z "$EXISTING" ]; then
-    die "非交互环境且缺少完整既有模型配置。请交互式运行。"
-  fi
-  IFS=$'\0' read -r -d '' HIVE_URL BASE_URL API_KEY MODEL_ID <<< "$EXISTING" || true
+  [ -n "$EXISTING_BASE_URL" ] && [ -n "$EXISTING_API_KEY" ] && [ -n "$EXISTING_MODEL" ] \
+    || die "非交互环境且缺少完整既有模型配置。请交互式运行。"
+  BASE_URL="$EXISTING_BASE_URL"
+  API_KEY="$EXISTING_API_KEY"
+  MODEL_ID="$EXISTING_MODEL"
   log "复用既有模型配置：$MODEL_ID（$BASE_URL）"
 fi
 
@@ -212,23 +270,27 @@ CONFIG="$HOME/.asterhive/worker.json"
 mkdir -p "$HOME/.asterhive"
 "$NODE_BIN" -e '
 const fs = require("fs");
-const [, , url, executor, baseURL, apiKey, model] = process.argv;
+const [, , url, executor, baseURL, apiKey, model, reuse, token, handle] = process.argv;
 const path = require("os").homedir() + "/.asterhive/worker.json";
 let cfg = {};
 try { cfg = JSON.parse(fs.readFileSync(path, "utf8")); } catch {}
 cfg.url = url;
 cfg.executor = executor;
 cfg.model = { baseURL, apiKey, model };
+if (reuse === "1" && token) {
+  cfg.token = token;
+  if (handle) cfg.handle = handle;
+}
 fs.mkdirSync(require("path").dirname(path), { recursive: true });
 fs.writeFileSync(path, JSON.stringify(cfg, null, 2), { mode: 0o600 });
-' "$HIVE_URL" "pi" "$BASE_URL" "$API_KEY" "$MODEL_ID"
+' "$HIVE_URL" "pi" "$BASE_URL" "$API_KEY" "$MODEL_ID" "$REUSE_IDENTITY" "$EXISTING_TOKEN" "$EXISTING_HANDLE"
 chmod 600 "$CONFIG" 2>/dev/null || true
 log "配置已写入 $CONFIG（含模型 Key，权限 0600）"
 
-# ---- 5. 首次自测与注册上线（前台 --once 单轮运行） ----
-log "执行工蜂首次自测与注册（--once 模式，向 Hive 自助注册）…"
+# ---- 5. 首次自测上线（前台 --once 单轮运行） ----
+log "执行工蜂首次自测（--once 模式，验证执行环境与 Hive 连通）…"
 ( cd "$APP_DIR" && "$NODE_BIN" --experimental-strip-types apps/worker-zcode/src/main.ts --once ) \
-  || die "工蜂首次自测或注册失败。请根据上方具体错误排查；本次未注册后台常驻服务，避免静默失败挂起。"
+  || die "工蜂自测失败。请根据上方具体错误排查；本次未注册后台常驻服务，避免静默失败挂起。"
 
 # ---- 6. 常驻化 ----
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -259,16 +321,14 @@ else
   ( cd "$APP_DIR" && nohup "$NODE_BIN" --experimental-strip-types apps/worker-zcode/src/main.ts >> "$BEE_HOME/worker.log" 2>&1 & )
 fi
 
-# ---- 7. 回显已注册身份 ----
+# ---- 7. 回显已就绪身份 ----
 sleep 1
-HANDLE="$(cut -s -f2 "$APP_DIR/apps/worker-zcode/work/token.txt" 2>/dev/null || true)"
+HANDLE="$(cut -s -f2 "$TOKEN_FILE" 2>/dev/null || true)"
 echo
 echo "=========================================="
-echo "  ✅ 工蜂安装完成"
+echo "  ✅ 工蜂就绪（Hive 控制台已实时点亮）"
 if [ -n "$HANDLE" ]; then
-  echo "  句柄：@$HANDLE（Fleet 总览中可见）"
-else
-  warn "  未从 token.txt 读到注册句柄，请检查 $BEE_HOME/worker.log。"
+  echo "  句柄：@$HANDLE"
 fi
 echo "  Hive：$HIVE_URL"
 echo "  源码：$APP_DIR   日志：$BEE_HOME/worker.log"

@@ -1,11 +1,12 @@
-# AsterHive（星巢）托管工蜂（Bee）一键安装脚本 —— Windows 原生 PowerShell
+# AsterHive（星巢）托管工蜂（Bee）一键安装与升级脚本 —— Windows 原生 PowerShell
 #
 # 一行命令（在 PowerShell 中执行；从 Web「Agent 接入」页复制——服务器地址已自动内嵌）：
 #   irm http://<hive-ip>:8067/scripts/install-bee.ps1 | iex
 #   （地址解析顺序：$env:ASTERHIVE_URL → 命令行参数 → 服务端自动内嵌注入 → 交互提问）
 #
-# 全自动依赖检测与部署：Node ≥23.6 缺失/过旧 → 自动下载便携版并写入用户 PATH；
-# 源码优先从本局域网 Hive 实例内网直拉（50KB 秒级直达），无需依赖 GitHub 外网；
+# 全自动依赖自检与部署：Node ≥23.6 + MinGit 便携版自动安装并锁定运行环境；
+# 源码优先从本局域网 Hive 实例内网直拉（50KB 秒级直达），零 GitHub 依赖；
+# 热升级自动识别并复用本设备既有合法工蜂身份，绝不产生冗余的新工蜂；
 # 模型 Key 只写本设备（%USERPROFILE%\.asterhive\worker.json），服务器不经手。
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
@@ -15,7 +16,11 @@ $Repo   = if ($env:ASTERHIVE_REPO) { $env:ASTERHIVE_REPO } else { 'https://githu
 $Ref    = if ($env:ASTERHIVE_REF)  { $env:ASTERHIVE_REF }  else { 'main' }
 $BeeHome = if ($env:BEE_HOME)      { $env:BEE_HOME }       else { Join-Path $env:USERPROFILE '.asterhive-worker' }
 $NodeDir  = Join-Path $BeeHome 'node'
+$GitDir   = Join-Path $BeeHome 'git'
 $AppDir   = Join-Path $BeeHome 'app'
+$ConfigDir = Join-Path $env:USERPROFILE '.asterhive'
+$ConfigFile = Join-Path $ConfigDir 'worker.json'
+$TokenFile = Join-Path $AppDir 'apps\worker-zcode\work\token.txt'
 $NodeMinMajor = 23
 
 function Log($m)  { Write-Host "[bee] $m" -ForegroundColor Cyan }
@@ -36,7 +41,50 @@ try {
   Log "Hive 连通：$HiveUrl"
 } catch { Die "无法连接 $HiveUrl/health —— 请确认 Hive 已部署且地址可达。（$($_.Exception.Message)）" }
 
-# ---- 1. 依赖自检与自动部署：Node ≥ 23.6（含 npm） ----
+# ---- 0.1 探查既有工蜂身份与模型配置（热升级无缝复用机制） ----
+$existingToken = $null
+$existingHandle = $null
+$existingBaseURL = $null
+$existingApiKey = $null
+$existingModel = $null
+
+if (Test-Path $TokenFile) {
+  try {
+    $tLines = Get-Content $TokenFile
+    if ($tLines.Count -ge 1) { $existingToken = $tLines[0].Trim() }
+    if ($tLines.Count -ge 2) { $existingHandle = $tLines[1].Trim() }
+  } catch {}
+}
+if (Test-Path $ConfigFile) {
+  try {
+    $cfg = Get-Content -Raw $ConfigFile | ConvertFrom-Json
+    if (-not $existingToken -and $cfg.token) { $existingToken = [string]$cfg.token }
+    if (-not $existingHandle -and $cfg.handle) { $existingHandle = [string]$cfg.handle }
+    if ($cfg.model) {
+      $existingBaseURL = [string]$cfg.model.baseURL
+      $existingApiKey = [string]$cfg.model.apiKey
+      $existingModel = [string]$cfg.model.model
+    }
+  } catch {}
+}
+
+$reuseIdentity = $false
+if ($existingToken) {
+  try {
+    $prof = Invoke-RestMethod -Uri "$($HiveUrl.TrimEnd('/'))/agents/me/profile" `
+      -Headers @{ Authorization = "Bearer $existingToken" } -TimeoutSec 6
+    if ($prof) {
+      $reuseIdentity = $true
+      Log "检测到本设备已有有效工蜂身份（@$existingHandle），热升级将保持并复用该身份。"
+    }
+  } catch {
+    Warn "本地既有工蜂凭据在当前 Hive 上未通过验证（可能已被删除或服务器重置），将重新发起注册。"
+    $existingToken = $null
+    $existingHandle = $null
+  }
+}
+
+# ---- 1. 依赖自检与自动部署：Node ≥ 23.6 ----
 function Test-NodeOk {
   try {
     $v = (& node -p 'process.versions.node' 2>$null)
@@ -55,7 +103,7 @@ if (Test-NodeOk) {
   $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
   $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -TimeoutSec 30
   $nv = ($index | Where-Object { $_.version -like 'v24.*' } | Select-Object -First 1).version
-  if (-not $nv) { Die "无法确定 Node 24 版本号（nodejs.org 不可达？）。请手动安装 Node ≥ $NodeMinMajor 后重试。" }
+  if (-not $nv) { Die "无法确定 Node 24 版本号。请手动安装 Node ≥ $NodeMinMajor 后重试。" }
   $zipUrl = "https://nodejs.org/dist/$nv/node-$nv-win-$arch.zip"
   $zipFile = Join-Path $env:TEMP "node-$nv-win-$arch.zip"
   Log "下载 Node $nv (win-$arch)…"
@@ -67,7 +115,7 @@ if (Test-NodeOk) {
   if ($extracted) { Move-Item $extracted.FullName $NodeDir -Force }
   Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
   $NodeExe = Join-Path $NodeDir 'node.exe'
-  # 写入用户 PATH（新终端自动可用；当前会话进程内即时生效）
+  # 写入用户 PATH
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if (($userPath -split ';') -notcontains $NodeDir) {
     [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ';' + $NodeDir), 'User')
@@ -75,12 +123,13 @@ if (Test-NodeOk) {
   $env:Path = "$NodeDir;$env:Path"
   & $NodeExe -p 'process.versions.node' | ForEach-Object { Log "Node $_ 就绪（$NodeDir）" }
 }
+
 $NpmCmd = 'npm'
 try {
   $nodePath = (Get-Command $NodeExe -ErrorAction Stop).Path
   $candidate = Join-Path (Split-Path $nodePath) 'npm.cmd'
   if (Test-Path $candidate) { $NpmCmd = $candidate }
-} catch { } # 系统 Node 场景 npm 在 PATH 中，直接用 npm
+} catch { }
 
 # ---- 1.1 Git 依赖自检与自动部署（MinGit 便携版） ----
 function Test-GitOk {
@@ -90,7 +139,6 @@ function Test-GitOk {
   } catch { return $false }
 }
 
-$GitDir = Join-Path $BeeHome 'git'
 $GitCmdDir = $null
 if (Test-GitOk) {
   $gitCmd = Get-Command git -ErrorAction SilentlyContinue
@@ -129,9 +177,11 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyCon
   ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-$oldToken = Join-Path $AppDir 'apps\worker-zcode\work\token.txt'
-if (Test-Path $oldToken) { Remove-Item $oldToken -Force -ErrorAction SilentlyContinue }
-$env:WORKER_TOKEN = $null
+if (-not $reuseIdentity) {
+  if (Test-Path $TokenFile) { Remove-Item $TokenFile -Force -ErrorAction SilentlyContinue }
+  $env:WORKER_TOKEN = $null
+}
+
 $tmpTgz = Join-Path $env:TEMP "asterhive-worker-bundle.tar.gz"
 $sourceOk = $false
 
@@ -155,7 +205,6 @@ if (-not $sourceOk) { Die "工蜂源码获取失败：内网与 GitHub 均不可
 
 # 解压到 AppDir
 if (Get-Command tar -ErrorAction SilentlyContinue) {
-  # 如果是 Hive 打包的 worker.tar.gz，根为工作区结构直接解压；如果是 github 的带顶层目录
   try {
     tar -xzf $tmpTgz -C $AppDir
   } catch {
@@ -166,6 +215,13 @@ if (Get-Command tar -ErrorAction SilentlyContinue) {
 }
 Remove-Item $tmpTgz -Force -ErrorAction SilentlyContinue
 
+# 若为热升级，确保工作区内恢复原工蜂凭据
+if ($reuseIdentity -and $existingToken) {
+  $workDir = Join-Path $AppDir 'apps\worker-zcode\work'
+  New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+  [System.IO.File]::WriteAllText($TokenFile, "$existingToken`n$existingHandle`n", [System.Text.Encoding]::UTF8)
+}
+
 Log "安装依赖（npm，仅 worker + sdk 工作区；首次需数分钟）…"
 Push-Location $AppDir
 try {
@@ -173,14 +229,19 @@ try {
   if ($LASTEXITCODE -ne 0) { Die "npm install 失败——请检查网络后重试。" }
 } finally { Pop-Location }
 
-# ---- 3. 交互式模型配置（Key 只写本设备文件，服务器不经手） ----
+# ---- 3. 交互式模型配置（Key 只写本设备文件，支持回车保持既有配置） ----
 Write-Host ''
 Write-Host '=========================================='
 Write-Host '  模型配置（工蜂执行内核为内置 Pi，模型 Key 只存本机）'
 Write-Host '=========================================='
-$baseURL = Read-Host 'Base URL [https://api.openai.com/v1]'
-if (-not $baseURL) { $baseURL = 'https://api.openai.com/v1' }
-$apiKey = Read-Host 'API Key'
+
+$basePrompt = if ($existingBaseURL) { "Base URL [$existingBaseURL]" } else { "Base URL [https://api.openai.com/v1]" }
+$baseURL = Read-Host $basePrompt
+if (-not $baseURL) { $baseURL = if ($existingBaseURL) { $existingBaseURL } else { 'https://api.openai.com/v1' } }
+
+$keyPrompt = if ($existingApiKey) { "API Key [回车保持既有密钥]" } else { "API Key" }
+$apiKey = Read-Host $keyPrompt
+if (-not $apiKey -and $existingApiKey) { $apiKey = $existingApiKey }
 if (-not $apiKey) { Die 'API Key 不能为空（工蜂没有可用模型无法执行任务）。' }
 
 Log '拉取模型清单（同时校验 Base URL 与 Key）…'
@@ -191,29 +252,38 @@ $modelIds = @($modelsResp.data | ForEach-Object { $_.id }) | Where-Object { $_ }
 if (-not $modelIds -or $modelIds.Count -eq 0) { Die '模型清单为空（非 OpenAI 兼容端点？）。' }
 Log "可用模型 $($modelIds.Count) 个："
 for ($i = 0; $i -lt $modelIds.Count; $i++) { Write-Host ("{0,4}  {1}" -f ($i + 1), $modelIds[$i]) }
-$pick = Read-Host '选择模型（输入序号，或直接粘贴模型 id）'
-if ($pick -match '^\d+$' -and [int]$pick -le $modelIds.Count) { $modelId = $modelIds[[int]$pick - 1] } else { $modelId = $pick }
+
+$pickPrompt = if ($existingModel) { "选择模型（输入序号，直接粘贴，或回车保持 [$existingModel]）" } else { "选择模型（输入序号，或直接粘贴模型 id）" }
+$pick = Read-Host $pickPrompt
+if (-not $pick -and $existingModel) {
+  $modelId = $existingModel
+} elseif ($pick -match '^\d+$' -and [int]$pick -le $modelIds.Count) {
+  $modelId = $modelIds[[int]$pick - 1]
+} else {
+  $modelId = $pick
+}
 if (-not $modelId) { Die '未选择模型。' }
 Log "已选择：$modelId"
 
-# ---- 4. 写注册与执行配置（worker 首次启动自助注册：开放注册，token 自动落盘） ----
-$configDir = Join-Path $env:USERPROFILE '.asterhive'
-New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-$config = Join-Path $configDir 'worker.json'
-@{
+# ---- 4. 写注册与执行配置 ----
+New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
+$cfgObj = @{
   url = $HiveUrl
   executor = 'pi'
   model = @{ baseURL = $baseURL; apiKey = $apiKey; model = $modelId }
-} | ConvertTo-Json -Depth 4 | ForEach-Object {
-  # .NET WriteAllText 写 UTF-8 无 BOM——worker 的 JSON.parse 读到 BOM 会解析失败
-  [System.IO.File]::WriteAllText($config, $_)
 }
-# 收紧 ACL：仅当前用户可读（0600 语义）
-try { icacls $config /inheritance:r /grant:r "$env:USERNAME`:(R,W)" | Out-Null } catch {}
-Log "配置已写入 $config（含模型 Key，仅当前用户可读）"
+if ($reuseIdentity -and $existingToken) {
+  $cfgObj['token'] = $existingToken
+  if ($existingHandle) { $cfgObj['handle'] = $existingHandle }
+}
+$cfgObj | ConvertTo-Json -Depth 4 | ForEach-Object {
+  [System.IO.File]::WriteAllText($ConfigFile, $_)
+}
+try { icacls $ConfigFile /inheritance:r /grant:r "$env:USERNAME`:(R,W)" | Out-Null } catch {}
+Log "配置已写入 $ConfigFile（含模型 Key，仅当前用户可读）"
 
-# ---- 5. 首次自测与注册上线（前台 --once 运行） ----
-Log '执行工蜂首次自测与注册（--once 模式，向 Hive 自助注册）…'
+# ---- 5. 首次自测上线（前台 --once 运行） ----
+Log '执行工蜂首次自测（--once 模式，验证执行环境与 Hive 连通）…'
 $workerMain = Join-Path $AppDir 'apps\worker-zcode\src\main.ts'
 Push-Location $AppDir
 $testExit = 0
@@ -227,7 +297,7 @@ try {
   Pop-Location
 }
 if ($testExit -ne 0) {
-  Die "工蜂首次自测或注册失败（exit=$testExit）。请根据上方具体错误排查；本次未注册后台计划任务，避免静默失败挂起。"
+  Die "工蜂自测失败（exit=$testExit）。请根据上方具体错误排查；本次未注册后台计划任务，避免静默挂起。"
 }
 
 # ---- 6. 生成常驻启动器脚本（start-worker.cmd，带环境路径锁定与日志重定向） ----
@@ -254,22 +324,19 @@ Log '计划任务已注册并启动。'
 
 # ---- 8. 回显已注册身份 ----
 $handle = $null
-$tokenFile = Join-Path $AppDir 'apps\worker-zcode\work\token.txt'
-if (Test-Path $tokenFile) {
-  $lines = Get-Content $tokenFile
+if (Test-Path $TokenFile) {
+  $lines = Get-Content $TokenFile
   if ($lines.Count -ge 2) { $handle = $lines[1] }
 }
 Write-Host ''
 Write-Host '=========================================='
-Write-Host '  ✅ 工蜂安装与注册完成'
+Write-Host '  ✅ 工蜂就绪（Hive 控制台已实时点亮）'
 if ($handle) {
-  Write-Host "  句柄：@$handle（Hive 控制台已实时点亮）"
-} else {
-  Warn "  警告：未从 $tokenFile 读到注册句柄，请检查 $BeeHome\worker.log。"
+  Write-Host "  工蜂句柄：@$handle"
 }
-Write-Host "  Hive：$HiveUrl"
-Write-Host "  源码：$AppDir"
-Write-Host "  日志：$BeeHome\worker.log"
-Write-Host '  执行内核：内置 Pi（无需本机任何 agent CLI）；模型 Key 仅存本机'
-Write-Host '  常驻：计划任务 AsterHive worker（登录自启，taskschd.msc 可管理）'
+Write-Host "  Hive 服务器：$HiveUrl"
+Write-Host "  源码目录：$AppDir"
+Write-Host "  日志文件：$BeeHome\worker.log"
+Write-Host '  执行内核：内置 Pi（自带 MinGit 与 Node 运行时；模型 Key 仅存本机）'
+Write-Host '  常驻方式：Windows 计划任务 AsterHive worker（登录自启，taskschd.msc 可管理）'
 Write-Host '=========================================='
