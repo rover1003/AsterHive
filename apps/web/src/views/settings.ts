@@ -37,19 +37,17 @@ export async function render(el: HTMLElement): Promise<void> {
     <div class="view-head"><h2>${icon.gear} 设置</h2></div>
     <div class="panel">
       <h3>用户</h3>
-      <p class="muted">单用户系统——用户名只是聊天室里的显示名，保存即生效，无需任何令牌。</p>
       <div class="grid-form">
         <div class="field"><label for="user-handle">用户名</label><input id="user-handle" placeholder="如 老板" /></div>
       </div>
       <div class="inline-form">
         <button class="primary" id="user-save">保存</button>
       </div>
-      <p class="muted small">当前状态：<span id="user-status">加载中…</span></p>
       <div id="user-result"></div>
     </div>
     <div class="panel">
       <h3>蜂后设置（内置蜂后，模式 B）</h3>
-      <p class="muted">蜂后是服务器常驻的调度者：拆解建卡 / 分派 / 验收 / 汇报，绝不执行任务。模型通道（Base URL + API Key + 模型）在下方「模型组」按组管理，这里只管总开关。</p>
+      <p class="muted">蜂后只调度不执行；模型通道在下方「模型组」管理，这里只管总开关。</p>
       <div class="grid-form">
         <div class="field"><label for="oc-enabled">启用蜂后</label>
           <select id="oc-enabled"><option value="off">关闭（默认）</option><option value="on">启用</option></select>
@@ -72,7 +70,7 @@ export async function render(el: HTMLElement): Promise<void> {
     </div>
     <div class="panel">
       <h3>模型组</h3>
-      <p class="muted">蜂后的模型通道按组管理：每组 = 名称 + Base URL + API Key（加密存储，界面永不回显）+ 模型。各组可独立刷新模型列表、测试连通、一键启用——上游账号池瞬时 503 时切到备用组，蜂后下一轮即走新通道。</p>
+      <p class="muted">每组 = 名称 + Base URL + API Key + 模型；启用中的组即蜂后当前通道。</p>
       <div id="oc-groups"></div>
       <div class="inline-form">
         <button class="primary" id="oc-group-add">＋ 添加模型组</button>
@@ -81,18 +79,18 @@ export async function render(el: HTMLElement): Promise<void> {
     </div>
     <div class="panel">
       <h3>Pi 运行时</h3>
-      <p class="muted">蜂后的 Pi agent 运行时装由服务器数据卷自管理（不进镜像）：装新版 → 原子切换 → 旧版保留可回滚；更新不重启服务器，只影响下次蜂后会话创建。</p>
+      <p class="muted">更新不重启服务器，只影响下次蜂后会话创建。</p>
       <div id="rt-status" class="muted small">加载中…</div>
       <div class="inline-form">
         <button id="rt-update">更新到最新版</button>
         <button id="rt-rollback" class="danger">回滚上一版</button>
       </div>
       <div id="rt-result"></div>
-      <p class="muted small">社区插件挂载点：<code id="rt-extdir">…</code><br />把社区插件放到该目录（每个插件一个子目录）即可被蜂后会话加载；服务器不预装任何插件。</p>
+      <p class="muted small">插件目录（每个插件一个子目录，放入即被蜂后加载）：<code id="rt-extdir">…</code></p>
     </div>
     <div class="panel">
       <h3>蜂后扩展与技能</h3>
-      <p class="muted">管理蜂后的 Pi 扩展插件与技能：npm 包名安装（服务器代装入数据卷）、启停、删除；技能直接写 SKILL.md。变更不打断运行中的会话，蜂后下个会话生效。</p>
+      <p class="muted">npm 包名安装扩展或启停/删除；技能直接写 SKILL.md。变更在蜂后下个会话生效。</p>
       <div id="ext-list" class="muted small">加载中…</div>
       <div class="inline-form">
         <input id="ext-pkg" placeholder="npm 包名，如 @scope/some-pi-ext" style="flex:1;min-width:220px" />
@@ -114,15 +112,13 @@ export async function render(el: HTMLElement): Promise<void> {
     </div>`;
 
   // ---- 用户：回填用户名；保存只是改名 ----
-  const statusEl = el.querySelector('#user-status') as HTMLElement;
   const input = el.querySelector('#user-handle') as HTMLInputElement;
   const result = el.querySelector('#user-result') as HTMLElement;
   try {
     const u = await api.get<UserStatus>('/api/user');
     input.value = u.handle ?? '';
-    statusEl.textContent = u.handle ? `当前用户名：${u.handle}` : '未设置（用默认名"用户"）';
-  } catch (err) {
-    statusEl.textContent = `读取失败：${err instanceof Error ? err.message : ''}`;
+  } catch {
+    /* 读取失败保持空值，保存时可再试 */
   }
 
   (el.querySelector('#user-save') as HTMLElement).addEventListener('click', async () => {
@@ -134,7 +130,6 @@ export async function render(el: HTMLElement): Promise<void> {
     try {
       const res = await api.put<{ handle: string }>('/api/user', { handle: h });
       setCachedUserName(res.handle);
-      statusEl.textContent = `当前用户名：${res.handle}`;
       result.innerHTML = `已保存：${esc(res.handle)}`;
     } catch (err) {
       result.innerHTML = `<span class="warn">保存失败：${esc(err instanceof Error ? err.message : '')}</span>`;
@@ -263,7 +258,7 @@ export async function render(el: HTMLElement): Promise<void> {
     const cards = groups.map(groupCardHtml).join('');
     const newForm = creating
       ? `<div class="oc-group" data-id="__new__">
-          <div class="oc-group-head"><div class="oc-group-title"><b>新模型组</b><div class="muted small">创建后即可刷新模型列表 / 测试连通 / 启用；空组态创建的第一组自动启用</div></div></div>
+          <div class="oc-group-head"><div class="oc-group-title"><b>新模型组</b></div></div>
           ${groupFormHtml(null)}
         </div>`
       : '';

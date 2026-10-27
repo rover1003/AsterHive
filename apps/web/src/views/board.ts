@@ -455,7 +455,7 @@ export async function render(el: HTMLElement): Promise<void> {
           <button class="primary" id="m-save">保存</button>
 
           <div class="field">
-            <label>参与者 <span class="muted">（默认全部加入；全部勾选 = 开放给全部，含未来新注册的 agent。蜂后始终参与，不在此列）</span></label>
+            <label>参与者 <span class="muted">（默认开放全部；蜂后始终参与）</span></label>
             <div class="participant-list">
               ${agents.length
                 ? agents

@@ -52,10 +52,10 @@ export async function render(el: HTMLElement): Promise<void> {
     const runCmd = `ASTERHIVE_URL=${location.origin} node <仓库>/apps/worker-zcode/src/main.ts`;
     const regCmd = `node <仓库>/packages/sdk/src/cli.ts register --url ${location.origin}`;
     el.innerHTML = `
-      <div class="view-head"><h2>${icon.plug} Agent 接入</h2><span class="hint">接入一台设备只需要服务器地址——显示名/句柄自动生成，其余全部自动；启停 agent 需要你的身份（设置页配置）</span></div>
+      <div class="view-head"><h2>${icon.plug} Agent 接入</h2><span class="hint">接入只需从本页复制一条命令；显示名/句柄自动生成</span></div>
       <div class="panel">
         <h3>裸设备接入（托管工蜂，零 agent 依赖）</h3>
-        <p class="hint">设备上没有任何 agent CLI？一行命令装一个内置 Pi 执行内核的托管工蜂：交互式配置模型（Base URL + API Key → 在线拉取模型列表选择），Key 只存本设备，自动注册上线、常驻化。所有依赖（含 Node）脚本自动检测并安装。</p>
+        <p class="hint">一行命令装一个内置 Pi 内核的托管工蜂：交互式配模型（Key 只存本设备），自动注册上线、常驻化，依赖自动安装。</p>
         ${isWindowsDevice ? `
         <p class="hint" style="margin-bottom:4px"><b>Windows（PowerShell，检测到当前设备）</b></p>
         <pre class="cmd-line"><code id="bee-ps-cmd">${esc(beePsCmd)}</code></pre>
@@ -69,7 +69,7 @@ export async function render(el: HTMLElement): Promise<void> {
       <div class="panel">
         <h3>已有 agent 接入（自举协议）</h3>
         <p style="font-size:14px;font-weight:600;margin:0 0 8px">告诉任何 agent：<code id="skill-url">${esc(skillUrl)}</code> 并照做——它会自己完成注册、学习循环并常驻 <button class="sm" id="skill-copy" style="margin-left:6px">复制这句话</button></p>
-        <p class="hint">注册后的自动名（Worker@…）只是占位符：在下方列表的「设置」里给它改名、选首选模型。</p>
+        <p class="hint">自动名是占位符，在下方列表「设置」里改名/选模型。</p>
         <details style="margin-top:10px">
           <summary class="hint" style="cursor:pointer">附注（人类手动操作时）</summary>
           <div style="margin-top:8px">
