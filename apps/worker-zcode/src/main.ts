@@ -400,12 +400,30 @@ async function main(): Promise<void> {
     CFG.token = lines[0];
     if (lines[1]) CFG.handle = lines[1];
   }
-  const worker = new Worker(CFG.url, CFG.token, CFG.handle);
+  let worker = new Worker(CFG.url, CFG.token, CFG.handle);
   const deviceSpecs = detectDeviceSpecs(detectExecutorKind());
-  if (!CFG.token) {
-    // 注册时自报接入设备名（本机主机名）与硬件规格；
-    // registerWithRetry：handle 撞名（409）自动加 -2/-3… 后缀，接入不需要人工挑名字
-    const reg = await registerWithRetry(worker, {
+  let needRegister = !CFG.token;
+
+  if (CFG.token) {
+    // token 复用（已注册）：启动时尝试自报设备能力以验证既有 token 有效性
+    try {
+      await worker.reportSpecs(deviceSpecs);
+      log(`已自报设备能力：${deviceSpecs.os}/${deviceSpecs.arch} · ${deviceSpecs.cpus}C/${deviceSpecs.memoryTotalGb}GB · 内核 ${deviceSpecs.executor}`);
+    } catch (err) {
+      if (err instanceof SdkError && err.status === 401) {
+        log('检测到既有 Token 在当前服务器已失效（401：可能服务器已重置或身份被注销），自动发起重新注册…');
+        needRegister = true;
+        CFG.token = undefined;
+      } else {
+        log('设备能力规格上报失败（非致命）：', err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
+  if (needRegister) {
+    // 重新实例化未带旧 token 的 worker 发起纯净注册
+    const freshWorker = new Worker(CFG.url, undefined, CFG.handle);
+    const reg = await registerWithRetry(freshWorker, {
       name: CFG.name,
       handle: CFG.handle,
       models: CFG.models,
@@ -413,19 +431,19 @@ async function main(): Promise<void> {
       specs: deviceSpecs,
     });
     if (reg.handle !== CFG.handle) log(`句柄 @${CFG.handle} 已被占用，自动改用 @${reg.handle}`);
-    CFG.handle = reg.handle; // 后续日志与 token.txt 落盘用实际生效的句柄
+    CFG.handle = reg.handle;
+    CFG.token = reg.token;
+    worker = freshWorker;
     // token 只此一次：落盘到 work 目录（连同实际 handle），供下次复用
     mkdirSync(CFG.workdirRoot, { recursive: true });
     writeFileSync(join(CFG.workdirRoot, 'token.txt'), `${reg.token}\n${reg.handle}\n`, 'utf8');
     log(`已注册工蜂 ${reg.handle}（token 已存 ${join(CFG.workdirRoot, 'token.txt')}）`);
     log(`已自报设备能力：${deviceSpecs.os}/${deviceSpecs.arch} · ${deviceSpecs.cpus}C/${deviceSpecs.memoryTotalGb}GB · 内核 ${deviceSpecs.executor}`);
   } else {
-    // token 复用（已注册）：启动时自报设备硬件能力与模型清单
-    try {
-      await worker.reportSpecs(deviceSpecs);
-      log(`已自报设备能力：${deviceSpecs.os}/${deviceSpecs.arch} · ${deviceSpecs.cpus}C/${deviceSpecs.memoryTotalGb}GB · 内核 ${deviceSpecs.executor}`);
-    } catch (err) {
-      log('设备能力规格上报失败（非致命）：', err instanceof Error ? err.message : err);
+    // 复用有效 token：如果本地缺失 token.txt，补齐落盘供管理脚本与回显使用
+    if (!existsSync(tokenFile) && CFG.token) {
+      mkdirSync(CFG.workdirRoot, { recursive: true });
+      writeFileSync(join(CFG.workdirRoot, 'token.txt'), `${CFG.token}\n${CFG.handle}\n`, 'utf8');
     }
     if (CFG.models.length > 0) {
       try {
@@ -440,14 +458,14 @@ async function main(): Promise<void> {
   let busy = false;
   // 定期重报基线：启动时注册/复用 token 分支已上报过一次模型，从现在起再计时
   let lastModelReport = Date.now();
-  const authHeaders = { authorization: `Bearer ${worker.token ?? ''}` };
+  const getAuthHeaders = () => ({ authorization: `Bearer ${worker.token ?? ''}` });
   // 多板巡检状态：已知板清单（定期刷新）+ 403 跳过集合（只 log 一次防刷屏）
   const knownBoards: { ids: string[]; lastRefresh: number } = { ids: [], lastRefresh: 0 };
   const skipped403 = new Set<string>();
   const listMine = async (boardId: string, lane: string): Promise<Task[]> => {
     const r = await fetch(
       `${CFG.url}/boards/${boardId}/tasks?lane=${lane}&assignee=${encodeURIComponent(worker.agentId)}`,
-      { headers: authHeaders },
+      { headers: getAuthHeaders() },
     );
     // 非 2xx 一律抛 SdkError（与 SDK call() 同语义）：多板巡检靠 403 识别非参与者板
     const json = (await r.json().catch(() => ({}))) as { tasks?: Task[]; error?: string };
@@ -455,7 +473,7 @@ async function main(): Promise<void> {
     return json.tasks ?? [];
   };
   const taskFeedback = async (boardId: string, taskId: string): Promise<string[]> => {
-    const r = await fetch(`${CFG.url}/boards/${boardId}/messages?limit=500`, { headers: authHeaders });
+    const r = await fetch(`${CFG.url}/boards/${boardId}/messages?limit=500`, { headers: getAuthHeaders() });
     const json = (await r.json().catch(() => ({}))) as {
       messages?: { taskRef: string | null; author: string; content: string }[];
       error?: string;

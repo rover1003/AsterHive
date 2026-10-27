@@ -126,6 +126,8 @@ systemctl --user stop asterhive-worker.service 2>/dev/null || true
 pkill -f 'worker-zcode.*main.ts' 2>/dev/null || true
 
 mkdir -p "$APP_DIR"
+rm -f "$APP_DIR/apps/worker-zcode/work/token.txt" 2>/dev/null || true
+unset WORKER_TOKEN || true
 TMP_TGZ="$(mktemp /tmp/asterhive-worker-bundle.XXXXXX.tar.gz)"
 SOURCE_OK=0
 

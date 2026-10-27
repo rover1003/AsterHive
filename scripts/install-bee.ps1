@@ -91,6 +91,9 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyCon
   ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+$oldToken = Join-Path $AppDir 'apps\worker-zcode\work\token.txt'
+if (Test-Path $oldToken) { Remove-Item $oldToken -Force -ErrorAction SilentlyContinue }
+$env:WORKER_TOKEN = $null
 $tmpTgz = Join-Path $env:TEMP "asterhive-worker-bundle.tar.gz"
 $sourceOk = $false
 
