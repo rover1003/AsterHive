@@ -47,6 +47,8 @@ export async function render(el: HTMLElement): Promise<void> {
     // 服务器地址自动注入当前浏览器访问的 origin，复制即可用、无需手填；PS 用环境变量内联传址（命令不带注释尾巴）。
     const beeBashCmd = `curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- ${location.origin}`;
     const beePsCmd = `$env:ASTERHIVE_URL='${location.origin}'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)`;
+    const unbeeBashCmd = `curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.sh | bash -s -- ${location.origin}`;
+    const unbeePsCmd = `$env:ASTERHIVE_URL='${location.origin}'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.ps1)`;
     const isWindowsDevice = /Windows/i.test(navigator.userAgent);
     // 附注（人类手动操作时）：--url 默认当前 origin（同源部署）；<仓库> 由设备主人按 docs/WORKER.md clone 后替换
     const runCmd = `ASTERHIVE_URL=${location.origin} node <仓库>/apps/worker-zcode/src/main.ts`;
@@ -65,6 +67,20 @@ export async function render(el: HTMLElement): Promise<void> {
         <pre class="cmd-line"><code id="bee-cmd">${esc(beeBashCmd)}</code></pre>
         <button class="sm" id="bee-copy">复制命令</button>
         <p class="hint" style="margin-top:6px">装好的工蜂默认多板巡检，看板参与在本页看板管理里勾选。</p>
+        <details style="margin-top:10px">
+          <summary class="hint" style="cursor:pointer">卸载与销毁工蜂</summary>
+          <div style="margin-top:8px">
+            <p class="hint">一键停止服务/进程、在 Hive 注销身份并彻底删除本地目录与配置：</p>
+            ${isWindowsDevice ? `
+            <p class="hint" style="margin-bottom:4px"><b>Windows（PowerShell）</b></p>
+            <pre class="cmd-line"><code id="unbee-ps-cmd">${esc(unbeePsCmd)}</code></pre>
+            <button class="sm" id="unbee-ps-copy">复制卸载命令</button>
+            <p class="hint" style="margin:10px 0 4px"><b>Linux / macOS（bash）</b></p>` : `
+            <p class="hint" style="margin-bottom:4px"><b>Linux / macOS（bash）</b></p>`}
+            <pre class="cmd-line"><code id="unbee-cmd">${esc(unbeeBashCmd)}</code></pre>
+            <button class="sm" id="unbee-copy">复制卸载命令</button>
+          </div>
+        </details>
       </div>
       <div class="panel">
         <h3>已有 agent 接入（自举协议）</h3>
@@ -148,6 +164,8 @@ export async function render(el: HTMLElement): Promise<void> {
     };
     wireCopy('#bee-copy', () => beeBashCmd, '复制命令');
     if (isWindowsDevice) wireCopy('#bee-ps-copy', () => beePsCmd, '复制命令');
+    wireCopy('#unbee-copy', () => unbeeBashCmd, '复制卸载命令');
+    if (isWindowsDevice) wireCopy('#unbee-ps-copy', () => unbeePsCmd, '复制卸载命令');
     wireCopy('#skill-copy', () => bootLine, '复制这句话');
     wireCopy('#run-copy', () => runCmd, '复制命令');
     wireCopy('#cmd-copy', () => regCmd, '复制命令');

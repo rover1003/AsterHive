@@ -306,11 +306,19 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json({ agent });
   });
 
-  // 删除 agent（真删行，≠ 停用；单用户身份受保护）
+  // 删除 agent（真删行，≠ 停用；单用户身份受保护；requireElevated 闸门：匿名 user / orchestrator 可删，worker 403）
   app.delete('/agents/:id', (c) => {
     requireElevated(ctx, c);
     deleteAgent(ctx, c.req.param('id'));
     return c.json({ ok: true, deleted: c.req.param('id') });
+  });
+
+  // 工蜂自助注销端点（Phase 10：卸载脚本调用，凭自身 worker token 注销自己的身份行并落账）
+  app.post('/agents/me/unregister', (c) => {
+    const actor = requireActor(ctx, c);
+    if (actor.id === 'user') throw new HttpError(422, '单用户身份不可删除');
+    deleteAgent(ctx, actor.id);
+    return c.json({ ok: true, deleted: actor.id });
   });
 
   app.post('/agents/:id/heartbeat', async (c) => {

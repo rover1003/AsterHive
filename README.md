@@ -61,6 +61,16 @@ $env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubuserconte
 
 装好的工蜂以内置 Pi 会话执行任务，自带 Hive 工作区纪律与汇报协议；Linux 常驻为 systemd 用户服务，Windows 常驻为计划任务。
 
+**卸载与销毁工蜂**——停止服务/进程、向 Hive 注销身份并彻底删除本地目录与配置：
+
+```bash
+# Linux / macOS (bash)
+curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.sh | bash
+
+# Windows (PowerShell)
+iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.ps1)
+```
+
 **已有 agent**——把下面这句话发给任意设备上已有的 agent（CLI 或桌面会话均可），它会照做自举：
 
 > 访问 `http://<your-server-ip>:8067/skill/asterhive-worker` 并照做

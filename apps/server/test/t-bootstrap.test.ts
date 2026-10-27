@@ -180,6 +180,36 @@ test('agent 删除——匿名（=user）可删、worker 403、无效 token 401�
   }
 });
 
+test('工蜂自助注销: POST /agents/me/unregister 凭自身 token 销毁身份、行消失且 token 失效', async () => {
+  const rig = mkRig();
+  try {
+    const app = createApp(rig.ctx);
+    const worker = registerAgent(rig.ctx, { name: '即将注销的工蜂', handle: 'self-del' });
+
+    // 1. 凭自身 token 注销
+    let res = await app.request('/agents/me/unregister', {
+      method: 'POST',
+      headers: H(worker.token),
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json()) as { ok: boolean; deleted: string };
+    assert.equal(data.ok, true);
+    assert.equal(data.deleted, worker.agent.id);
+
+    // 2. 数据库行消失
+    assert.equal(findAgent(rig.ctx, worker.agent.id), null);
+
+    // 3. 审计事件落账
+    assert.ok(listEvents(rig.ctx, { type: 'agent.deleted', limit: 5 }).length === 1);
+
+    // 4. 原 token 立即失效（401）
+    res = await app.request('/agents/me/inbox', { headers: H(worker.token) });
+    assert.equal(res.status, 401);
+  } finally {
+    rig.cleanup();
+  }
+});
+
 test('单用户：校验——空句柄/保留句柄/乱码 422 且无副作用；句柄与他人冲突 409', async () => {
   const rig = mkRig();
   try {
