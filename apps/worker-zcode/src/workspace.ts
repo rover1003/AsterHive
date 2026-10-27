@@ -184,6 +184,17 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
   return { dir, mode: 'repo', taskId: opts.taskId, branch, baseCommit, cloned, pulled, push: opts.push, log };
 }
 
+/** Execution succeeded; code work additionally needs a stored commit before it may be submitted. */
+export function canSubmitExecution(input: {
+  exitCode: number | null;
+  commitHash?: string;
+  commitFailed?: boolean;
+  noCode: boolean;
+}): boolean {
+  if (input.exitCode !== 0 || input.commitFailed) return false;
+  return input.noCode || Boolean(input.commitHash);
+}
+
 /** 任务结束后提交成果（repo/managed 模式）：有变更才 commit，返回 hash；无变更返回 undefined。永不自动 push 除非 ws.push */
 export async function commitWorkspace(ws: PreparedWorkspace, message: string): Promise<string | undefined> {
   if (ws.mode === 'scratch') return undefined; // scratch 模式无 git 语义

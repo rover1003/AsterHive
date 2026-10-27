@@ -227,6 +227,8 @@ export function releaseTask(ctx: Ctx, actor: Agent, taskId: string, reason?: str
 export interface SubmitInput {
   summary: string;
   evidence?: Task['evidence'];
+  /** Explicit no-code results remain in manual Review; they are never auto-approved. */
+  noCode?: boolean;
 }
 
 export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: SubmitInput): Task {
@@ -245,10 +247,15 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   if (reviewCount.n >= reviewLimit) {
     throw new HttpError(409, `WIP limit reached for Review on board ${task.boardId} (limit ${reviewLimit})`);
   }
+  const noCodeAuthorized = task.workspace.noCode === true;
+  const noCode = noCodeAuthorized;
+  if (input.noCode === true && !noCodeAuthorized) {
+    throw new HttpError(409, 'no-code submission is not authorized by this task; set workspace.noCode=true when creating a no-code task');
+  }
   const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
   let reviewerEnabled = false;
   try {
-    reviewerEnabled = JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && board.repoMode === 'managed';
+    reviewerEnabled = !noCode && JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && board.repoMode === 'managed';
   } catch { /* invalid settings fall back to manual review */ }
   const evidence = [...(task.evidence ?? []), ...(input.evidence ?? [])];
   return withWrite(ctx, 'task.submit', () => {
@@ -262,6 +269,7 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
       summary: input.summary.trim(),
       evidence: input.evidence ?? [],
       reviewerEnabled,
+      noCode,
     });
     if (reviewerEnabled) logEvent(ctx, 'task.review_queued', { taskId, boardId: task.boardId });
     messageInner(ctx, {
@@ -270,7 +278,7 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
       kind: 'submit',
       content: reviewerEnabled
         ? `@主脑 ${taskId} 已完成并排队独立审核：${input.summary.trim()}`
-        : `@主脑 ${taskId} 已完成：${input.summary.trim()}`,
+        : `@主脑 ${taskId} 已完成并进入人工验收${noCode ? '（无代码任务）' : ''}：${input.summary.trim()}`,
     });
     return getTask(ctx, taskId);
   });

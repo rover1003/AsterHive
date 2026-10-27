@@ -306,7 +306,9 @@ export class RepoManager {
     const repo = this.repoPath(boardId);
     const targetRef = `refs/asterhive/tasks/${taskId}`;
     const headRes = await runGit(['rev-parse', targetRef], repo);
-    if (headRes.code !== 0 || !headRes.stdout.trim()) throw new HttpError(404, `task ref ${targetRef} not found`);
+    if (headRes.code !== 0 || !headRes.stdout.trim()) {
+      throw new HttpError(404, `task ref ${targetRef} not found; confirm the worker successfully uploaded a task result bundle via POST /tasks/${taskId}/repo-result (HTTP 200), then retry review`);
+    }
     const head = headRes.stdout.trim();
     const taskRow = this.#ctx.holder.db.prepare('SELECT review_summary, submit_summary, review_status FROM task WHERE id=? AND board_id=?').get(taskId, boardId) as { review_summary: string; submit_summary: string; review_status: string } | undefined;
     if (!taskRow) throw new HttpError(404, `task not found: ${taskId}`);
@@ -340,7 +342,9 @@ export class RepoManager {
     const repo = this.repoPath(boardId);
     const targetRef = `refs/asterhive/tasks/${taskId}`;
     const headRes = await runGit(['rev-parse', targetRef], repo);
-    if (headRes.code !== 0 || !headRes.stdout.trim()) throw new HttpError(404, `task ref ${targetRef} not found`);
+    if (headRes.code !== 0 || !headRes.stdout.trim()) {
+      throw new HttpError(404, `task ref ${targetRef} not found; confirm the worker successfully uploaded a task result bundle via POST /tasks/${taskId}/repo-result (HTTP 200), then retry integration`);
+    }
     const taskCommit = headRes.stdout.trim();
 
     // 结构化合并：在临时工作树中尝试 merge 到 bare 仓库 HEAD 指向的默认分支

@@ -88,7 +88,7 @@ export const TOOL_DEFS: ToolDef[] = [
   ),
   tool(
     'asterhive_submit',
-    '完成执行：提交总结与证据文件清单，卡进 Review 并在聊天室自动 @主脑 报告。',
+    '完成执行：提交总结与证据文件清单，卡进 Review 并在聊天室自动 @主脑 报告。noCode 仅可用于任务卡 workspace.noCode=true 的明确无代码任务；这类任务进入人工验收，绝不自动通过。',
     {
       taskId: z.string(),
       summary: z.string(),
@@ -101,8 +101,9 @@ export const TOOL_DEFS: ToolDef[] = [
           }),
         )
         .optional(),
+      noCode: z.boolean().optional(),
     },
-    (ctx, a, args) => submitTask(ctx, a, args.taskId, { summary: args.summary, evidence: args.evidence }),
+    (ctx, a, args) => submitTask(ctx, a, args.taskId, { summary: args.summary, evidence: args.evidence, noCode: args.noCode }),
   ),
   tool(
     'asterhive_release',

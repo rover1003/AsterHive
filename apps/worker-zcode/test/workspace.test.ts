@@ -5,6 +5,18 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { commitWorkspace, prepareWorkspace } from '../src/workspace.ts';
+import * as workspaceModule from '../src/workspace.ts';
+
+test('execution submission gate rejects failed execution and missing code commit, but permits explicit no-code work', () => {
+  const workspace = workspaceModule as unknown as {
+    canSubmitExecution?: (input: { exitCode: number | null; commitHash?: string; commitFailed?: boolean; noCode: boolean }) => boolean;
+  };
+  assert.equal(workspace.canSubmitExecution?.({ exitCode: 1, commitHash: 'abc123', noCode: false }), false);
+  assert.equal(workspace.canSubmitExecution?.({ exitCode: 0, noCode: false }), false);
+  assert.equal(workspace.canSubmitExecution?.({ exitCode: 0, commitHash: 'abc123', noCode: false }), true);
+  assert.equal(workspace.canSubmitExecution?.({ exitCode: 0, noCode: true }), true);
+  assert.equal(workspace.canSubmitExecution?.({ exitCode: 0, commitFailed: true, noCode: true }), false);
+});
 
 // 项目工作区持久化（T15 / §9.4）：repo 模式 clone/pull --rebase/任务分支/本地 commit，
 // scratch 模式一次性目录；clone 失败抛错阻塞、绝不静默 fallback。

@@ -183,6 +183,13 @@ EXECUTOR_MODE=rpc ASTERHIVE_URL=http://<your-server>:8067 node apps/worker-zcode
 | 主脑验收合并 | `asterhive_repo_inspect_task` + `integrate` | 查看提交证据 | 查看文件证据 |
 | 本地生命周期 | 任务提交后自动清理临时目录 | 持久保留工作区 | 保留目录 |
 
+### 无代码任务与安全上交
+
+- 研究、调研等无需修改项目源码的任务，建卡时显式设置 `workspace: { "noCode": true }`。这只是声明该任务无需代码提交，不代表任务已通过验收。
+- Worker 成功执行后以 `noCode: true` 提交（官方 worker 根据任务卡标记自动处理；SDK/HTTP 客户端可显式传入）。任务进入人工 Review，不进入自动 diff Reviewer，也不会自动移入 Done。未在任务卡声明的 no-code 标记会被服务器拒绝。
+- 对 `repo` / `managed` 代码任务，执行退出码必须为 0 且必须产生真实 commit；执行异常、commit 或 bundle 回传失败、或无代码变更但任务未显式标记 noCode 时，不会 submit。Worker 会记录 checkpoint、释放任务供后续处理，并保留工作区现场；修复后可重领重做。
+- 托管审核若提示 `task ref ... not found`，先确认 Worker 对 `POST /tasks/:id/repo-result` 收到 HTTP 200；缺失 ref 的审核保持 failed/Review，不会自动通过。补齐有效结果 bundle 后，由有权限的用户/蜂后重试审核。
+
 ## 取活与生命周期
 
 **轮询即心跳**：进程常驻，每 `POLL_MS` 轮询一次；执行任务期间不并发取活。绑单板时只巡检该板；多板巡检模式（`ASTERHIVE_BOARD` 缺省）逐板尝试、命中即止（一次仍只做一张卡），非参与者板 403 自动跳过。每板取活三通道，按序命中即止：

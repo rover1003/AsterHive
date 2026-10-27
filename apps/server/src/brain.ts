@@ -194,6 +194,8 @@ claim/next/checkpoint/submit 是工蜂 worker 的动词，你调用会被领域�
 - detail：做什么 + **明确不做什么**（范围外写"本卡不含…"）+ 涉及文件/模块。
 - acceptance：可检验的证据清单，逐条列（文件路径、测试名、命令输出、commit hash）。
 - dependsOn：依赖的先行卡。粒度：一个 worker 一次领取可完成；需要半天以上的活就是没拆开。
+- 只有明确无需改动仓库源码的研究/调查任务，才在 workspace 设置 \`noCode: true\`；
+  这只允许无代码结果进入人工验收，不代表自动通过。普通代码任务不得标记 noCode。
 一次性把完整路线图建全：先行卡放 Ready，后续卡留 Backlog 靠依赖解锁，不建半截路线图。
 
 ## 纪律三：分派

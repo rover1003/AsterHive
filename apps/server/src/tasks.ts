@@ -589,7 +589,7 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
       try {
         reviewerEnabled = JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && getBoard(ctx, row.board_id).repoMode === 'managed';
       } catch { /* Invalid settings retain manual review behavior. */ }
-      if (reviewerEnabled) throw new HttpError(403, 'reviewer workflow owns Review task transitions');
+      if (reviewerEnabled && row.review_status !== 'none') throw new HttpError(403, 'reviewer workflow owns Review task transitions');
     }
     // 信任分层（§5.2）：Review→Done（及 Done 的任何移出/移入）仅主脑/用户可操作
     if ((laneChanges.to === 'Done' || laneChanges.from === 'Done') && actor.role === 'worker') {
@@ -748,7 +748,12 @@ export function failTaskReview(ctx: Ctx, taskId: string, summary: string): void 
     ctx.holder.db.prepare("UPDATE task SET review_status='failed', review_summary=?, updated_at=? WHERE id=?")
       .run(message, Date.now(), taskId);
     logEvent(ctx, 'task.review_failed', { taskId, boardId: task.boardId, summary: message });
-    messageInner(ctx, { boardId: task.boardId, author: 'asterhive-brain', kind: 'system', content: `⚠ ${taskId} 的独立审核未能完成，任务仍停留在 Review，未自动通过。请检查审核员模型配置后重试。` });
+    messageInner(ctx, {
+      boardId: task.boardId,
+      author: 'asterhive-brain',
+      kind: 'system',
+      content: `⚠ ${taskId} 的独立审核未能完成，任务仍停留在 Review，未自动通过。\n\n失败详情：${message}\n\n请依据详情排查：task ref 不存在时确认工蜂已成功上传 repo-result bundle；审核模型调用失败时检查 reviewer 模型组配置。修复原因后可重试审核。`,
+    });
   });
 }
 

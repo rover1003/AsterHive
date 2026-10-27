@@ -545,10 +545,12 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     const body = (await c.req.json().catch(() => ({}))) as {
       summary?: string;
       evidence?: { path: string; machine?: string; note?: string }[];
+      noCode?: boolean;
     };
     const task = submitTask(ctx, actor, c.req.param('id'), {
       summary: body.summary ?? '',
       evidence: body.evidence,
+      noCode: body.noCode,
     });
     return c.json({ task, by: actor.id });
   });

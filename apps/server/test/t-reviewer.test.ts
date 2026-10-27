@@ -18,6 +18,7 @@ import {
   failTaskReview,
   retryTaskReview,
   recoverReviewerClaims,
+  updateTask,
 } from '../src/tasks.ts';
 import { submitTask, claimTask } from '../src/verbs.ts';
 import { getOrchestratorSettings, putOrchestratorSettings, createOrchestratorGroup } from '../src/settings.ts';
@@ -120,6 +121,66 @@ test('独立 Reviewer 配置：组引用校验、secret 不回显、删除组自
     const deleted = await app.request(`/settings/orchestrator/groups/${group.id}`, { method: 'DELETE' });
     assert.equal(deleted.status, 200);
     assert.equal(getOrchestratorSettings(rig.ctx).reviewerGroupId, null);
+  } finally { rig.cleanup(); }
+});
+
+test('Reviewer: managed no-code submission remains available for manual review without an automated pass', async () => {
+  const rig = mkRig();
+  try {
+    const workerReg = registerAgent(rig.ctx, { name: 'Research Worker', handle: 'research-worker' });
+    const worker = workerReg.agent;
+    createBoard(rig.ctx, { id: 'research-review', name: 'Research', repoMode: 'managed', repoStatus: 'ready' });
+    createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
+    putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
+    createTask(rig.ctx, 'research-review', { id: 'REV-20', title: 'Research without code', lane: 'Ready', workspace: { noCode: true } });
+    claimTask(rig.ctx, worker, 'REV-20');
+
+    const app = createApp(rig.ctx);
+    const response = await app.request('/tasks/REV-20/submit', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${workerReg.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ summary: '调查结论与来源已记录。' }),
+    });
+    assert.equal(response.status, 200);
+    const { task: submitted } = await response.json() as { task: { lane: string; reviewStatus: string; submitSummary: string } };
+
+    assert.equal(submitted.lane, 'Review');
+    assert.equal(submitted.reviewStatus, 'none', 'no-code work must not be sent to the diff reviewer');
+    assert.equal(submitted.submitSummary, '调查结论与来源已记录。');
+    assert.ok(!listEvents(rig.ctx, { type: 'task.review_queued', limit: 10 }).some((e) => e.payload.taskId === 'REV-20'));
+    assert.equal(updateTask(rig.ctx, ensureBrainAgent(rig.ctx), 'REV-20', { lane: 'Done' }).lane, 'Done', 'manual review can explicitly accept no-code work');
+
+    createTask(rig.ctx, 'research-review', { id: 'REV-22', title: 'Code task', lane: 'Ready' });
+    claimTask(rig.ctx, worker, 'REV-22');
+    assert.throws(() => submitTask(rig.ctx, worker, 'REV-22', { summary: 'not code', noCode: true }), /not authorized/);
+    assert.equal(getTask(rig.ctx, 'REV-22').lane, 'InProgress');
+
+  } finally { rig.cleanup(); }
+});
+
+test('Reviewer: submitted managed code without a server task ref fails with actionable recovery guidance', async () => {
+  const rig = mkRig();
+  try {
+    const worker = registerAgent(rig.ctx, { name: 'Worker', handle: 'missing-ref-worker' }).agent;
+    createBoard(rig.ctx, { id: 'missing-ref', name: 'Missing Ref', repoMode: 'managed', repoStatus: 'ready' });
+    createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
+    putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
+    createTask(rig.ctx, 'missing-ref', { id: 'REV-21', title: 'Code change without uploaded ref', lane: 'Ready' });
+    claimTask(rig.ctx, worker, 'REV-21');
+    submitTask(rig.ctx, worker, 'REV-21', { summary: '提交了代码改动' });
+
+    const claimed = claimTaskForReview(rig.ctx, 'REV-21');
+    assert.ok(claimed);
+    const failure = await new RepoManager(rig.ctx).inspectTask('missing-ref', 'REV-21').then(
+      () => new Error('expected missing task ref to fail'),
+      (err: unknown) => err instanceof Error ? err : new Error(String(err)),
+    );
+    assert.match(failure.message, /task ref refs\/asterhive\/tasks\/REV-21 not found/);
+    failTaskReview(rig.ctx, 'REV-21', failure.message);
+    const task = getTask(rig.ctx, 'REV-21');
+    assert.equal(task.reviewStatus, 'failed');
+    assert.match(task.reviewSummary, /repo-result|bundle|上传|检查/);
+    assert.equal(task.lane, 'Review');
   } finally { rig.cleanup(); }
 });
 

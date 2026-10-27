@@ -57,7 +57,7 @@ export interface Task {
   priority: string;
   category: string;
   acceptance: string;
-  workspace: Record<string, string>;
+  workspace: Record<string, unknown>;
   files: string[];
   evidence: { path: string; machine?: string; note?: string }[];
   protectedPaths: string[];
@@ -253,10 +253,11 @@ export class Worker {
     return call(this.#baseUrl, this.#token, 'POST', `/tasks/${taskId}/checkpoint`, { note });
   }
 
-  async submit(taskId: string, summary: string, evidence?: Task['evidence']): Promise<Task> {
+  async submit(taskId: string, summary: string, evidence?: Task['evidence'], options?: { noCode?: boolean }): Promise<Task> {
     const r = await call<{ task: Task }>(this.#baseUrl, this.#token, 'POST', `/tasks/${taskId}/submit`, {
       summary,
       evidence,
+      noCode: options?.noCode,
     });
     return r.task;
   }

@@ -158,6 +158,10 @@ function parseArgs(argv: string[]): { flags: Record<string, string>; rest: strin
       continue;
     }
     const key = arg.slice(2);
+    if (key === 'no-code') {
+      flags[key] = 'true';
+      continue;
+    }
     const value = argv[i + 1];
     if (value === undefined || value.startsWith('--')) {
       throw new Error(`--${key} 缺少取值（含 "=" 的写法：--${key}=<值>）`);
@@ -391,8 +395,8 @@ async function main(): Promise<void> {
     }
     case 'submit': {
       const id = rest[1];
-      if (!id) throw new Error('用法：submit <任务号> --summary "..." [--evidence "docs/x.md@机器,src/y.ts@机器"]');
-      console.log(JSON.stringify(await requireWorker(cfg).submit(id, need(flags, 'summary'), parseEvidence(flags.evidence))));
+      if (!id) throw new Error('用法：submit <任务号> --summary "..." [--evidence "docs/x.md@机器,src/y.ts@机器"] [--no-code]');
+      console.log(JSON.stringify(await requireWorker(cfg).submit(id, need(flags, 'summary'), parseEvidence(flags.evidence), { noCode: flags['no-code'] === 'true' })));
       break;
     }
     case 'release': {

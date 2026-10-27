@@ -29,7 +29,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { homedir, hostname } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
+import { canSubmitExecution, commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
 import { firstSkip, nextBoardsToPoll } from './polling.ts';
 import { runPiPrompt } from './pi-executor.ts';
 import {
@@ -650,36 +650,68 @@ async function main(): Promise<void> {
           // hive_checkpoint 落点：模型在里程碑/受阻时主动汇报，服务器的干预消息原样带回
           checkpoint: (note) => worker.checkpoint(task.id, note),
         });
+      } catch (err) {
+        const reason = `执行异常：${err instanceof Error ? err.message : String(err)}；工作区已保留，任务结果未上交。`;
+        await worker.checkpoint(task.id, reason);
+        await worker.release(task.id, reason);
+        log(`${reason} 已释放 ${task.id}`);
+        return;
       } finally {
         clearInterval(keepAliveTimer);
       }
       const { stdout, code } = execRes;
       log(`执行结束（exit=${code}），输出 ${stdout.length} 字符`);
-      const cp2 = await worker.checkpoint(task.id, code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），仍上交现场`);
+      const noCode = task.workspace.noCode === true;
+      const cp2 = await worker.checkpoint(task.id, code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），现场已保留且不会上交`);
       logPending(cp2.pendingMessages);
+      if (code !== 0) {
+        const reason = `执行器退出码 ${code}，任务结果未上交；工作区已保留，修复后可重新执行。`;
+        await worker.checkpoint(task.id, reason);
+        await worker.release(task.id, reason);
+        log(`${reason} 已释放 ${task.id}`);
+        return;
+      }
 
-      // 成果提交：repo / managed 模式统一由 commitWorkspace 处理
+      // 代码仓库任务必须有真实提交；明确标记的无代码任务进入人工验收。
       let commitNote = '';
+      let commitHash: string | undefined;
+      let commitFailed = false;
       let evidence = collectEvidence(ws.dir);
       if (ws.mode === 'repo' || ws.mode === 'managed') {
         try {
-          const hash = await commitWorkspace(ws, task.title);
-          if (hash) {
-            commitNote = `\n[workspace] 本地提交 ${ws.branch}@${hash}（${ws.changedFiles?.length ?? 0} 个文件${ws.mode === 'managed' ? '，已回传服务器仓库' : ws.push ? '，已推送 origin' : '，未推送'}）`;
+          commitHash = await commitWorkspace(ws, task.title);
+          if (commitHash) {
+            commitNote = `\n[workspace] 本地提交 ${ws.branch}@${commitHash}（${ws.changedFiles?.length ?? 0} 个文件${ws.mode === 'managed' ? '，已回传服务器仓库' : ws.push ? '，已推送 origin' : '，未推送'}）`;
             evidence = (ws.changedFiles ?? []).map((p) => ({ path: p, machine: hostname() }));
-            evidence.push({ path: `git:${ws.branch}@${hash}`, machine: hostname() });
+            evidence.push({ path: `git:${ws.branch}@${commitHash}`, machine: hostname() });
           } else {
             commitNote = '\n[workspace] 工作区无文件变更，未产生提交';
           }
         } catch (err) {
+          commitFailed = true;
           const reason = err instanceof Error ? err.message : String(err);
           commitNote = `\n[workspace] 提交失败：${reason}`;
-          log(`提交失败（仍上交现场）：${reason}`);
+          log(`提交失败（现场已保留，不会上交）：${reason}`);
         }
       }
 
+      if ((ws.mode === 'repo' || ws.mode === 'managed') && !canSubmitExecution({
+        exitCode: code,
+        commitHash,
+        commitFailed,
+        noCode,
+      })) {
+        const reason = commitFailed
+          ? `代码提交失败，任务结果未上交；工作区 ${ws.dir} 已保留，请修复提交问题后重试。`
+          : `代码任务没有产生可回传的提交。若该卡确为无代码任务，请在建卡时设置 workspace.noCode=true；工作区 ${ws.dir} 已保留。`;
+        await worker.checkpoint(task.id, reason);
+        await worker.release(task.id, reason);
+        log(`${reason} 已释放 ${task.id}`);
+        return;
+      }
+
       const summary = (stdout.trim().split('\n').slice(-6).join('\n') || '(无输出)') + commitNote;
-      await worker.submit(task.id, summary, evidence);
+      await worker.submit(task.id, summary, evidence, { noCode });
       log(`已上交 ${task.id}，证据 ${evidence.length} 项`);
 
       // managed 模式：成功交活后销毁本机临时目录
