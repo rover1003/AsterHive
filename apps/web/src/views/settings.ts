@@ -57,12 +57,11 @@ export async function render(el: HTMLElement): Promise<void> {
         <div class="field"><label for="oc-reviewer-enabled">独立审核员</label>
           <select id="oc-reviewer-enabled"><option value="off">关闭（蜂后手动验收）</option><option value="on">启用（托管仓库自动审核）</option></select>
         </div>
-        <div class="field"><label for="oc-reviewer-group">审核模型（复用下方模型组完整清单）</label>
+        <div class="field"><label for="oc-reviewer-group">审核模型</label>
           <div style="display:flex; gap:8px; align-items:stretch">
             <select id="oc-reviewer-group" style="flex:1; min-width:0"><option value="">跟随蜂后当前模型组</option></select>
             <button class="sm" id="oc-reviewer-refresh" style="height:auto" title="绕过 60 秒缓存，强制重新拉取各组模型清单">刷新</button>
           </div>
-          <div id="oc-reviewer-hint" class="muted small">清单来自各组上游 /models，与下方模型组共用同一次拉取</div>
         </div>
       </div>
       <div class="inline-form">
@@ -293,11 +292,6 @@ export async function render(el: HTMLElement): Promise<void> {
       }
     }
     sel.innerHTML = parts.join('');
-    const hint = el.querySelector('#oc-reviewer-hint') as HTMLElement;
-    const withCache = groups.filter((g) => modelCache.get(g.id)?.models?.length);
-    hint.textContent = withCache.length
-      ? `已复用 ${withCache.length} 个模型组的清单（最近更新 ${new Date(Math.max(...withCache.map((g) => modelCache.get(g.id)!.fetchedAt))).toLocaleTimeString()}）`
-      : '清单来自各组上游 /models，与下方模型组共用同一次拉取';
   }
 
   // 全局状态行：启用态与激活组配置是否齐全（与服务端 #turn 的启动条件一致）

@@ -64,7 +64,7 @@ export async function render(el: HTMLElement): Promise<void> {
         <p class="hint" style="margin-bottom:4px"><b>Linux / macOS（bash）</b></p>`}
         <pre class="cmd-line"><code id="bee-cmd">${esc(beeBashCmd)}</code></pre>
         <button class="sm" id="bee-copy">复制命令</button>
-        <p class="hint" style="margin-top:6px">服务器地址已按当前浏览器访问的地址自动注入（<code>${esc(location.origin)}</code>）——复制即可执行，无需手填；若从其他地址访问该服务器，请先修改命令中的地址再复制。装好的工蜂默认多板巡检，看板参与在本页看板管理里勾选；Windows 计划任务、Linux systemd 用户服务均可随时卸载重装。</p>
+        <p class="hint" style="margin-top:6px">装好的工蜂默认多板巡检，看板参与在本页看板管理里勾选。</p>
       </div>
       <div class="panel">
         <h3>已有 agent 接入（自举协议）</h3>
