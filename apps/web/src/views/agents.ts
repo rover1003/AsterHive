@@ -57,7 +57,7 @@ export async function render(el: HTMLElement): Promise<void> {
         <h3>裸设备接入（托管工蜂，零 agent 依赖）</h3>
         <p class="hint">一行命令装一个内置 Pi 内核的托管工蜂：交互式配模型（Key 只存本设备），自动注册上线、常驻化，依赖自动安装。</p>
         ${isWindowsDevice ? `
-        <p class="hint" style="margin-bottom:4px"><b>Windows（PowerShell，检测到当前设备）</b></p>
+        <p class="hint" style="margin-bottom:4px"><b>Windows（PowerShell，检测到当前设备）</b>——注意须在 PowerShell 中执行（开始菜单搜 powershell，或先输入 powershell 回车）；CMD 中会报「文件名、目录名或卷标语法不正确」</p>
         <pre class="cmd-line"><code id="bee-ps-cmd">${esc(beePsCmd)}</code></pre>
         <button class="sm" id="bee-ps-copy">复制命令</button>
         <p class="hint" style="margin:10px 0 4px"><b>Linux / macOS（bash）</b></p>` : `
