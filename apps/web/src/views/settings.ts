@@ -58,11 +58,11 @@ export async function render(el: HTMLElement): Promise<void> {
           <select id="oc-reviewer-enabled"><option value="off">关闭（蜂后手动验收）</option><option value="on">启用（托管仓库自动审核）</option></select>
         </div>
         <div class="field"><label for="oc-reviewer-group">审核模型（复用下方模型组完整清单）</label>
-          <div class="inline-form">
-            <select id="oc-reviewer-group" style="flex:1;min-width:220px"><option value="">跟随蜂后当前模型组</option></select>
-            <button class="sm" id="oc-reviewer-refresh" title="绕过 60 秒缓存，强制重新拉取各组模型清单">刷新</button>
+          <div style="display:flex; gap:8px; align-items:stretch">
+            <select id="oc-reviewer-group" style="flex:1; min-width:0"><option value="">跟随蜂后当前模型组</option></select>
+            <button class="sm" id="oc-reviewer-refresh" style="height:auto" title="绕过 60 秒缓存，强制重新拉取各组模型清单">刷新</button>
           </div>
-          <div id="oc-reviewer-hint" class="muted small" style="margin-top:6px">清单来自各组上游 /models，与下方模型组共用同一次拉取</div>
+          <div id="oc-reviewer-hint" class="muted small">清单来自各组上游 /models，与下方模型组共用同一次拉取</div>
         </div>
       </div>
       <div class="inline-form">
