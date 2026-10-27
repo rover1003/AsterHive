@@ -45,7 +45,9 @@ function Test-NodeOk {
 
 $NodeExe = 'node'
 if (Test-NodeOk) {
-  Log "使用系统 Node $(& node -p 'process.versions.node')"
+  $nodeCmd = Get-Command node -ErrorAction Stop
+  $NodeExe = $nodeCmd.Source
+  Log "使用系统 Node $(& $NodeExe -p 'process.versions.node') ($NodeExe)"
 } else {
   Log "系统 Node 缺失或 < $NodeMinMajor，自动安装便携版 Node 24 …"
   $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
@@ -153,10 +155,33 @@ $config = Join-Path $configDir 'worker.json'
 try { icacls $config /inheritance:r /grant:r "$env:USERNAME`:(R,W)" | Out-Null } catch {}
 Log "配置已写入 $config（含模型 Key，仅当前用户可读）"
 
-# ---- 5. 常驻化：注册计划任务（登录自启 + 崩溃自动重启，无时长上限） ----
-Log '注册计划任务 AsterHive worker（登录自启、崩溃自动重启）…'
+# ---- 5. 首次自测与注册上线（前台 --once 运行） ----
+Log '执行工蜂首次自测与注册（--once 模式，向 Hive 自助注册）…'
 $workerMain = Join-Path $AppDir 'apps\worker-zcode\src\main.ts'
-$action = New-ScheduledTaskAction -Execute $NodeExe -Argument "--experimental-strip-types `"$workerMain`"" -WorkingDirectory $AppDir
+Push-Location $AppDir
+try {
+  & $NodeExe --experimental-strip-types "$workerMain" --once
+  if ($LASTEXITCODE -ne 0) {
+    Warn "工蜂首次运行返回非零码（exit=$LASTEXITCODE），请检查上方输出。"
+  }
+} catch {
+  Warn "工蜂首次运行异常：$($_.Exception.Message)"
+} finally {
+  Pop-Location
+}
+
+# ---- 6. 生成常驻启动器脚本（start-worker.cmd，带日志重定向） ----
+$startCmd = Join-Path $BeeHome 'start-worker.cmd'
+$cmdContent = @"
+@echo off
+cd /d "$AppDir"
+"$NodeExe" --experimental-strip-types "$workerMain" >> "$BeeHome\worker.log" 2>&1
+"@
+[System.IO.File]::WriteAllText($startCmd, $cmdContent, [System.Text.Encoding]::Default)
+
+# ---- 7. 常驻化：注册计划任务（登录自启 + 崩溃自动重启，无时长上限） ----
+Log '注册计划任务 AsterHive worker（登录自启、崩溃自动重启）…'
+$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$startCmd`"" -WorkingDirectory $AppDir
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `
   -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -164,8 +189,7 @@ Register-ScheduledTask -TaskName 'AsterHive worker' -Action $action -Trigger $tr
 Start-ScheduledTask -TaskName 'AsterHive worker'
 Log '计划任务已注册并启动。'
 
-# ---- 6. 等待注册上线并回显 ----
-Start-Sleep -Seconds 4
+# ---- 8. 回显已注册身份 ----
 $handle = $null
 $tokenFile = Join-Path $AppDir 'apps\worker-zcode\work\token.txt'
 if (Test-Path $tokenFile) {
@@ -174,10 +198,11 @@ if (Test-Path $tokenFile) {
 }
 Write-Host ''
 Write-Host '=========================================='
-Write-Host '  ✅ 工蜂安装完成'
-if ($handle) { Write-Host "  句柄：@$handle（Fleet 总览中可见）" }
+Write-Host '  ✅ 工蜂安装与注册完成'
+if ($handle) { Write-Host "  句柄：@$handle（Hive 控制台已实时点亮）" }
 Write-Host "  Hive：$HiveUrl"
-Write-Host "  源码：$AppDir   日志：$BeeHome\worker.log"
+Write-Host "  源码：$AppDir"
+Write-Host "  日志：$BeeHome\worker.log"
 Write-Host '  执行内核：内置 Pi（无需本机任何 agent CLI）；模型 Key 仅存本机'
 Write-Host '  常驻：计划任务 AsterHive worker（登录自启，taskschd.msc 可管理）'
 Write-Host '=========================================='

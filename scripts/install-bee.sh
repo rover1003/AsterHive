@@ -185,7 +185,11 @@ fs.writeFileSync(path, JSON.stringify(cfg, null, 2), { mode: 0o600 });
 chmod 600 "$CONFIG" 2>/dev/null || true
 log "配置已写入 $CONFIG（含模型 Key，权限 0600）"
 
-# 5. 常驻化：优先 systemd 用户服务（开机自启 + 崩溃重启），否则后台进程
+# 5. 首次自测与注册上线（前台 --once 单轮运行）
+log "执行工蜂首次自测与注册（--once 模式，向 Hive 自助注册）…"
+( cd "$APP_DIR" && "$NODE_BIN" --experimental-strip-types apps/worker-zcode/src/main.ts --once ) || warn "工蜂首次运行返回非零码，请检查上方输出。"
+
+# 6. 常驻化：优先 systemd 用户服务（开机自启 + 崩溃重启），否则后台进程
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/asterhive-worker.service"
 if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1 || [ -d "$UNIT_DIR" ]; then
