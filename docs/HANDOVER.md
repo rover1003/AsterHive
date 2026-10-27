@@ -135,6 +135,26 @@ AsterHive 是一个专为可信局域网/分布式物理设备设计的 **多设
   - 若在当前 Hive 仍有效，强制保留原 Handle 与 Token，杜绝重装产生 `-2`、`-3` 冗余工蜂；
   - 若已在服务器注销（返回 401），则自动触发自愈重注册。
 
+### 5. 项目代码库初始化规则与引导机制（Managed Repo Onboarding）
+
+为彻底解决新建看板后“蜂后不理解初始化”及用户不知如何将代码导入服务器的问题，系统建立了完整的自动化检测、工具链与引导闭环：
+- **概念与目的**：
+  - “初始化项目代码库”是指为看板在 AsterHive 服务器建立持久化托管 Bare 主仓（`/data/repos/<boardId>.git`）；
+  - 这是后续所有跨设备工蜂拉取任务快照 bundle、在临时分支开发自测并由独立 Reviewer 自动合并的前提。
+- **触发时机**：
+  1. 新建看板（`board.created`）且代码库处于 `empty` 状态时；
+  2. 看板仓库配置更新（`board.updated` 变更了 `repo` 或 `repoSource`）时；
+  3. 用户在聊天室主动提及“初始化项目”、“拉取代码”或“导入仓库”时。
+- **蜂后能力与工具链**：
+  - **`asterhive_board_repo_status(boardId)`**：蜂后随时查询看板主仓状态（`repoMode`, `repoStatus`: empty/queued/running/ready/failed, `head`, `source`），并给出 `needsInit` 诊断；
+  - **`asterhive_board_repo_init(boardId, mode, url)`**：
+    - `mode: 'clone'`：服务端直接发起从远程 Git 地址拉取并建立主仓；
+    - `mode: 'local_import'`：为用户生成精确的源设备 CLI 导入命令（`node packages/sdk/src/cli.ts repo import --board <boardId> --path <本机目录> --url <hiveUrl>`）；
+    - `mode: 'empty'`：建立初始空仓库。
+  - **蜂后纪律九（系统提示词规范）**：未初始化前绝不盲目建代码卡；主动在聊天室 @用户 并提供“A: 远程克隆 / B: 本机目录导入 / C: 空项目 / D: 暂不初始化”四个选项，并按用户意图调用工具执行。
+- **Web 界面状态横幅**：
+  - 看板页面顶部检测到 `managed` 模式且 `repoStatus === 'empty'` 时，自动渲染醒目的黄色引导横幅，并提供“复制导入命令”快捷按钮。
+
 ---
 
 ## 四、当前开发进度与里程碑状态
