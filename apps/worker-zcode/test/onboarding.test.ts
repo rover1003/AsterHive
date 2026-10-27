@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { SdkError, Worker, defaultWorkerIdentity, registerWithRetry } from '@asterhive/sdk';
-import { firstSkip, nextBoardsToPoll } from '../src/polling.ts';
+import { firstSkip, nextBoardsToPoll, BOARD_REFRESH_MS } from '../src/polling.ts';
 
 // 接入极简化：默认身份规则（sdk）、注册 409 冲突自愈（sdk，fetch stub 可控 409 序列）、
 // 多板巡检状态决策（polling.ts 纯函数）。命令编排薄壳（cli.ts / main.ts）不在此测。
@@ -143,7 +143,7 @@ test('多板巡检: 刷新窗口内不刷新、返回全部已知板（副本）
 });
 
 test('多板巡检: 超过刷新周期 → 到点刷新（自定义周期同样生效）', () => {
-  const REF = 5 * 60_000;
+  const REF = BOARD_REFRESH_MS;
   assert.equal(nextBoardsToPoll(['b1'], { now: REF + 1, lastRefresh: 1 }).refreshDue, true); // 恰好一个周期
   assert.equal(nextBoardsToPoll(['b1'], { now: REF, lastRefresh: 1 }).refreshDue, false); // 差 1ms 不刷
   assert.equal(nextBoardsToPoll(['b1'], { now: 1001, lastRefresh: 1, refreshMs: 1000 }).refreshDue, true);
