@@ -1,4 +1,4 @@
-﻿# AsterHive（星巢）托管工蜂（Bee）一键安装脚本 —— Windows 原生 PowerShell
+# AsterHive（星巢）托管工蜂（Bee）一键安装脚本 —— Windows 原生 PowerShell
 #
 # 一行命令（在 PowerShell 中执行；推荐由 Web「Agent 接入」页复制——服务器地址已自动注入）：
 #   $env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
