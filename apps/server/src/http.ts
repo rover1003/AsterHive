@@ -1153,6 +1153,8 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   const SCRIPT_FILES = new Set([
     'install-bee.ps1',
     'install-bee.sh',
+    'activate-bee.ps1',
+    'activate-bee.sh',
     'uninstall-bee.ps1',
     'uninstall-bee.sh',
     'worker.tar.gz',

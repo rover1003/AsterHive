@@ -47,6 +47,8 @@ export async function render(el: HTMLElement): Promise<void> {
     // 服务器地址直接打到本实例（/scripts/ 端点），脚本自动内嵌服务器地址，无需手动填参数或配环境变量。
     const beeBashCmd = `curl -fsSL ${location.origin}/scripts/install-bee.sh | bash`;
     const beePsCmd = `irm ${location.origin}/scripts/install-bee.ps1 | iex`;
+    const activateBashCmd = `curl -fsSL ${location.origin}/scripts/activate-bee.sh | bash`;
+    const activatePsCmd = `irm ${location.origin}/scripts/activate-bee.ps1 | iex`;
     const unbeeBashCmd = `curl -fsSL ${location.origin}/scripts/uninstall-bee.sh | bash`;
     const unbeePsCmd = `irm ${location.origin}/scripts/uninstall-bee.ps1 | iex`;
     const isWindowsDevice = /Windows/i.test(navigator.userAgent);
@@ -54,7 +56,7 @@ export async function render(el: HTMLElement): Promise<void> {
     const runCmd = `ASTERHIVE_URL=${location.origin} node <仓库>/apps/worker-zcode/src/main.ts`;
     const regCmd = `node <仓库>/packages/sdk/src/cli.ts register --url ${location.origin}`;
     el.innerHTML = `
-      <div class="view-head"><h2>${icon.plug} Agent 接入</h2><span class="hint">接入只需从本页复制一条命令；显示名/句柄自动生成</span></div>
+      <div class="view-head"><h2>${icon.plug} Agent 管理</h2><span class="hint">接入、激活和管理设备上的工蜂</span></div>
       <div class="panel">
         <h3>裸设备接入（托管工蜂，零 agent 依赖）</h3>
         <p class="hint">一行命令装一个内置 Pi 内核的托管工蜂：交互式配模型（Key 只存本设备），自动注册上线、常驻化，依赖自动安装。</p>
@@ -81,6 +83,16 @@ export async function render(el: HTMLElement): Promise<void> {
             <button class="sm" id="unbee-copy">复制卸载命令</button>
           </div>
         </details>
+      </div>
+      <div class="panel">
+        <h3>激活已有工蜂</h3>
+        <p class="hint">在安装过工蜂的目标设备终端执行；保留现有身份和配置，不重新注册。必要时会备份并修补旧版工蜂的自动注册代码。激活后可能立即领取已指派任务。</p>
+        <p class="hint"><b>Windows（PowerShell）</b></p>
+        <pre class="cmd-line"><code>${esc(activatePsCmd)}</code></pre>
+        <button class="sm" id="activate-ps-copy">复制激活命令</button>
+        <p class="hint"><b>Linux / macOS（bash）</b></p>
+        <pre class="cmd-line"><code>${esc(activateBashCmd)}</code></pre>
+        <button class="sm" id="activate-copy">复制激活命令</button>
       </div>
       <div class="panel">
         <h3>已有 agent 接入（自举协议）</h3>
@@ -166,6 +178,8 @@ export async function render(el: HTMLElement): Promise<void> {
     if (isWindowsDevice) wireCopy('#bee-ps-copy', () => beePsCmd, '复制命令');
     wireCopy('#unbee-copy', () => unbeeBashCmd, '复制卸载命令');
     if (isWindowsDevice) wireCopy('#unbee-ps-copy', () => unbeePsCmd, '复制卸载命令');
+    wireCopy('#activate-copy', () => activateBashCmd, '复制激活命令');
+    wireCopy('#activate-ps-copy', () => activatePsCmd, '复制激活命令');
     wireCopy('#skill-copy', () => bootLine, '复制这句话');
     wireCopy('#run-copy', () => runCmd, '复制命令');
     wireCopy('#cmd-copy', () => regCmd, '复制命令');

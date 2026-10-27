@@ -19,7 +19,7 @@ interface ViewModule {
 const ROUTES: Record<string, { label: string; icon: string; load: () => Promise<ViewModule> }> = {
   '#/board': { label: '项目', icon: icon.folder, load: () => import('./views/board.ts') },
   '#/fleet': { label: 'Agent 总览', icon: icon.hive, load: () => import('./views/fleet.ts') },
-  '#/agents': { label: 'Agent 接入', icon: icon.plug, load: () => import('./views/agents.ts') },
+  '#/agents': { label: 'Agent 管理', icon: icon.plug, load: () => import('./views/agents.ts') },
   '#/settings': { label: '设置', icon: icon.gear, load: () => import('./views/settings.ts') },
   '#/audit': { label: '审计', icon: icon.list, load: () => import('./views/audit.ts') },
 };

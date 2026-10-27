@@ -675,7 +675,7 @@ export async function render(el: HTMLElement): Promise<void> {
                 </label>`,
                     )
                     .join('')
-                : '<div class="muted small">暂无已注册 worker，可先到「Agent 接入」页注册</div>'}
+                : '<div class="muted small">暂无已注册 worker，可先到「Agent 管理」页注册</div>'}
             </div>
             <button id="m-participants-save">保存参与者</button>
           </div>
