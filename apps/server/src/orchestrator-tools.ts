@@ -265,13 +265,15 @@ export const TOOL_DEFS: ToolDef[] = [
       }
       const mgr = new RepoManager(ctx);
       if (args.mode === 'local_import') {
-        const hiveUrl = `http://${ctx.cfg.host || '127.0.0.1'}:${ctx.cfg.port}`;
+        const port = process.env.PORT ?? '8067';
+        const host = process.env.HOST && process.env.HOST !== '0.0.0.0' ? process.env.HOST : '127.0.0.1';
+        const hiveUrl = `http://${host}:${port}`;
         return {
           mode: 'local_import',
           boardId: board.id,
           instruction: '请用户在拥有项目源码的设备终端中运行以下命令（源码将以 Git bundle 完整历史流式上传到星巢主仓）：',
           command: `node packages/sdk/src/cli.ts repo import --board ${board.id} --path <你的本机项目目录> --url ${hiveUrl}`,
-          notes: '导入前请确保源工作树干净（无未提交修改）。导入成功后服务器主仓将自动就绪。',
+          notes: '若从其他物理设备导入，请将 URL 中的 IP 换为本星巢服务器的局域网 IP。导入前请确保源工作树干净（无未提交修改）。导入成功后服务器主仓将自动就绪。',
         };
       }
       if (args.mode === 'clone') {
