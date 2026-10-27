@@ -1,15 +1,16 @@
 # AsterHive（星巢）托管工蜂（Bee）一键安装脚本 —— Windows 原生 PowerShell
 #
-# 一行命令（在 PowerShell 中执行；推荐由 Web「Agent 接入」页复制——服务器地址已自动注入）：
-#   $env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
-#   （地址解析顺序：$env:ASTERHIVE_URL → 命令行参数 & ([scriptblock]::Create((irm <本脚本url>))) 'http://<hive-ip>:8067' → 交互提问）
+# 一行命令（在 PowerShell 中执行；从 Web「Agent 接入」页复制——服务器地址已自动内嵌）：
+#   irm http://<hive-ip>:8067/scripts/install-bee.ps1 | iex
+#   （地址解析顺序：$env:ASTERHIVE_URL → 命令行参数 → 服务端自动内嵌注入 → 交互提问）
 #
 # 全自动依赖检测与部署：Node ≥23.6 缺失/过旧 → 自动下载便携版并写入用户 PATH；
-# 源码/依赖从 GitHub 自动拉取（tar 不可用时回退 zip）；安装完成后注册计划任务常驻化。
+# 源码优先从本局域网 Hive 实例内网直拉（50KB 秒级直达），无需依赖 GitHub 外网；
 # 模型 Key 只写本设备（%USERPROFILE%\.asterhive\worker.json），服务器不经手。
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
+$InjectedHiveUrl = '__HIVE_URL_PLACEHOLDER__'
 $Repo   = if ($env:ASTERHIVE_REPO) { $env:ASTERHIVE_REPO } else { 'https://github.com/rover1003/AsterHive' }
 $Ref    = if ($env:ASTERHIVE_REF)  { $env:ASTERHIVE_REF }  else { 'main' }
 $BeeHome = if ($env:BEE_HOME)      { $env:BEE_HOME }       else { Join-Path $env:USERPROFILE '.asterhive-worker' }
@@ -21,9 +22,10 @@ function Log($m)  { Write-Host "[bee] $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "[bee] $m" -ForegroundColor Yellow }
 function Die($m)  { Write-Host "[bee] $m" -ForegroundColor Red; exit 1 }
 
-# ---- 0. Hive 地址：env 优先 → 命令行参数次之 → 交互提问；取得后探活 ----
+# ---- 0. Hive 地址：env 优先 → 命令行参数次之 → 服务端内嵌地址 → 交互提问；取得后探活 ----
 $HiveUrl = $env:ASTERHIVE_URL
 if (-not $HiveUrl -and $args.Count -gt 0) { $HiveUrl = [string]$args[0] }
+if (-not $HiveUrl -and $InjectedHiveUrl -and $InjectedHiveUrl -notlike '*PLACEHOLDER*') { $HiveUrl = $InjectedHiveUrl }
 if (-not $HiveUrl) {
   Write-Host ''
   $HiveUrl = Read-Host 'Hive 服务器地址（如 http://192.168.1.10:8067，见部署完成输出或 Web「Agent 接入」页）'
@@ -80,7 +82,7 @@ try {
   if (Test-Path $candidate) { $NpmCmd = $candidate }
 } catch { } # 系统 Node 场景 npm 在 PATH 中，直接用 npm
 
-# ---- 2. 依赖自动部署：源码 + npm 依赖（重装前先停旧任务/旧进程，防文件占用） ----
+# ---- 2. 源码下载：优先从 Hive 服务器直拉，外网不可用时自愈 ----
 Log "停止旧的 AsterHive worker（如有）…"
 try { Stop-ScheduledTask -TaskName 'AsterHive worker' -ErrorAction SilentlyContinue } catch {}
 try { Unregister-ScheduledTask -TaskName 'AsterHive worker' -Confirm:$false -ErrorAction SilentlyContinue } catch {}
@@ -88,24 +90,38 @@ Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyCon
   Where-Object { $_.CommandLine -like '*worker-zcode*' } |
   ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
 
-Log "下载 worker 源码（$Repo @$Ref）…"
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-$tmpTgz = Join-Path $env:TEMP "asterhive-worker-$Ref.tar.gz"
-$ok = $false
-foreach ($u in @("$Repo/archive/refs/heads/$Ref.tar.gz", "$Repo/archive/refs/tags/$Ref.tar.gz")) {
-  try { Invoke-WebRequest -Uri $u -OutFile $tmpTgz -TimeoutSec 600; $ok = $true; break } catch {}
+$tmpTgz = Join-Path $env:TEMP "asterhive-worker-bundle.tar.gz"
+$sourceOk = $false
+
+# 优先通道：从本地内网 Hive 实例直接拉取工蜂源码包（局域网秒级搞定，零 GitHub 依赖）
+$hiveTgzUrl = "$($HiveUrl.TrimEnd('/'))/scripts/worker.tar.gz"
+try {
+  Log "从 Hive 服务器下载工蜂源码包（$hiveTgzUrl）…"
+  Invoke-WebRequest -Uri $hiveTgzUrl -OutFile $tmpTgz -TimeoutSec 30
+  if ((Get-Item $tmpTgz).Length -gt 1024) { $sourceOk = $true; Log "内网源码包获取成功。" }
+} catch {
+  Warn "内网源码包下载未成功，尝试从 GitHub 拉取…"
 }
-if (-not $ok) { Die "源码下载失败：请检查网络与 ASTERHIVE_REF=$REF。" }
+
+# 回退通道：GitHub archive
+if (-not $sourceOk) {
+  foreach ($u in @("$Repo/archive/refs/heads/$Ref.tar.gz", "$Repo/archive/refs/tags/$Ref.tar.gz")) {
+    try { Invoke-WebRequest -Uri $u -OutFile $tmpTgz -TimeoutSec 600; $sourceOk = $true; break } catch {}
+  }
+}
+if (-not $sourceOk) { Die "工蜂源码获取失败：内网与 GitHub 均不可达，请检查网络。" }
+
+# 解压到 AppDir
 if (Get-Command tar -ErrorAction SilentlyContinue) {
-  tar -xzf $tmpTgz -C $AppDir --strip-components=1
+  # 如果是 Hive 打包的 worker.tar.gz，根为工作区结构直接解压；如果是 github 的带顶层目录
+  try {
+    tar -xzf $tmpTgz -C $AppDir
+  } catch {
+    tar -xzf $tmpTgz -C $AppDir --strip-components=1
+  }
 } else {
-  # 极老系统无 bsdtar：回退 zip 包 + Expand-Archive
-  $tmpZip = Join-Path $env:TEMP "asterhive-worker-$Ref.zip"
-  Invoke-WebRequest -Uri "$Repo/archive/refs/heads/$Ref.zip" -OutFile $tmpZip -TimeoutSec 600
-  Expand-Archive -Path $tmpZip -DestinationPath $AppDir -Force
-  $inner = Get-ChildItem $AppDir -Directory | Select-Object -First 1
-  Get-ChildItem $inner.FullName | Move-Item -Destination $AppDir -Force
-  Remove-Item $inner.FullName -Force; Remove-Item $tmpZip -Force
+  Die "解压需要 tar 命令（Windows 10/11 内置 bsdtar）。"
 }
 Remove-Item $tmpTgz -Force -ErrorAction SilentlyContinue
 
@@ -159,15 +175,18 @@ Log "配置已写入 $config（含模型 Key，仅当前用户可读）"
 Log '执行工蜂首次自测与注册（--once 模式，向 Hive 自助注册）…'
 $workerMain = Join-Path $AppDir 'apps\worker-zcode\src\main.ts'
 Push-Location $AppDir
+$testExit = 0
 try {
   & $NodeExe --experimental-strip-types "$workerMain" --once
-  if ($LASTEXITCODE -ne 0) {
-    Warn "工蜂首次运行返回非零码（exit=$LASTEXITCODE），请检查上方输出。"
-  }
+  $testExit = $LASTEXITCODE
 } catch {
+  $testExit = 1
   Warn "工蜂首次运行异常：$($_.Exception.Message)"
 } finally {
   Pop-Location
+}
+if ($testExit -ne 0) {
+  Die "工蜂首次自测或注册失败（exit=$testExit）。请根据上方具体错误排查；本次未注册后台计划任务，避免静默失败挂起。"
 }
 
 # ---- 6. 生成常驻启动器脚本（start-worker.cmd，带日志重定向） ----
@@ -199,7 +218,11 @@ if (Test-Path $tokenFile) {
 Write-Host ''
 Write-Host '=========================================='
 Write-Host '  ✅ 工蜂安装与注册完成'
-if ($handle) { Write-Host "  句柄：@$handle（Hive 控制台已实时点亮）" }
+if ($handle) {
+  Write-Host "  句柄：@$handle（Hive 控制台已实时点亮）"
+} else {
+  Warn "  警告：未从 $tokenFile 读到注册句柄，请检查 $BeeHome\worker.log。"
+}
 Write-Host "  Hive：$HiveUrl"
 Write-Host "  源码：$AppDir"
 Write-Host "  日志：$BeeHome\worker.log"

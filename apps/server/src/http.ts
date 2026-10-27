@@ -984,6 +984,52 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.body(readBootstrapSource(file), 200, { 'content-type': 'text/plain; charset=utf-8' });
   });
 
+  // ---- 托管脚本与工蜂源码包分发（/scripts/）----
+  // 支持 install-bee / uninstall-bee 脚本及 worker.tar.gz 源码包内网直拉分发；
+  // 返回脚本时动态将 __HIVE_URL_PLACEHOLDER__ 替换为当前请求实际 base origin，实现内网零配置直连。
+  const SCRIPT_FILES = new Set([
+    'install-bee.ps1',
+    'install-bee.sh',
+    'uninstall-bee.ps1',
+    'uninstall-bee.sh',
+    'worker.tar.gz',
+  ]);
+
+  function resolveScriptFile(file: string): string {
+    const candidates = [
+      fileURLToPath(new URL(`../../../scripts/${file}`, import.meta.url)),
+      fileURLToPath(new URL(`../../scripts/${file}`, import.meta.url)),
+      fileURLToPath(new URL(`../scripts/${file}`, import.meta.url)),
+    ];
+    for (const p of candidates) {
+      if (existsSync(p)) return p;
+    }
+    throw new HttpError(404, `script file not found: ${file}`);
+  }
+
+  app.get('/scripts/:file', (c) => {
+    const file = c.req.param('file');
+    if (!SCRIPT_FILES.has(file)) {
+      throw new HttpError(404, `unknown script: ${file}`);
+    }
+    const filePath = resolveScriptFile(file);
+    if (file.endsWith('.tar.gz')) {
+      const buffer = readFileSync(filePath);
+      return c.body(buffer, 200, {
+        'content-type': 'application/gzip',
+        'cache-control': 'no-cache',
+        'content-disposition': `attachment; filename="${file}"`,
+      });
+    }
+    let content = readFileSync(filePath, 'utf8');
+    const base = new URL(c.req.url).origin;
+    content = content.replaceAll('__HIVE_URL_PLACEHOLDER__', base);
+    return c.body(content, 200, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-cache',
+    });
+  });
+
   // ---- MCP 服务端（Streamable HTTP，挂在 /mcp）----
   // 分派服务器自身即 MCP 服务：桌面 agent 会话配一个 URL + Bearer token 即成 worker/主脑。
   mountMcp(app, ctx);

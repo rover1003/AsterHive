@@ -22,7 +22,7 @@ import {
   detectDeviceSpecs,
   type Task,
   type PendingMessage,
-} from '@asterhive/sdk';
+} from './sdk.ts';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';

@@ -27,6 +27,7 @@ Write-Host '  AsterHive 工蜂卸载与销毁'
 Write-Host '=========================================='
 
 # ---- 1. 读取本地配置与身份凭据 ----
+$InjectedHiveUrl = '__HIVE_URL_PLACEHOLDER__'
 $hiveUrl = $env:ASTERHIVE_URL
 $token = $null
 $handle = $null
@@ -50,6 +51,9 @@ if (Test-Path $Config) {
 
 if (-not $hiveUrl -and $args.Count -gt 0) {
   $hiveUrl = [string]$args[0]
+}
+if (-not $hiveUrl -and $InjectedHiveUrl -and $InjectedHiveUrl -notlike '*PLACEHOLDER*') {
+  $hiveUrl = $InjectedHiveUrl
 }
 
 # ---- 2. 停止并删除 Windows 计划任务与相关进程 ----

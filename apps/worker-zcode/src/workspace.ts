@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Worker } from '@asterhive/sdk';
+import type { Worker } from './sdk.ts';
 
 export interface PreparedWorkspace {
   dir: string;                         // 实际执行 cwd

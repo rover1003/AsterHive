@@ -44,11 +44,11 @@ export async function render(el: HTMLElement): Promise<void> {
     // 复制给 agent 的就是这句话本身（不含"告诉任何 agent："前缀）
     const bootLine = `访问 ${skillUrl} 并照做——它会自己完成注册、学习循环并常驻`;
     // 托管工蜂（T19）：一行命令在裸设备装内置 Pi 工蜂（交互式配模型，Key 只存设备）——按设备系统给 bash / PowerShell 两条。
-    // 服务器地址自动注入当前浏览器访问的 origin，复制即可用、无需手填；PS 用环境变量内联传址（命令不带注释尾巴）。
-    const beeBashCmd = `curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- ${location.origin}`;
-    const beePsCmd = `$env:ASTERHIVE_URL='${location.origin}'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)`;
-    const unbeeBashCmd = `curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.sh | bash -s -- ${location.origin}`;
-    const unbeePsCmd = `$env:ASTERHIVE_URL='${location.origin}'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.ps1)`;
+    // 服务器地址直接打到本实例（/scripts/ 端点），脚本自动内嵌服务器地址，无需手动填参数或配环境变量。
+    const beeBashCmd = `curl -fsSL ${location.origin}/scripts/install-bee.sh | bash`;
+    const beePsCmd = `irm ${location.origin}/scripts/install-bee.ps1 | iex`;
+    const unbeeBashCmd = `curl -fsSL ${location.origin}/scripts/uninstall-bee.sh | bash`;
+    const unbeePsCmd = `irm ${location.origin}/scripts/uninstall-bee.ps1 | iex`;
     const isWindowsDevice = /Windows/i.test(navigator.userAgent);
     // 附注（人类手动操作时）：--url 默认当前 origin（同源部署）；<仓库> 由设备主人按 docs/WORKER.md clone 后替换
     const runCmd = `ASTERHIVE_URL=${location.origin} node <仓库>/apps/worker-zcode/src/main.ts`;

@@ -47,16 +47,20 @@ curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/in
 
 **裸设备（推荐，零 agent 依赖）**——一行命令装一个内置 Pi 执行内核的托管工蜂，交互式配置模型（API Key 只存本设备），自动注册上线并常驻。所有依赖（含 Node ≥ 23.6）脚本自动检测并安装：
 
-Linux / macOS（bash）：
+Linux / macOS（bash；推荐直接从部署好的 Hive 服务内网拉取，秒级且自动注入地址）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- http://<hive-ip>:8067
+curl -fsSL http://<hive-ip>:8067/scripts/install-bee.sh | bash
+# 或从 GitHub 备用安装：
+# curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.sh | bash -s -- http://<hive-ip>:8067
 ```
 
-Windows（PowerShell；把地址换成你的 Hive 服务器，或从 Web「Agent 接入」页复制已注入地址的命令）：
+Windows（PowerShell；推荐直接从 Web「Agent 接入」页一键复制）：
 
 ```powershell
-$env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
+irm http://<hive-ip>:8067/scripts/install-bee.ps1 | iex
+# 或从 GitHub 备用安装：
+# $env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/install-bee.ps1)
 ```
 
 装好的工蜂以内置 Pi 会话执行任务，自带 Hive 工作区纪律与汇报协议；Linux 常驻为 systemd 用户服务，Windows 常驻为计划任务。
@@ -65,10 +69,10 @@ $env:ASTERHIVE_URL='http://<hive-ip>:8067'; iex (irm https://raw.githubuserconte
 
 ```bash
 # Linux / macOS (bash)
-curl -fsSL https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.sh | bash
+curl -fsSL http://<hive-ip>:8067/scripts/uninstall-bee.sh | bash
 
 # Windows (PowerShell)
-iex (irm https://raw.githubusercontent.com/rover1003/AsterHive/main/scripts/uninstall-bee.ps1)
+irm http://<hive-ip>:8067/scripts/uninstall-bee.ps1 | iex
 ```
 
 **已有 agent**——把下面这句话发给任意设备上已有的 agent（CLI 或桌面会话均可），它会照做自举：

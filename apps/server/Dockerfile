@@ -22,6 +22,10 @@ COPY apps/server/src apps/server/src
 # worker CLI 自举源码（/bootstrap/ 端点原样分发）：仅 packages/sdk/src 下两个 .ts 小文件
 COPY packages/sdk/src /app/sdk/
 COPY skills /app/skills
+COPY scripts /app/scripts
+COPY apps/worker-zcode /app/apps/worker-zcode
+COPY packages/sdk /app/packages/sdk
+RUN tar -czf /app/scripts/worker.tar.gz package.json apps/worker-zcode packages/sdk
 COPY --from=web /repo/apps/web/dist /app/public
 
 ENV HOST=0.0.0.0 \

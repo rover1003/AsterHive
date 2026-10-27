@@ -394,3 +394,38 @@ test('自举快捷通道：/bootstrap/ 返回下载指引，cli.ts/index.ts 原�
     rig.cleanup();
   }
 });
+
+test('托管脚本与源码分发：/scripts/ 动态注入当前服务器 origin，worker.tar.gz 返回二进制，未知文件 404', async () => {
+  const rig = mkRig();
+  try {
+    const app = createApp(rig.ctx);
+
+    // 请求 install-bee.ps1：动态替换 __HIVE_URL_PLACEHOLDER__ 为请求的 origin
+    const ps = await app.request('http://hive.local:8067/scripts/install-bee.ps1');
+    assert.equal(ps.status, 200);
+    assert.match(ps.headers.get('content-type') ?? '', /text\/plain/);
+    const psText = await ps.text();
+    assert.ok(psText.includes('http://hive.local:8067'), '已注入请求的 origin 地址');
+    assert.ok(!psText.includes('__HIVE_URL_PLACEHOLDER__'), '占位符已被完全替换');
+
+    // 请求 install-bee.sh：同样替换
+    const sh = await app.request('http://hive.local:8067/scripts/install-bee.sh');
+    assert.equal(sh.status, 200);
+    const shText = await sh.text();
+    assert.ok(shText.includes('http://hive.local:8067'), '已注入请求的 origin 地址');
+    assert.ok(!shText.includes('__HIVE_URL_PLACEHOLDER__'), '占位符已被完全替换');
+
+    // worker.tar.gz 二进制流
+    const gz = await app.request('/scripts/worker.tar.gz');
+    assert.equal(gz.status, 200);
+    assert.equal(gz.headers.get('content-type'), 'application/gzip');
+    const buf = await gz.arrayBuffer();
+    assert.ok(buf.byteLength > 1024, '工蜂源码 tarball 大小正常');
+
+    // 未知脚本 404
+    const miss = await app.request('/scripts/evil.sh');
+    assert.equal(miss.status, 404);
+  } finally {
+    rig.cleanup();
+  }
+});

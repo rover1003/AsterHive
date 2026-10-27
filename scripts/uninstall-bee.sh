@@ -12,6 +12,7 @@
 set -u
 
 BEE_HOME="${BEE_HOME:-$HOME/.asterhive-worker}"
+INJECTED_HIVE_URL="__HIVE_URL_PLACEHOLDER__"
 APP_DIR="$BEE_HOME/app"
 CONFIG="$HOME/.asterhive/worker.json"
 TOKEN_FILE="$APP_DIR/apps/worker-zcode/work/token.txt"
@@ -26,6 +27,9 @@ echo "=========================================="
 
 # ---- 1. 读取本地配置与身份凭据 ----
 HIVE_URL="${1:-${ASTERHIVE_URL:-}}"
+if [ -z "$HIVE_URL" ] && [ -n "$INJECTED_HIVE_URL" ] && [[ "$INJECTED_HIVE_URL" != *"PLACEHOLDER"* ]]; then
+  HIVE_URL="$INJECTED_HIVE_URL"
+fi
 TOKEN=""
 HANDLE=""
 
