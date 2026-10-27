@@ -20,6 +20,7 @@ export interface PreparedWorkspace {
   mode: 'repo' | 'scratch' | 'managed'; // repo=持久克隆；scratch=无 repo 一次性目录；managed=服务端托管临时快照
   taskId: string;                      // 所属任务号
   branch?: string;                     // 任务分支
+  baseCommit?: string;                 // 基线提交 hash
   commitHash?: string;                 // 执行后提交的 hash
   pulled?: boolean;                    // 是否执行了 pull --rebase
   cloned?: boolean;                    // 是否新 clone
@@ -129,6 +130,7 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
       mode: 'managed',
       taskId: opts.taskId,
       branch,
+      baseCommit: snap.baseCommit,
       worker: opts.worker,
       cleanup: () => rmSync(baseDir, { recursive: true, force: true }),
       log,
@@ -170,6 +172,8 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
     cloned = true;
   }
 
+  const baseCommit = (await git(['rev-parse', 'HEAD'], dir, '读取基线提交失败')).trim();
+
   // 干活前切任务分支：新建；同名分支已存在（同任务重做/续做）则复用并提示
   const co = await runGit(['checkout', '-b', branch], dir);
   if (co.code !== 0) {
@@ -177,7 +181,7 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
     await git(['checkout', branch], dir, '切换任务分支失败，需人工处理');
   }
 
-  return { dir, mode: 'repo', taskId: opts.taskId, branch, cloned, pulled, push: opts.push, log };
+  return { dir, mode: 'repo', taskId: opts.taskId, branch, baseCommit, cloned, pulled, push: opts.push, log };
 }
 
 /** 任务结束后提交成果（repo/managed 模式）：有变更才 commit，返回 hash；无变更返回 undefined。永不自动 push 除非 ws.push */
@@ -186,21 +190,46 @@ export async function commitWorkspace(ws: PreparedWorkspace, message: string): P
   const log = ws.log ?? (() => {});
   const branch = ws.branch!;
 
-  // 先看有没有变更（此时还没 add，porcelain 覆盖未跟踪/已修改/已暂存/已删除）
+  // 1. 检查是否有未暂存/未提交变更
   const st = await git(['status', '--porcelain', '-z'], ws.dir, '读取工作区状态失败');
   const changed = parseStatusZ(st);
-  if (changed.length === 0) {
-    log('工作区无文件变更，不产生提交');
+  let commitMade = false;
+  if (changed.length > 0) {
+    await git(['add', '-A'], ws.dir, '暂存变更失败');
+    await git(['commit', '-m', `asterhive(${ws.taskId}): ${message}`], ws.dir, '提交失败（检查设备 git 全局 user.name/email 配置）');
+    commitMade = true;
+  }
+
+  // 2. 检查任务分支当前 HEAD 与基线
+  const hash = (await git(['rev-parse', 'HEAD'], ws.dir, '读取提交 hash 失败')).trim();
+  const isNewCommit = ws.baseCommit
+    ? (hash !== ws.baseCommit && hash !== ws.commitHash)
+    : (commitMade || (ws.commitHash ? hash !== ws.commitHash : false));
+  const hasNewCommits = commitMade || isNewCommit;
+
+  if (!hasNewCommits && changed.length === 0) {
+    log('工作区无文件变更，且任务分支无新增提交，不产生提交');
     return undefined;
   }
 
-  // author 用设备 git 全局配置，不代设（没有配置时 commit 失败并带出原因）
-  await git(['add', '-A'], ws.dir, '暂存变更失败');
-  await git(['commit', '-m', `asterhive(${ws.taskId}): ${message}`], ws.dir, '提交失败（检查设备 git 全局 user.name/email 配置）');
-  const hash = (await git(['rev-parse', 'HEAD'], ws.dir, '读取提交 hash 失败')).trim();
+  // 3. 汇总变更文件清单（模型已自行 commit 的场景，从 diff HEAD~1 或与 baseCommit 差量提取）
+  if (changed.length > 0) {
+    ws.changedFiles = changed;
+  } else if (ws.baseCommit && hash !== ws.baseCommit) {
+    const diffOut = await runGit(['diff', '--name-only', ws.baseCommit, 'HEAD'], ws.dir);
+    ws.changedFiles = diffOut.code === 0 && diffOut.stdout.trim()
+      ? diffOut.stdout.trim().split(/\r?\n/).filter(Boolean)
+      : [];
+  } else {
+    const diffHead = await runGit(['diff', '--name-only', 'HEAD~1', 'HEAD'], ws.dir);
+    ws.changedFiles = diffHead.code === 0 && diffHead.stdout.trim()
+      ? diffHead.stdout.trim().split(/\r?\n/).filter(Boolean)
+      : [];
+  }
+
   ws.commitHash = hash;
-  ws.changedFiles = changed;
-  log(`已提交 ${hash.slice(0, 10)}（${changed.length} 个文件）到分支 ${branch}`);
+  ws.baseCommit = hash;
+  log(`已确认提交 ${hash.slice(0, 10)}（${ws.changedFiles?.length ?? 0} 个文件）到分支 ${branch}`);
 
   // managed 模式：打包当前任务分支并回传给服务器
   if (ws.mode === 'managed') {
