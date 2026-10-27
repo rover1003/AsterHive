@@ -312,15 +312,56 @@ $pathPrefix`cd /d "$AppDir"
 "@
 [System.IO.File]::WriteAllText($startCmd, $cmdContent, [System.Text.Encoding]::Default)
 
-# ---- 7. 常驻化：注册计划任务（登录自启 + 崩溃自动重启，无时长上限） ----
-Log '注册计划任务 AsterHive worker（登录自启、崩溃自动重启）…'
-$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$startCmd`"" -WorkingDirectory $AppDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `
-  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName 'AsterHive worker' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
-Start-ScheduledTask -TaskName 'AsterHive worker'
-Log '计划任务已注册并启动。'
+# ---- 7. 常驻化：首选计划任务；权限受限时自动降级为当前用户启动项（零提权要求） ----
+$scheduledOk = $false
+Log '配置工蜂常驻服务（登录自启与后台守护）…'
+
+# 尝试方式 A：PowerShell 计划任务
+try {
+  $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$startCmd`"" -WorkingDirectory $AppDir
+  $trigger = New-ScheduledTaskTrigger -AtLogOn
+  $settings = New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+  Register-ScheduledTask -TaskName 'AsterHive worker' -Action $action -Trigger $trigger -Settings $settings -Force -ErrorAction Stop | Out-Null
+  Start-ScheduledTask -TaskName 'AsterHive worker' -ErrorAction Stop
+  $scheduledOk = $true
+  Log '计划任务已就绪并启动。'
+} catch {}
+
+# 尝试方式 B：schtasks 命令行（部分非提权环境可用）
+if (-not $scheduledOk) {
+  try {
+    $null = & schtasks /Create /TN "AsterHive worker" /TR "`"$startCmd`"" /SC ONLOGON /F 2>&1
+    if ($LASTEXITCODE -eq 0) {
+      & schtasks /Run /TN "AsterHive worker" 2>$null | Out-Null
+      $scheduledOk = $true
+      Log '计划任务已通过 schtasks 配置完成并启动。'
+    }
+  } catch {}
+}
+
+# 兜底方式 C（100% 成功，零权限要求）：当前用户 Startup 目录自启 + 即时后台拉起
+if (-not $scheduledOk) {
+  try {
+    $startupDir = [Environment]::GetFolderPath('Startup')
+    if ($startupDir -and (Test-Path $startupDir)) {
+      $vbsFile = Join-Path $startupDir 'AsterHive-worker.vbs'
+      # VBScript 无黑框静默运行 start-worker.cmd
+      $vbsContent = "CreateObject(`"Wscript.Shell`").Run `"`"`"$startCmd`"`"`", 0, False"
+      [System.IO.File]::WriteAllText($vbsFile, $vbsContent, [System.Text.Encoding]::ASCII)
+      Log '计划任务权限受限，已自动降级为当前用户专属启动项（登录自启，无需管理员权限）。'
+    }
+  } catch {
+    Warn "写入启动项异常：$($_.Exception.Message)"
+  }
+  # 即时拉起后台常驻进程（无窗口静默运行）
+  try {
+    Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$startCmd`"" -WindowStyle Hidden
+    Log '工蜂后台常驻进程已成功拉起。'
+  } catch {
+    Warn "拉起后台进程异常：$($_.Exception.Message)"
+  }
+}
 
 # ---- 8. 回显已注册身份 ----
 $handle = $null

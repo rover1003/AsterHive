@@ -57,14 +57,26 @@ if (-not $hiveUrl -and $InjectedHiveUrl -and $InjectedHiveUrl -notlike '*PLACEHO
 }
 
 # ---- 2. 停止并删除 Windows 计划任务与相关进程 ----
-Log '停止并注销计划任务 AsterHive worker…'
-try {
-  Stop-ScheduledTask -TaskName 'AsterHive worker' -ErrorAction SilentlyContinue
-  Unregister-ScheduledTask -TaskName 'AsterHive worker' -Confirm:$false -ErrorAction SilentlyContinue
-  Log '计划任务已清理。'
-} catch {
-  Warn "计划任务清理跳过：$($_.Exception.Message)"
-}
+  Log '停止并注销计划任务 AsterHive worker…'
+  try {
+    Stop-ScheduledTask -TaskName 'AsterHive worker' -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName 'AsterHive worker' -Confirm:$false -ErrorAction SilentlyContinue
+    Log '计划任务已清理。'
+  } catch {
+    Warn "计划任务清理跳过：$($_.Exception.Message)"
+  }
+
+  # 清理用户专属 Startup 目录启动项
+  try {
+    $startupDir = [Environment]::GetFolderPath('Startup')
+    if ($startupDir) {
+      $vbsFile = Join-Path $startupDir 'AsterHive-worker.vbs'
+      if (Test-Path $vbsFile) {
+        Remove-Item $vbsFile -Force -ErrorAction SilentlyContinue
+        Log '已清理用户启动项。'
+      }
+    }
+  } catch {}
 
 Log '检查并终止运行中的工蜂进程…'
 $killed = 0
