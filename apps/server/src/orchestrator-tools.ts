@@ -9,6 +9,7 @@ import { HttpError, type Ctx } from './types.ts';
 import type { Agent } from './agents.ts';
 import {
   listBoards,
+  getBoard,
   listTasks,
   getTask,
   createTask,
@@ -223,6 +224,80 @@ export const TOOL_DEFS: ToolDef[] = [
   ),
 
   // ---- 托管仓库整合工具（仅主脑/用户可调用，worker 403）----
+  tool(
+    'asterhive_board_repo_status',
+    '查询指定看板的代码仓库托管模式与初始化状态（status: empty/queued/running/ready/failed, head, source, error 等），并评估是否需要初始化。',
+    { boardId: z.string() },
+    (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot inspect repository status');
+      const board = getBoard(ctx, args.boardId);
+      const mgr = new RepoManager(ctx);
+      const status = mgr.status(args.boardId);
+      const needsInit = board.repoMode === 'managed' && (status.repoStatus === 'empty' || status.repoStatus === 'failed');
+      return {
+        boardId: board.id,
+        boardName: board.name,
+        repoMode: board.repoMode,
+        repoStatus: status.repoStatus,
+        repoHead: status.repoHead,
+        repoSource: board.repoSource || board.repo,
+        repoError: status.repoError,
+        needsInit,
+        advice: needsInit
+          ? '项目代码库尚未初始化。请在聊天室询问用户是从远程 Git 仓库（如 GitHub）克隆，还是从本机目录导入。'
+          : (status.repoStatus === 'ready' ? '代码库已就绪，可正常开展工蜂开发与审核。' : `代码库正在后台处理中（状态：${status.repoStatus}）。`),
+      };
+    },
+  ),
+  tool(
+    'asterhive_board_repo_init',
+    '对指定看板发起代码库初始化或生成本机导入命令。mode 可选 clone（从远端 git 地址拉取）、empty（建立初始空主仓）、local_import（指导用户从本机目录导入）。',
+    {
+      boardId: z.string(),
+      mode: z.enum(['clone', 'empty', 'local_import']),
+      url: z.string().optional(),
+    },
+    async (ctx, a, args) => {
+      if (a.role === 'worker') throw new HttpError(403, 'workers cannot initialize repositories');
+      const board = getBoard(ctx, args.boardId);
+      if (board.repoMode !== 'managed') {
+        throw new HttpError(409, `看板 ${args.boardId} 为 remote-legacy 模式，仅 managed 看板支持服务端主仓初始化`);
+      }
+      const mgr = new RepoManager(ctx);
+      if (args.mode === 'local_import') {
+        const hiveUrl = `http://${ctx.cfg.host || '127.0.0.1'}:${ctx.cfg.port}`;
+        return {
+          mode: 'local_import',
+          boardId: board.id,
+          instruction: '请用户在拥有项目源码的设备终端中运行以下命令（源码将以 Git bundle 完整历史流式上传到星巢主仓）：',
+          command: `node packages/sdk/src/cli.ts repo import --board ${board.id} --path <你的本机项目目录> --url ${hiveUrl}`,
+          notes: '导入前请确保源工作树干净（无未提交修改）。导入成功后服务器主仓将自动就绪。',
+        };
+      }
+      if (args.mode === 'clone') {
+        const repoUrl = args.url?.trim() || board.repoSource?.trim() || board.repo?.trim();
+        if (!repoUrl) throw new HttpError(422, 'mode=clone 必须提供远程 Git 仓库 URL（如 https://github.com/...）');
+        mgr.initialize(board.id, 'clone', repoUrl);
+        return {
+          mode: 'clone',
+          boardId: board.id,
+          source: repoUrl,
+          status: 'queued',
+          message: `已向服务器提交从 ${repoUrl} 克隆初始化的后台任务。可调用 asterhive_board_repo_status 查看进度。`,
+        };
+      }
+      // mode === 'empty'
+      mgr.initialize(board.id, 'empty');
+      await mgr.waitForJob(board.id);
+      const st = mgr.status(board.id);
+      return {
+        mode: 'empty',
+        boardId: board.id,
+        status: st.repoStatus,
+        message: '已建立初始空仓库。后续可通过工蜂开发提交首个 commit。',
+      };
+    },
+  ),
   tool(
     'asterhive_repo_inspect_task',
     '检查任务分支代码变更（diff/stat 与改动文件列表），仅限 managed 看板中的任务。',

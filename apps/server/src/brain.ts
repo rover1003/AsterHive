@@ -242,7 +242,19 @@ worker 协作模型对三者完全一致。用户项目含未公开内容时：
   1. 调用 \`asterhive_worker_probe(agentId)\` 检查目标工蜂的健康状况、任务持续时间及受控通道连通度；
   2. 若探活显示受控通道可用且服务需要拉起，调用 \`asterhive_worker_restart(agentId, reason)\` 执行受控重启；
   3. 若需重新分配卡片，调用 \`asterhive_worker_release_stuck_task(agentId, taskId, reason)\` 解除卡死占用并将任务回退至 Ready；
-  4. 仅当探活报告目标设备物理不可达（如断网/关机/通道超时）时，才向用户陈述事实并请求人工兜底介入。`;
+  4. 仅当探活报告目标设备物理不可达（如断网/关机/通道超时）时，才向用户陈述事实并请求人工兜底介入。
+
+## 纪律九：项目代码库初始化总管
+当检测到新建看板、看板仓库配置变更，或用户在聊天室提到"初始化项目"、"拉取代码"、"导入仓库"时：
+1. **明确概念与目的**：初始化是指为看板建立服务器持久化托管主仓（/data/repos/<boardId>.git），这是后续多设备工蜂拉取快照、提交任务分支并由独立 Reviewer 自动合并的前提。
+2. **主动检查**：调用 \`asterhive_board_repo_status(boardId)\` 检查目标看板仓库状态：
+   - 若 \`needsInit\` 为 true 或 \`repoStatus === 'empty'\`：说明代码库尚未建立；
+   - 若用户尚未确认初始化方案，主动向用户提问并给出清晰选项（"检测到当前看板代码库尚未初始化。请问是：A) 从远程 Git 仓库（如 GitHub）克隆；还是 B) 从你本机现有代码目录导入？"）；
+3. **执行与引导**：
+   - 用户选择远程 Git 克隆（给出 URL）→ 调用 \`asterhive_board_repo_init(boardId, 'clone', url)\`，并在完成后向用户汇报拉取到的默认分支与最新提交 HEAD；
+   - 用户选择本机现有目录导入 → 调用 \`asterhive_board_repo_init(boardId, 'local_import')\`，将精确的 CLI 导入命令发给用户，指导其在源设备执行；
+   - 用户确认开始新建空项目 → 调用 \`asterhive_board_repo_init(boardId, 'empty')\` 建立初始空主仓。
+4. **仓库就绪前绝不盲目建业务卡**：在仓库状态就绪（ready）之前，不要盲目拆解具体的代码开发任务，因为工蜂无处拉取快照。`;
 
 const REVIEWER_SYSTEM_PROMPT = `你是 AsterHive 内置的独立代码审核员。你只对照验收标准检查本次代码差异，不参与任务规划、派发或实现。
 
@@ -366,7 +378,20 @@ function buildSnapshot(ctx: Ctx, focusBoardId?: string | null, triggerMessageId?
   lines.push(`【看板快照】${new Date().toISOString()}`);
 
   const reviewTasks: ReturnType<typeof listTasks> = [];
-  for (const b of listBoards(ctx)) {
+  const boards = listBoards(ctx);
+  const uninitBoards = boards.filter(
+    (b) => b.repoMode === 'managed' && (b.repoStatus === 'empty' || b.repoStatus === 'failed'),
+  );
+  if (uninitBoards.length > 0) {
+    lines.push('【代码库待初始化看板】');
+    for (const ub of uninitBoards) {
+      lines.push(
+        `  - 板 ${ub.id}（${ub.name}）：代码库状态为 ${ub.repoStatus || 'empty'}，尚未导入/克隆代码！请检查并主动向用户确认是否开始初始化。`,
+      );
+    }
+  }
+
+  for (const b of boards) {
     const parts: string[] = [];
     for (const lane of LANES) {
       const tasks = listTasks(ctx, b.id, { lane });
@@ -378,7 +403,8 @@ function buildSnapshot(ctx: Ctx, focusBoardId?: string | null, triggerMessageId?
       );
       if (lane === 'Review') reviewTasks.push(...tasks);
     }
-    if (parts.length > 0) lines.push(`板 ${b.id}（${b.name}）：`);
+    const repoInfo = b.repoMode === 'managed' ? `，模式: managed，主仓: ${b.repoStatus || 'empty'}` : '';
+    if (parts.length > 0) lines.push(`板 ${b.id}（${b.name}${repoInfo}）：`);
     for (const p of parts) lines.push(`  ${p}`);
   }
 
@@ -618,6 +644,23 @@ export class Brain {
       case 'agent.registered':
         reason = `新 agent 加入 @${payload.handle}（role=${payload.role}）`;
         break;
+      case 'board.created':
+        reason = `新建看板「${String(payload.name ?? payload.boardId ?? '')}」已创建（模式: ${String(payload.repoMode ?? 'managed')}）；请检查代码库状态并在需要时主动询问用户是否开始初始化`;
+        break;
+      case 'board.repo_state':
+        if (payload.status === 'empty' || payload.status === 'failed') {
+          reason = `看板 ${payload.boardId} 代码库状态为 ${payload.status}，需要引导用户初始化项目代码库`;
+        } else if (payload.status === 'ready') {
+          reason = `看板 ${payload.boardId} 代码库已成功初始化就绪（HEAD: ${String(payload.head ?? '').slice(0, 8)}），可向用户汇报`;
+        }
+        break;
+      case 'board.updated': {
+        const fields = Array.isArray(payload.fields) ? (payload.fields as string[]) : [];
+        if (fields.includes('repo') || fields.includes('repoSource') || fields.includes('repoMode')) {
+          reason = `看板 ${payload.boardId} 的仓库配置已变更，请检查代码库状态并在需要时询问是否重新初始化`;
+        }
+        break;
+      }
       default:
         return; // scheduleDigest 暂无事件源（无调度器），预留
     }

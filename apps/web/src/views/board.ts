@@ -177,6 +177,20 @@ export async function render(el: HTMLElement): Promise<void> {
   refreshNav(); // 当前板可能因深链/回落变化：同步侧栏项目高亮
 
   const board = boards.find((b) => b.id === currentBoard)!;
+  const needsInit = board.repoMode === 'managed' && (board.repoStatus === 'empty' || board.repoStatus === 'failed');
+  const initBanner = needsInit
+    ? `
+      <div class="panel init-banner" style="margin: 0 16px 12px; border-left: 3px solid var(--gold); background: rgba(217, 119, 6, 0.08); padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-radius: 6px;">
+        <div>
+          <div style="font-weight: 600; font-size: 13px; color: var(--gold-light);">📦 项目代码库尚未初始化</div>
+          <div class="muted small" style="margin-top: 2px;">
+            当前项目为托管空仓。在聊天室对蜂后说<b>“初始化项目”</b>，蜂后将协助从 GitHub 远端拉取；也可在「管理」中配置远端，或由本机终端导入。
+          </div>
+        </div>
+        <button class="sm ghost" id="btn-copy-import" style="white-space: nowrap;">复制导入命令</button>
+      </div>`
+    : '';
+
   // 页头两行：①项目名+仓库 pill+建卡主按钮 ②切板+管理+新项目（窄屏外加看板开关）
   el.innerHTML = `
     <div class="view-head stack">
@@ -196,6 +210,7 @@ export async function render(el: HTMLElement): Promise<void> {
         <button id="board-toggle" class="ghost rail-toggle" title="展开看板浮层">${icon.folder} 看板</button>
       </div>
     </div>
+    ${initBanner}
     <div class="workbench" id="workbench">
       <section class="chat-panel" id="chat-panel" aria-label="项目聊天">
         <div class="chat-panel-head">
@@ -215,6 +230,19 @@ export async function render(el: HTMLElement): Promise<void> {
 
   const boardEl = el.querySelector('#board') as HTMLElement;
   const drawerHost = el.querySelector('#drawer-host') as HTMLElement;
+
+  const copyImportBtn = el.querySelector('#btn-copy-import');
+  if (copyImportBtn) {
+    copyImportBtn.addEventListener('click', async () => {
+      const cmd = `node packages/sdk/src/cli.ts repo import --board ${board.id} --path <你的本机项目目录> --url ${location.origin}`;
+      try {
+        await navigator.clipboard.writeText(cmd);
+        toast('导入命令已复制到剪贴板');
+      } catch {
+        prompt('请手动复制以下导入命令：', cmd);
+      }
+    });
+  }
 
   // 看板渲染：五条横向 lane-strip 纵向堆叠（条带头 = lane 名 + WIP 计数胶囊），
   // 每条内卡片横向滚动——消灭"一条一条竖排"的卡片列；空 lane 保留条带展示占位
