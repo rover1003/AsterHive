@@ -133,6 +133,7 @@ TypeScript + Node（原生 TS 运行）· Hono · SQLite（WAL）· Pi（内置�
 
 ## 文档
 
+- [docs/HANDOVER.md](docs/HANDOVER.md) —— **项目全景交接与架构文档（迁移/续做必读）**
 - [docs/DEPLOY.md](docs/DEPLOY.md) —— 部署指南（一键起容器、数据卷、升级、安全模型）
 - [docs/WORKER.md](docs/WORKER.md) —— worker 接入与常驻化
 - [docs/ROADMAP.md](docs/ROADMAP.md) —— 分期路线与决策记录
