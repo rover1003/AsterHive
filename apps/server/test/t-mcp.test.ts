@@ -77,7 +77,7 @@ function seed(rig: ReturnType<typeof mkRig>): Seed {
   const orch = registerAgent(rig.ctx, { name: '主脑', handle: 'brain-a', role: 'orchestrator' });
   const bee = registerAgent(rig.ctx, { name: '工蜂', handle: 'zcode' });
   createBoard(rig.ctx, { id: 'b', name: '板' });
-  createTask(rig.ctx, 'b', { id: 'T1', title: '活', lane: 'Ready' });
+  createTask(rig.ctx, 'b', { id: 'T1', title: '活', lane: 'Ready', assignee: bee.agent.id });
   return { orch, bee };
 }
 

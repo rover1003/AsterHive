@@ -29,7 +29,7 @@ async function mkBoardWithTask(r: ReturnType<typeof mkRoomRig>) {
   await r.app.request('/boards/b/tasks', {
     method: 'POST',
     headers: H(r.orch.token),
-    body: JSON.stringify({ id: 'T42', title: '演示任务' }),
+    body: JSON.stringify({ id: 'T42', title: '演示任务', assignee: 'zcode' }),
   });
 }
 

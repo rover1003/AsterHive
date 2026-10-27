@@ -7,6 +7,7 @@ const KNOWN_EVENTS = [
   'snapshot.manual',
   'agent.registered',
   'agent.enabled',
+  'agent.telemetry',
   'agent.disabled',
   'board.created',
   'board.updated',

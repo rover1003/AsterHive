@@ -19,8 +19,10 @@ import {
   reportAgentSpecs,
   updateAgentProfile,
   getAgentProfile,
+  recordAgentTelemetry,
   type Agent,
   type AgentRole,
+  type AgentTelemetry,
 } from './agents.ts';
 import {
   listBoards,
@@ -40,7 +42,9 @@ import {
   addDependencies,
   type Lane,
   type Priority,
+  type TaskRequirements,
   cancelTask,
+  returnTaskFromReview,
 } from './tasks.ts';
 import { claimTask, nextTask, checkpointTask, releaseTask, submitTask } from './verbs.ts';
 import { createMessage, listMessages, inboxFor, dispatchTask, type MessageKind } from './messages.ts';
@@ -66,9 +70,10 @@ import { matchTaskToWorkers } from './scheduler.ts';
 import { probeWorker, restartWorkerService, releaseStuckTask } from './worker-control.ts';
 import { inferAndApplyTaskDependencies } from './dependencies.ts';
 import { handleChatToCard } from './webhook.ts';
-import { getFleetRadar } from './fleet-radar.ts';
+import { getFleetRadar, getFleetTelemetry } from './fleet-radar.ts';
 import { storeEvidenceFile, listEvidenceFiles, readEvidenceContent, deleteEvidenceFile } from './evidence.ts';
 import { Brain } from './brain.ts';
+import { withTaskIntegrationLock } from './task-integration-lock.ts';
 import { fileURLToPath } from 'node:url';
 import { serveStatic } from '@hono/node-server/serve-static';
 
@@ -96,6 +101,24 @@ function requireActor(ctx: Ctx, c: Context): Agent {
   return resolveActor(ctx, c);
 }
 
+function requireTokenActor(ctx: Ctx, c: Context): Agent {
+  const token = bearerToken(c);
+  if (!token) throw new HttpError(401, 'unauthorized: bearer token required');
+  const agent = authByToken(ctx, token);
+  if (!agent) throw new HttpError(401, 'invalid or revoked bearer token');
+  return agent;
+}
+
+function requireVerifiedUser(ctx: Ctx, c: Context): Agent {
+  const token = bearerToken(c);
+  if (!token) throw new HttpError(401, 'unauthorized: verified user bearer token required for high-risk task release');
+  const agent = authByToken(ctx, token);
+  if (!agent) throw new HttpError(401, 'invalid or revoked bearer token');
+  if (agent.role !== 'user') {
+    throw new HttpError(403, 'only user role may confirm worker stopped and force release tasks');
+  }
+  return agent;
+}
 // 提权写闸门：worker 角色的 token 不放行（信任分层仍对 agent 生效）；匿名即 user，自然通过。
 function requireElevated(ctx: Ctx, c: Context): Agent {
   const agent = resolveActor(ctx, c);
@@ -326,12 +349,25 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   });
 
   app.post('/agents/:id/heartbeat', async (c) => {
+    const actor = requireTokenActor(ctx, c);
     const id = c.req.param('id');
-    const body = (await c.req.json().catch(() => ({}))) as { specs?: unknown };
+    if (actor.id !== id && actor.role !== 'orchestrator' && actor.role !== 'user') {
+      throw new HttpError(403, `forbidden: cannot send heartbeat for agent ${id}`);
+    }
+    const body = (await c.req.json().catch(() => ({}))) as {
+      specs?: unknown;
+      telemetry?: unknown;
+    };
     if (body.specs !== undefined) {
       reportAgentSpecs(ctx, id, body.specs);
     }
-    return c.json({ agent: heartbeat(ctx, id) });
+    let recordedTelemetry: AgentTelemetry | null = null;
+    if (body.telemetry !== undefined) {
+      recordedTelemetry = recordAgentTelemetry(ctx, id, body.telemetry);
+      ctx.bus.publish('agent.telemetry', { agentId: id, telemetry: recordedTelemetry });
+    }
+    const agent = heartbeat(ctx, id);
+    return c.json({ agent, telemetry: recordedTelemetry ?? agent.telemetry ?? null });
   });
 
   // ---- 工蜂受控诊断与干预（Phase 6：requireElevated，worker 403）----
@@ -349,10 +385,16 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   });
 
   app.post('/agents/:id/control/release-task', async (c) => {
-    const actor = requireElevated(ctx, c);
-    const body = (await c.req.json().catch(() => ({}))) as { taskId?: string; reason?: string };
+    const actor = requireVerifiedUser(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      taskId?: string;
+      reason?: string;
+      confirmedStopped?: boolean;
+    };
     if (!body.taskId) throw new HttpError(422, 'taskId required');
-    const task = await releaseStuckTask(ctx, actor, c.req.param('id'), body.taskId, body.reason ?? '');
+    const task = await releaseStuckTask(ctx, actor, c.req.param('id'), body.taskId, body.reason ?? '', {
+      confirmedStopped: body.confirmedStopped === true,
+    });
     return c.json({ task });
   });
 
@@ -458,6 +500,7 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       tasks: listTasks(ctx, c.req.param('b'), {
         lane: (c.req.query('lane') as Lane | undefined) || undefined,
         assignee: c.req.query('assignee') || undefined,
+        reviewStatus: c.req.query('reviewStatus') || undefined,
       }),
     }),
   );
@@ -470,12 +513,14 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       title: String(body.title ?? ''),
       detail: body.detail === undefined ? undefined : String(body.detail),
       lane: (body.lane as Lane | undefined) || undefined,
+      assignee: body.assignee === undefined ? undefined : String(body.assignee),
       priority: (body.priority as Priority | undefined) || undefined,
       category: body.category === undefined ? undefined : String(body.category),
       acceptance: body.acceptance === undefined ? undefined : String(body.acceptance),
       workspace: (body.workspace as Record<string, unknown> | undefined) || undefined,
       files: (body.files as string[] | undefined) || undefined,
       protectedPaths: (body.protectedPaths as string[] | undefined) || undefined,
+      requirements: body.requirements as TaskRequirements | undefined,
       dependsOn: (body.dependsOn as string[] | undefined) || undefined,
     });
     return c.json({ task, by: actor.id }, 201);
@@ -497,6 +542,7 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       workspace: (body.workspace as Record<string, unknown> | undefined) || undefined,
       files: (body.files as string[] | undefined) || undefined,
       protectedPaths: (body.protectedPaths as string[] | undefined) || undefined,
+      requirements: body.requirements as TaskRequirements | undefined,
     });
     return c.json({ task, by: actor.id });
   });
@@ -523,6 +569,11 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json(nextTask(ctx, actor, c.req.param('b')));
   });
 
+  app.post('/boards/:b/tasks/next', (c) => {
+    const actor = requireActor(ctx, c);
+    return c.json(nextTask(ctx, actor, c.req.param('b')));
+  });
+
   app.post('/tasks/:id/claim', async (c) => {
     const actor = requireActor(ctx, c);
     const body = (await c.req.json().catch(() => ({}))) as { files?: string[] };
@@ -532,8 +583,18 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
 
   app.post('/tasks/:id/checkpoint', async (c) => {
     const actor = requireActor(ctx, c);
-    const body = (await c.req.json().catch(() => ({}))) as { note?: string };
-    const result = checkpointTask(ctx, actor, c.req.param('id'), body.note ?? '');
+    const body = (await c.req.json().catch(() => ({}))) as {
+      note?: string;
+      kind?: string;
+      isKeepalive?: boolean;
+      attempt?: number;
+    };
+    const result = checkpointTask(ctx, actor, c.req.param('id'), {
+      note: body.note ?? '',
+      kind: body.kind,
+      isKeepalive: body.isKeepalive,
+      attempt: body.attempt,
+    });
     return c.json({ ...result, by: actor.id });
   });
 
@@ -550,11 +611,13 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       summary?: string;
       evidence?: { path: string; machine?: string; note?: string }[];
       noCode?: boolean;
+      attempt?: number;
     };
     const task = submitTask(ctx, actor, c.req.param('id'), {
       summary: body.summary ?? '',
       evidence: body.evidence,
       noCode: body.noCode,
+      attempt: body.attempt,
     });
     return c.json({ task, by: actor.id });
   });
@@ -562,6 +625,20 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.post('/tasks/:id/review/retry', (c) => {
     const actor = requireElevated(ctx, c);
     const task = retryTaskReview(ctx, actor, c.req.param('id'));
+    return c.json({ task });
+  });
+
+  app.post('/tasks/:id/review/return', async (c) => {
+    const actor = requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { reason?: string; assignee?: string };
+    const task = await returnTaskFromReview(ctx, actor, c.req.param('id'), body);
+    return c.json({ task });
+  });
+
+  app.post('/tasks/:id/review/reject', async (c) => {
+    const actor = requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { reason?: string; assignee?: string };
+    const task = await returnTaskFromReview(ctx, actor, c.req.param('id'), body);
     return c.json({ task });
   });
 
@@ -598,23 +675,58 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.post('/tasks/:id/repo-result', async (c) => {
     const actor = requireActor(ctx, c);
     const taskId = c.req.param('id');
-    const task = getTask(ctx, taskId);
-    if (actor.role === 'worker') {
-      requireParticipant(ctx, task.boardId, actor);
-    }
     const length = Number(c.req.header('content-length'));
     const sha256 = c.req.header('x-content-sha256') ?? '';
     if (!Number.isSafeInteger(length) || length < 1) throw new HttpError(411, 'Content-Length required');
     const body = c.req.raw.body;
     if (!body) throw new HttpError(400, 'Git bundle body required');
-    const result = await repoManager.importTaskResult(
-      task.boardId,
-      taskId,
-      body as ReadableStream<Uint8Array> & AsyncIterable<Uint8Array>,
-      length,
-      sha256,
-    );
-    return c.json({ status: 'saved', ...result });
+
+    const rawAttempt = c.req.header('x-task-attempt');
+    const expectedAttempt = rawAttempt !== undefined ? Number(rawAttempt) : undefined;
+
+    return withTaskIntegrationLock(taskId, async () => {
+      let task = getTask(ctx, taskId);
+      if (actor.role === 'worker') {
+        requireParticipant(ctx, task.boardId, actor);
+        if (task.assignee !== actor.id && task.assignee !== actor.handle) {
+          throw new HttpError(403, `only assigned worker (${task.assignee}) may upload repo result`);
+        }
+      }
+      if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+      if (task.lane !== 'InProgress') throw new HttpError(409, `task ${taskId} not InProgress (lane: ${task.lane})`);
+
+      const taskAttempt = task.attempt ?? 1;
+      if (taskAttempt > 1) {
+        if (expectedAttempt === undefined) {
+          throw new HttpError(
+            409,
+            `stale or unversioned execution attempt: task ${taskId} has been re-dispatched (attempt ${taskAttempt}); x-task-attempt header required`,
+          );
+        }
+        if (expectedAttempt !== taskAttempt) {
+          throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${expectedAttempt}`);
+        }
+      } else if (expectedAttempt !== undefined && expectedAttempt !== taskAttempt) {
+        throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${expectedAttempt}`);
+      }
+
+      const result = await repoManager.importTaskResult(
+        task.boardId,
+        taskId,
+        body as ReadableStream<Uint8Array> & AsyncIterable<Uint8Array>,
+        length,
+        sha256,
+      );
+
+      task = getTask(ctx, taskId);
+      if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} was cancelled during upload`);
+      if (task.lane !== 'InProgress') throw new HttpError(409, `task ${taskId} is no longer InProgress`);
+      if (expectedAttempt !== undefined && (task.attempt ?? 1) !== expectedAttempt) {
+        throw new HttpError(409, `stale execution attempt detected after upload: expected ${task.attempt}, got ${expectedAttempt}`);
+      }
+
+      return c.json({ status: 'saved', ...result });
+    });
   });
 
   // managed 模式：查询任务分支差异（Diff / Stat），供前端卡片及审查抽屉展示
@@ -629,9 +741,9 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     return c.json(diff);
   });
 
-  // 资源感知任务匹配查询（Nomad 风格调度评估与建议）
+  // 资源感知任务匹配查询（Nomad 风格调度评估与建议：仅 orchestrator / user 可查，worker 403）
   app.get('/tasks/:id/match', (c) => {
-    requireActor(ctx, c);
+    requireElevated(ctx, c);
     const result = matchTaskToWorkers(ctx, c.req.param('id'));
     return c.json(result);
   });
@@ -749,6 +861,28 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.get('/api/fleet/radar', (c) => {
     requireActor(ctx, c);
     return c.json(getFleetRadar(ctx));
+  });
+
+  // 舰队遥测时序与实时指标端点（Nomad 风格）
+  app.get('/api/fleet/telemetry', (c) => {
+    requireActor(ctx, c);
+    return c.json(getFleetTelemetry(ctx));
+  });
+
+  app.get('/api/fleet/telemetry/:id', (c) => {
+    requireActor(ctx, c);
+    const id = c.req.param('id');
+    const result = getFleetTelemetry(ctx, id);
+    if (!result) throw new HttpError(404, `telemetry not found for agent: ${id}`);
+    return c.json(result);
+  });
+
+  app.get('/agents/:id/telemetry', (c) => {
+    requireActor(ctx, c);
+    const id = c.req.param('id');
+    const result = getFleetTelemetry(ctx, id);
+    if (!result) throw new HttpError(404, `telemetry not found for agent: ${id}`);
+    return c.json(result);
   });
 
   // 多模型组（主脑多模型组升级）：GET 投影 { enabled, wakeOn, activeGroupId, groups }，

@@ -48,3 +48,64 @@ export function firstSkip(skipped: Set<string>, boardId: string): boolean {
   skipped.add(boardId);
   return true;
 }
+/**
+ * 纯决策/取活通道生产执行器（主板巡检统一调用）：
+ * 1. 被退回重做（InProgress 归我，断点续做）
+ * 2. 定向派发给我的任务（Ready 归我，调用 claim 原子认领）
+ * 3. 绝不调用 next(boardId) 抢未分配公共池
+ */
+export interface DirectedPollChannels<T> {
+  listMine: (boardId: string, lane: 'InProgress' | 'Ready') => Promise<T[]>;
+  isRework?: (task: T) => boolean;
+  claim: (taskId: string) => Promise<T>;
+  checkGate?: (boardId: string, reworks: T[]) => Promise<'ready' | 'stop'>;
+  onSkip403?: (boardId: string) => void;
+  is403?: (err: unknown) => boolean;
+}
+
+export interface DirectedPollResult<T> {
+  task: T;
+  channel: 'rework' | 'directed';
+  boardId: string;
+}
+
+export async function pollNextDirectedTask<T extends { id: string }>(
+  boardIds: string[],
+  channels: DirectedPollChannels<T>,
+): Promise<DirectedPollResult<T> | null> {
+  for (const boardId of boardIds) {
+    try {
+      const inProgress = await channels.listMine(boardId, 'InProgress');
+      const reworks = inProgress.filter((t) => {
+        if (channels.isRework) return channels.isRework(t);
+        const task = t as { reviewStatus?: string };
+        return task.reviewStatus === undefined || task.reviewStatus === 'rework';
+      });
+      if (channels.checkGate) {
+        const gate = await channels.checkGate(boardId, reworks);
+        if (gate === 'stop') continue;
+      }
+      if (reworks.length > 0) {
+        return { task: reworks[0], channel: 'rework', boardId };
+      }
+      const mine = await channels.listMine(boardId, 'Ready');
+      if (mine.length > 0) {
+        const claimed = await channels.claim(mine[0].id);
+        return { task: claimed, channel: 'directed', boardId };
+      }
+    } catch (err) {
+      let is403 = false;
+      if (channels.is403) {
+        is403 = channels.is403(err);
+      } else if (err && typeof err === 'object' && 'status' in err) {
+        is403 = err.status === 403;
+      }
+      if (is403) {
+        channels.onSkip403?.(boardId);
+        continue;
+      }
+      throw err;
+    }
+  }
+  return null;
+}

@@ -30,7 +30,8 @@ import { homedir, hostname } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canSubmitExecution, commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
-import { firstSkip, nextBoardsToPoll } from './polling.ts';
+import { firstSkip, nextBoardsToPoll, pollNextDirectedTask } from './polling.ts';
+import { TelemetryReporter } from './telemetry-reporter.ts';
 import { runPiPrompt, type PiThinkingLevel } from './pi-executor.ts';
 import {
   OmpRpcSession,
@@ -338,7 +339,11 @@ async function executeTask(
   prompt: string,
   cwd: string,
   model: string | undefined,
-  hooks?: { taskId?: string; checkpoint?: (note: string) => Promise<{ pendingMessages?: { author?: string; content?: string }[] }> },
+  hooks?: {
+    taskId?: string;
+    checkpoint?: (note: string) => Promise<{ pendingMessages?: { author?: string; content?: string }[] }>;
+    onActivity?: (activity: { kind: 'tool' | 'model'; toolName?: string; phase: 'start' | 'end'; timestamp: number }) => void | Promise<void>;
+  },
 ): Promise<{ stdout: string; code: number | null }> {
   // 托管工蜂（T19）：pi 执行器 = 进程内 Pi 会话，零外部 CLI 依赖；
   // 模型配置来自设备本地 worker.json（安装脚本交互式写入），服务器首选模型不适用于该内核
@@ -356,6 +361,7 @@ async function executeTask(
       timeoutMs: CFG.taskTimeoutMs,
       log,
       checkpoint: hooks?.checkpoint,
+      onActivity: hooks?.onActivity,
     });
   }
   const projectRoot = join(CFG.workdirRoot, 'projects');
@@ -482,6 +488,12 @@ async function main(): Promise<void> {
     }
   }
 
+  const telemetryReporter = new TelemetryReporter({
+    worker,
+    specs: deviceSpecs,
+    intervalMs: CFG.pollMs,
+    log,
+  });
   let busy = false;
   // 定期重报基线：启动时注册/复用 token 分支已上报过一次模型，从现在起再计时
   let lastModelReport = Date.now();
@@ -490,11 +502,10 @@ async function main(): Promise<void> {
   const knownBoards: { ids: string[]; lastRefresh: number } = { ids: [], lastRefresh: 0 };
   const skipped403 = new Set<string>();
   const listMine = async (boardId: string, lane: string): Promise<Task[]> => {
-    const r = await fetch(
-      `${CFG.url}/boards/${boardId}/tasks?lane=${lane}&assignee=${encodeURIComponent(worker.agentId)}`,
-      { headers: getAuthHeaders() },
-    );
-    // 非 2xx 一律抛 SdkError（与 SDK call() 同语义）：多板巡检靠 403 识别非参与者板
+    const url = lane === 'InProgress'
+      ? `${CFG.url}/boards/${boardId}/tasks?lane=InProgress&assignee=${encodeURIComponent(worker.agentId)}&reviewStatus=rework`
+      : `${CFG.url}/boards/${boardId}/tasks?lane=${lane}&assignee=${encodeURIComponent(worker.agentId)}`;
+    const r = await fetch(url, { headers: getAuthHeaders() });
     const json = (await r.json().catch(() => ({}))) as { tasks?: Task[]; error?: string };
     if (!r.ok) throw new SdkError(r.status, String(json.error ?? r.statusText));
     return json.tasks ?? [];
@@ -531,6 +542,8 @@ async function main(): Promise<void> {
     if (busy) return;
     busy = true;
     try {
+      // 每轮取活前采样并上报实时硬件遥测指标
+      await telemetryReporter.reportOnce();
       // 每轮取活前拉服务器档案：用户在设置页为本 agent 选了首选模型则覆盖本地 WORKER_MODEL。
       // 拉取失败不阻塞取活——记一行日志后继续用本地配置。
       let model = CFG.model;
@@ -573,50 +586,45 @@ async function main(): Promise<void> {
         }
       }
 
-      // 取活三通道，逐板按序尝试（多板巡检时命中即止——一次只做一张卡）：
-      // 被退回重做（InProgress 归我）＞ 派给我的 Ready ＞ 未指派池 next。
+      // 取活双通道，逐板按序尝试（多板巡检时命中即止——一次只做一张卡）：
+      // 1. 被退回重做（InProgress 归我，断点续做）
+      // 2. 定向派发给我的任务（Ready 归我，经 worker.claim 原子认领）
+      // 不再盲抢未指派公共池（worker.next 彻底废除，完全由主脑基于硬件与负载定向指派）。
       // 某板 403（非参与者）→ 该板本轮跳过，只 log 一次（Set 防刷屏）；下轮自然再试，
       // 参与者在页面里被勾上后无需任何处理即自动恢复。
       let reworkNotes: string[] = [];
       let task: Task | undefined;
       let rpcStopBoard: string | null = null;
-      for (const boardId of decision.poll) {
-        try {
-          const reworks = await listMine(boardId, 'InProgress'); // 只读查询，不触发领取/写入
+      const pollResult = await pollNextDirectedTask(decision.poll, {
+        listMine,
+        claim: (id) => worker.claim(id),
+        checkGate: async (boardId, reworks) => {
           const meta = await boardMeta(boardId);
-          // 仅持久 repo 工作区有跨任务 RPC 上下文；scratch / managed 每任务独立临时目录，无旧上下文可预检。
-          let gate: 'ready' | 'stop' = 'ready';
           if (meta.repoMode === 'remote-legacy' && meta.repo) {
-            gate = await gateRpcSessionBeforeClaim(join(CFG.workdirRoot, 'projects', boardId), model);
-          }
-          if (gate === 'stop') {
-            rpcStopBoard = boardId;
-            if (reworks.length > 0) {
-              const blocked = reworks[0]!;
-              await worker.checkpoint(blocked.id, `RPC 上下文达到 STOP ${CFG.ctxThresholds.stop}%：任务暂缓，未启动新执行；请等待当前 worker 会话整理或联系设备所有者。`);
-              log(`RPC STOP：重做任务 ${blocked.id} 保持 InProgress 并已 checkpoint，未重新执行`);
+            const gate = await gateRpcSessionBeforeClaim(join(CFG.workdirRoot, 'projects', boardId), model);
+            if (gate === 'stop') {
+              rpcStopBoard = boardId;
+              if (reworks.length > 0) {
+                const blocked = reworks[0]!;
+                await worker.checkpoint(blocked.id, `RPC 上下文达到 STOP ${CFG.ctxThresholds.stop}%：任务暂缓，未启动新执行；请等待当前 worker 会话整理或联系设备所有者。`);
+                log(`RPC STOP：重做任务 ${blocked.id} 保持 InProgress 并已 checkpoint，未重新执行`);
+              }
+              return 'stop';
             }
-            continue; // 不 claim/next；其他板仍可独立巡检
           }
-          if (reworks.length > 0) {
-            task = reworks[0];
-            reworkNotes = await taskFeedback(boardId, task.id);
-            log(`重做被退回的任务 ${task.id}`);
-            break;
-          }
-          const mine = await listMine(boardId, 'Ready');
-          if (mine.length > 0) {
-            task = await worker.claim(mine[0].id);
-            break;
-          }
-          task = (await worker.next(boardId)) ?? undefined;
-          if (task) break;
-        } catch (err) {
-          if (err instanceof SdkError && err.status === 403) {
-            if (firstSkip(skipped403, boardId)) log(`板 ${boardId} 非参与者，已跳过`);
-            continue;
-          }
-          throw err;
+          return 'ready';
+        },
+        onSkip403: (boardId) => {
+          if (firstSkip(skipped403, boardId)) log(`板 ${boardId} 非参与者，已跳过`);
+        },
+        is403: (err) => err instanceof SdkError && err.status === 403,
+      });
+
+      if (pollResult) {
+        task = pollResult.task;
+        if (pollResult.channel === 'rework') {
+          reworkNotes = await taskFeedback(pollResult.boardId, task.id);
+          log(`重做被退回的任务 ${task.id}`);
         }
       }
       if (!task) {
@@ -624,6 +632,7 @@ async function main(): Promise<void> {
         return;
       }
       log(`领取任务 ${task.id}：${task.title}`);
+      telemetryReporter.setTaskInProgress(task.id);
 
       // 工作区准备（T15 / §9.4 / managed 模式）：
       // managed 模式=临时快照（从服务器拉 bundle、本地执行、结果 bundle 回传、最后清理临时目录）；
@@ -636,6 +645,7 @@ async function main(): Promise<void> {
           workdirRoot: CFG.workdirRoot,
           boardId: task.boardId,
           taskId: task.id,
+          attempt: task.attempt,
           repo: meta.repo,
           repoMode: meta.repoMode,
           worker,
@@ -656,32 +666,53 @@ async function main(): Promise<void> {
       if (ws.cloned) log(`已 clone 项目工作区：${ws.dir}`);
       if (ws.pulled) log(`已同步远端（pull --rebase）：${ws.dir}`);
 
-      const cp1 = await worker.checkpoint(task.id, reworkNotes.length ? '收到退回反馈，开始重做' : '开始执行');
+      const cp1 = await worker.checkpoint(task.id, {
+        note: reworkNotes.length ? '收到退回反馈，开始重做' : '开始执行',
+        attempt: task.attempt,
+      });
       logPending(cp1.pendingMessages);
 
       const startTime = Date.now();
       const keepAliveIntervalMs = 60000;
       const keepAliveTimer = setInterval(() => {
         const mins = Math.max(1, Math.round((Date.now() - startTime) / 60000));
-        void worker.checkpoint(task.id, `进行中：任务持续执行（已耗时约 ${mins} 分钟）`).then((cp) => {
+        void worker.checkpoint(task.id, {
+          note: `进行中：任务持续执行（已耗时约 ${mins} 分钟）`,
+          kind: 'keepalive',
+          isKeepalive: true,
+          attempt: task.attempt,
+        }).then((cp) => {
           logPending(cp.pendingMessages);
         }).catch((err) => {
           log('保活心跳发送失败（非致命）：', err instanceof Error ? err.message : err);
         });
+        void telemetryReporter.reportOnce();
       }, keepAliveIntervalMs);
 
       let execRes: { stdout: string; code: number | null };
       try {
         execRes = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model, {
           taskId: task.id,
-          // hive_checkpoint 落点：模型在里程碑/受阻时主动汇报，服务器的干预消息原样带回
-          checkpoint: (note) => worker.checkpoint(task.id, note),
+          checkpoint: (note) => worker.checkpoint(task.id, { note, kind: 'milestone', attempt: task.attempt }),
+          onActivity: (activity) => {
+            if (activity.phase === 'start') {
+              const note = activity.kind === 'tool'
+                ? `正在执行工具 ${activity.toolName || 'tool'}`
+                : '正在进行模型推理思考';
+              void worker.checkpoint(task.id, {
+                note,
+                kind: activity.kind,
+                attempt: task.attempt,
+              }).catch((err) => {
+                log('活动事件上报异常（非致命）：', err instanceof Error ? err.message : err);
+              });
+            }
+          },
         });
       } catch (err) {
-        const reason = `执行异常：${err instanceof Error ? err.message : String(err)}；工作区已保留，任务结果未上交。`;
-        await worker.checkpoint(task.id, reason);
-        await worker.release(task.id, reason);
-        log(`${reason} 已释放 ${task.id}`);
+        const reason = `执行异常：${err instanceof Error ? err.message : String(err)}；工作区已保留（${ws.dir}），现场可恢复，任务结果未上交。`;
+        await worker.checkpoint(task.id, { note: reason, kind: 'error', attempt: task.attempt });
+        log(`${reason}；任务保持 InProgress 保留现场，等待干预`);
         return;
       } finally {
         clearInterval(keepAliveTimer);
@@ -689,13 +720,18 @@ async function main(): Promise<void> {
       const { stdout, code } = execRes;
       log(`执行结束（exit=${code}），输出 ${stdout.length} 字符`);
       const noCode = task.workspace.noCode === true;
-      const cp2 = await worker.checkpoint(task.id, code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），现场已保留且不会上交`);
+      const cp2 = await worker.checkpoint(task.id, {
+        note: code === 0 ? '执行完毕，整理证据' : `执行异常退出（${code}），现场已保留且不会上交`,
+        attempt: task.attempt,
+      });
       logPending(cp2.pendingMessages);
       if (code !== 0) {
-        const reason = `执行器退出码 ${code}，任务结果未上交；工作区已保留，修复后可重新执行。`;
-        await worker.checkpoint(task.id, reason);
-        await worker.release(task.id, reason);
-        log(`${reason} 已释放 ${task.id}`);
+        const isTimeout = code === -1;
+        const reason = isTimeout
+          ? `执行器超时中止，任务结果未上交；工作区已保留（${ws.dir}），现场可恢复。`
+          : `执行器退出码 ${code}，任务结果未上交；工作区已保留（${ws.dir}），现场可恢复。`;
+        await worker.checkpoint(task.id, { note: reason, kind: isTimeout ? 'timeout' : 'error', attempt: task.attempt });
+        log(`${reason}；任务保持 InProgress 保留现场，等待干预`);
         return;
       }
 
@@ -729,16 +765,15 @@ async function main(): Promise<void> {
         noCode,
       })) {
         const reason = commitFailed
-          ? `代码提交失败，任务结果未上交；工作区 ${ws.dir} 已保留，请修复提交问题后重试。`
-          : `代码任务没有产生可回传的提交。若该卡确为无代码任务，请在建卡时设置 workspace.noCode=true；工作区 ${ws.dir} 已保留。`;
-        await worker.checkpoint(task.id, reason);
-        await worker.release(task.id, reason);
-        log(`${reason} 已释放 ${task.id}`);
+          ? `代码提交失败，任务结果未上交；工作区 ${ws.dir} 已保留，现场可恢复。`
+          : `代码任务没有产生可回传的提交。若该卡确为无代码任务，请在建卡时设置 workspace.noCode=true；工作区 ${ws.dir} 已保留，现场可恢复。`;
+        await worker.checkpoint(task.id, { note: reason, kind: 'error', attempt: task.attempt });
+        log(`${reason}；任务保持 InProgress 保留现场，等待干预`);
         return;
       }
 
       const summary = (stdout.trim().split('\n').slice(-6).join('\n') || '(无输出)') + commitNote;
-      await worker.submit(task.id, summary, evidence, { noCode });
+      await worker.submit(task.id, summary, evidence, { noCode, attempt: task.attempt });
       log(`已上交 ${task.id}，证据 ${evidence.length} 项`);
 
       // managed 模式：成功交活后销毁本机临时目录
@@ -753,6 +788,7 @@ async function main(): Promise<void> {
     } catch (err) {
       log('轮询/执行出错：', err instanceof Error ? err.message : err);
     } finally {
+      telemetryReporter.setTaskInProgress(null);
       busy = false;
     }
   };
@@ -761,11 +797,13 @@ async function main(): Promise<void> {
     `worker ${CFG.handle} 就绪，轮询 ${CFG.url} ` +
       `${CFG.board ? `板 ${CFG.board}` : '全部看板（多板巡检，非参与者板自动跳过）'}（${CFG.pollMs}ms）`,
   );
+  telemetryReporter.start();
   let shuttingDown = false;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    telemetryReporter.stop();
     if (pollTimer) clearInterval(pollTimer);
     void Promise.all([...rpcSessions.values()].map((session) => session.kill())).finally(() => {
       rpcSessions.clear();
@@ -779,6 +817,7 @@ async function main(): Promise<void> {
   // --once（push 启动器形态）：单轮领活执行完毕即退出——最多执行一张卡；
   // 无任务也正常退出（退出码 0），由调用方（未来的 push Runner / cron）决定何时再拉起
   if (process.argv.includes('--once')) {
+    telemetryReporter.stop();
     log('--once 模式：单轮领活完毕，进程退出');
     process.exitCode = 0;
     return;

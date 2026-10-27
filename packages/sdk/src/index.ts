@@ -4,7 +4,7 @@
 // 附：inbox / postMessage（聊天室）、getTask 与 getBoards / getBoard（看板元数据，含 repo）。
 
 import { createHash } from 'node:crypto';
-import { platform, arch, cpus, totalmem } from 'node:os';
+import { platform, arch, cpus, totalmem, freemem, loadavg, uptime } from 'node:os';
 
 /** 工蜂设备硬件能力规格（Phase 4：隐私最小化，仅上报调度相关指标） */
 export interface AgentSpecs {
@@ -31,6 +31,165 @@ export function detectDeviceSpecs(executor?: string): AgentSpecs {
   }
 }
 
+/** 工蜂设备实时硬件性能遥测指标 */
+export interface DeviceTelemetry {
+  cpuPercent: number | null; // 0-100（当前 CPU 实际利用率百分比，首样本/无间隔/系统调用失败为 null）
+  memoryUsedGb: number | null; // 已用物理内存（GB，采集失败为 null）
+  memoryTotalGb: number | null; // 总物理内存（GB，采集失败为 null）
+  memoryFreeGb: number | null; // 剩余可用物理内存（GB，采集失败为 null）
+  memoryPercent: number | null; // 0-100（内存使用率百分比，采集失败为 null）
+  loadAvg: number[] | null; // 系统负载走势 [1m, 5m, 15m]，Windows 或不可用平台为 null
+  uptimeSec: number | null; // 运行时长（秒，采集失败为 null）
+  taskInProgress?: string | null; // 当前正在执行的任务 ID，空闲为 null/undefined
+}
+
+let globalLastCpuSnapshot: { idle: number; total: number } | null = null;
+
+export function computeCpuPercent(
+  prev: { idle: number; total: number } | null | undefined,
+  curr: { idle: number; total: number } | null | undefined,
+): number | null {
+  if (!prev || !curr) {
+    // 首样本没有间隔，或当前采样失败，标记未知 (null)
+    return null;
+  }
+  const deltaTotal = curr.total - prev.total;
+  const deltaIdle = curr.idle - prev.idle;
+  if (deltaTotal <= 0) {
+    // 计算周期为 0（无时间差）或出现时钟跳变，无法计算真实利用率，标记为 null，不得伪报 0%
+    return null;
+  }
+  const deltaBusy = Math.max(0, deltaTotal - deltaIdle);
+  const pct = (deltaBusy / deltaTotal) * 100;
+  return Math.max(0, Math.min(100, Math.round(pct * 10) / 10));
+}
+
+export interface SampleDeviceTelemetryOptions {
+  taskInProgress?: string | null;
+  /** 可选注入上一次 CPU 采样基准（测试用；显式传 null 可模拟首样本） */
+  previousCpuSnapshot?: { idle: number; total: number } | null;
+  osProvider?: {
+    platform?: typeof platform;
+    cpus?: typeof cpus;
+    totalmem?: typeof totalmem;
+    freemem?: typeof freemem;
+    loadavg?: typeof loadavg;
+    uptime?: typeof uptime;
+  };
+}
+
+/** 毫秒级采样本机实时硬件性能遥测指标（零外部依赖、极低开销） */
+export function sampleDeviceTelemetry(
+  taskOrOptions?: string | null | SampleDeviceTelemetryOptions,
+): DeviceTelemetry {
+  const options: SampleDeviceTelemetryOptions =
+    typeof taskOrOptions === 'string' || taskOrOptions === null
+      ? { taskInProgress: taskOrOptions }
+      : taskOrOptions ?? {};
+
+  const platformFn = options.osProvider?.platform ?? platform;
+  const cpusFn = options.osProvider?.cpus ?? cpus;
+  const totalmemFn = options.osProvider?.totalmem ?? totalmem;
+  const freememFn = options.osProvider?.freemem ?? freemem;
+  const loadavgFn = options.osProvider?.loadavg ?? loadavg;
+  const uptimeFn = options.osProvider?.uptime ?? uptime;
+
+  // CPU 采样
+  let currentTicks: { idle: number; total: number } | null = null;
+  try {
+    const cpuList = cpusFn();
+    if (Array.isArray(cpuList) && cpuList.length > 0) {
+      let idle = 0;
+      let total = 0;
+      for (const cpu of cpuList) {
+        const t = cpu.times;
+        idle += t.idle;
+        total += t.user + t.nice + t.sys + t.idle + t.irq;
+      }
+      if (total > 0) {
+        currentTicks = { idle, total };
+      }
+    }
+  } catch {
+    currentTicks = null;
+  }
+
+  const baseline =
+    options.previousCpuSnapshot !== undefined
+      ? options.previousCpuSnapshot
+      : globalLastCpuSnapshot;
+  const cpuPercent = computeCpuPercent(baseline, currentTicks);
+  if (currentTicks) {
+    globalLastCpuSnapshot = currentTicks;
+  }
+
+  // 内存采样（失败保持 null，不得伪报 0）
+  let memoryTotalGb: number | null = null;
+  let memoryFreeGb: number | null = null;
+  let memoryUsedGb: number | null = null;
+  let memoryPercent: number | null = null;
+  try {
+    const totalBytes = totalmemFn();
+    const freeBytes = freememFn();
+    if (typeof totalBytes === 'number' && totalBytes > 0 && typeof freeBytes === 'number' && freeBytes >= 0) {
+      const usedBytes = Math.max(0, totalBytes - freeBytes);
+      memoryTotalGb = Math.round((totalBytes / 1073741824) * 100) / 100;
+      memoryFreeGb = Math.round((freeBytes / 1073741824) * 100) / 100;
+      memoryUsedGb = Math.round((usedBytes / 1073741824) * 100) / 100;
+      memoryPercent = Math.round(((totalBytes - freeBytes) / totalBytes) * 1000) / 10;
+    }
+  } catch {
+    // 采集失败保持 null，不得伪报 0
+  }
+
+  // 负载走势采样（Windows os.loadavg() 始终为 [0, 0, 0]，标记为不可用 null）
+  let loadAvg: number[] | null = null;
+  let currentPlatform = 'unknown';
+  try {
+    currentPlatform = platformFn();
+  } catch {
+    // 忽略
+  }
+
+  if (currentPlatform !== 'win32') {
+    try {
+      const raw = loadavgFn();
+      if (Array.isArray(raw) && raw.length === 3 && raw.every((n) => typeof n === 'number' && Number.isFinite(n))) {
+        loadAvg = raw.map((n) => Math.round(n * 100) / 100);
+      }
+    } catch {
+      loadAvg = null;
+    }
+  }
+
+  // 运行时间采样
+  let uptimeSec: number | null = null;
+  try {
+    const up = uptimeFn();
+    if (typeof up === 'number' && Number.isFinite(up) && up >= 0) {
+      uptimeSec = Math.round(up);
+    }
+  } catch {
+    uptimeSec = null;
+  }
+
+  const telemetry: DeviceTelemetry = {
+    cpuPercent,
+    memoryUsedGb,
+    memoryTotalGb,
+    memoryFreeGb,
+    memoryPercent,
+    loadAvg,
+    uptimeSec,
+  };
+
+  if (options.taskInProgress !== undefined) {
+    telemetry.taskInProgress = options.taskInProgress;
+  }
+
+  return telemetry;
+}
+
 export interface Board {
   id: string;
   name: string;
@@ -44,6 +203,14 @@ export interface Board {
   wip: Record<string, number>;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface TaskProgress {
+  lastActivityAt: number | null;
+  lastActivityKind: string | null;
+  lastProgressAt: number | null;
+  workerLastSeenAt: number | null;
+  status: 'active' | 'no_recent_activity' | 'offline' | 'unknown';
 }
 
 export interface Task {
@@ -62,6 +229,16 @@ export interface Task {
   evidence: { path: string; machine?: string; note?: string }[];
   protectedPaths: string[];
   claimedAt: number | null;
+  lastActivityAt?: number | null;
+  lastProgressAt?: number | null;
+  lastActivityKind?: string | null;
+  progress?: TaskProgress | null;
+  reviewStatus?: string;
+  reviewAttempts?: number;
+  reviewReworks?: number;
+  reviewSummary?: string;
+  submitSummary?: string;
+  attempt?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -249,15 +426,29 @@ export class Worker {
   }
 
   /** 双向同步点：返回自上次以来 @ 到本 worker 的消息（干预直达） */
-  async checkpoint(taskId: string, note: string): Promise<{ task: Task; pendingMessages: PendingMessage[] }> {
-    return call(this.#baseUrl, this.#token, 'POST', `/tasks/${taskId}/checkpoint`, { note });
+  async checkpoint(
+    taskId: string,
+    noteOrOptions: string | { note: string; kind?: string; isKeepalive?: boolean; attempt?: number },
+  ): Promise<{ task: Task; pendingMessages: PendingMessage[] }> {
+    const body = typeof noteOrOptions === 'string' ? { note: noteOrOptions } : noteOrOptions;
+    return call(this.#baseUrl, this.#token, 'POST', `/tasks/${taskId}/checkpoint`, body);
   }
 
-  async submit(taskId: string, summary: string, evidence?: Task['evidence'], options?: { noCode?: boolean }): Promise<Task> {
+  /** 将 Review 状态任务受控退回指定工蜂重做 */
+  async returnReviewTask(taskId: string, reason?: string, assignee?: string): Promise<Task> {
+    const r = await call<{ task: Task }>(this.#baseUrl, this.#token, 'POST', `/tasks/${taskId}/review/return`, {
+      reason,
+      assignee,
+    });
+    return r.task;
+  }
+
+  async submit(taskId: string, summary: string, evidence?: Task['evidence'], options?: { noCode?: boolean; attempt?: number }): Promise<Task> {
     const r = await call<{ task: Task }>(this.#baseUrl, this.#token, 'POST', `/tasks/${taskId}/submit`, {
       summary,
       evidence,
       noCode: options?.noCode,
+      attempt: options?.attempt,
     });
     return r.task;
   }
@@ -267,8 +458,17 @@ export class Worker {
     return r.task;
   }
 
-  async heartbeat(specs?: AgentSpecs): Promise<void> {
-    await call(this.#baseUrl, this.#token, 'POST', `/agents/${this.#agentId}/heartbeat`, specs ? { specs } : undefined);
+  async heartbeat(specs?: AgentSpecs, telemetry?: DeviceTelemetry): Promise<void> {
+    const body: { specs?: AgentSpecs; telemetry?: DeviceTelemetry } = {};
+    if (specs !== undefined) body.specs = specs;
+    if (telemetry !== undefined) body.telemetry = telemetry;
+    await call(
+      this.#baseUrl,
+      this.#token,
+      'POST',
+      `/agents/${this.#agentId}/heartbeat`,
+      Object.keys(body).length > 0 ? body : undefined,
+    );
   }
 
   async inbox(since = 0): Promise<PendingMessage[]> {
@@ -303,13 +503,13 @@ export class Worker {
     return { buffer, baseCommit };
   }
 
-  async uploadTaskResult(taskId: string, bundleBuffer: Uint8Array, sha256: string): Promise<{ taskRef: string; headCommit: string }> {
+  async uploadTaskResult(taskId: string, bundleBuffer: Uint8Array, sha256: string, attempt?: number): Promise<{ taskRef: string; headCommit: string }> {
     const headers: Record<string, string> = {
       'content-type': 'application/vnd.git.bundle',
       'content-length': String(bundleBuffer.byteLength),
       'x-content-sha256': sha256,
+      ...(attempt !== undefined ? { 'x-task-attempt': String(attempt) } : {}),
     };
-    if (this.#token) headers.authorization = `Bearer ${this.#token}`;
     const res = await fetch(`${this.#baseUrl}/tasks/${taskId}/repo-result`, {
       method: 'POST',
       headers,

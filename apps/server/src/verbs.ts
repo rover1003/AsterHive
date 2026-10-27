@@ -45,8 +45,12 @@ function fileConflicts(ctx: Ctx, files: string[], selfActorId: string): string[]
 function assertClaimable(ctx: Ctx, task: Task, actor: Agent, files: string[]): void {
   requireExecutingRole(actor);
   if (task.lane !== 'Ready') throw new HttpError(409, `task ${task.id} not in Ready (lane: ${task.lane})`);
-  // 主脑 dispatch 预指派的卡，指派对象本人可领取开始执行；他人不可抢
-  if (task.assignee !== 'unassigned' && task.assignee !== actor.id && !isElevated(actor)) {
+  // 主脑 dispatch 预指派的卡，仅指派对象本人（或管理员）可认领执行；未指派或指派给他人均不可认领
+  if (
+    task.assignee !== actor.id &&
+    task.assignee !== actor.handle &&
+    !isElevated(actor)
+  ) {
     throw new HttpError(409, `task ${task.id} assigned to ${task.assignee}`);
   }
   const conflicts = fileConflicts(ctx, files, actor.id);
@@ -58,9 +62,11 @@ function assertClaimable(ctx: Ctx, task: Task, actor: Agent, files: string[]): v
 // 内层认领动作（不自行开事务）：claimTask 与 nextTask 各自在自己的 withWrite 里调用
 function claimInner(ctx: Ctx, task: Task, actor: Agent, files: string[] | null, via: string): Task {
   const now = Date.now();
+  const isFirstClaim = (task.attempt ?? 0) <= 1 && task.claimedAt === null && (task.reviewReworks ?? 0) === 0;
+  const nextAttempt = isFirstClaim ? 1 : (task.attempt ?? 1) + 1;
   let sql =
-    "UPDATE task SET assignee = ?, lane = 'InProgress', claimed_at = ?, last_activity_at = ?, updated_at = ?";
-  const args: SQLInputValue[] = [actor.id, now, now, now];
+    "UPDATE task SET assignee = ?, lane = 'InProgress', attempt = ?, claimed_at = ?, last_activity_at = ?, last_real_activity_at = NULL, last_activity_kind = NULL, last_progress_at = NULL, updated_at = ?";
+  const args: SQLInputValue[] = [actor.id, nextAttempt, now, now, now];
   if (files !== null) {
     sql += ', files = ?';
     args.push(JSON.stringify(files));
@@ -80,34 +86,28 @@ export function claimTask(ctx: Ctx, actor: Agent, taskId: string, files?: string
   return withWrite(ctx, 'task.claim', () => claimInner(ctx, task, actor, files === undefined ? null : files, 'claim'));
 }
 
-// TTL 断线判定（交接协议）：认领后超过 TTL 无活动 → 自动释放，他人可接管。
-// next 是天然扫掠点：拉取前先清理本板超时占用。
+// TTL 断线判定（交接协议，计划 §4.3.6）：
+// 网络断开或超时时，保留 InProgress、工作区及文件所有权，禁止自动释放或盲目重派；
+// 仅记录审计事件与雷达预警，只有经物理确认停止或显式解绑栅栏才能重派。
 function sweepStale(ctx: Ctx, boardId: string): string[] {
   const cutoff = Date.now() - ctx.cfg.ttlMinutes * 60_000;
   const rows = ctx.holder.db
-    .prepare("SELECT id, assignee, depends_on FROM task WHERE board_id = ? AND status='active' AND lane = 'InProgress' AND last_activity_at < ?")
-    .all(boardId, cutoff) as { id: string; assignee: string; depends_on: string }[];
-  const released: string[] = [];
+    .prepare("SELECT id, assignee FROM task WHERE board_id = ? AND status='active' AND lane = 'InProgress' AND last_activity_at < ?")
+    .all(boardId, cutoff) as { id: string; assignee: string }[];
   for (const r of rows) {
-    const deps = JSON.parse(r.depends_on) as string[];
-    const depsOk = deps.every((d) => {
-      const dep = ctx.holder.db.prepare("SELECT lane FROM task WHERE id = ? AND status='active'").get(d) as { lane: string } | undefined;
-      return dep?.lane === 'Done';
-    });
-    const now = Date.now();
-    ctx.holder.db
-      .prepare(
-        `UPDATE task SET assignee = 'unassigned', lane = ?, claimed_at = NULL, updated_at = ? WHERE id = ?`,
-      )
-      .run(depsOk ? 'Ready' : 'Backlog', now, r.id);
-    logEvent(ctx, 'task.ttl_released', { taskId: r.id, formerAssignee: r.assignee, ttlMinutes: ctx.cfg.ttlMinutes });
-    released.push(r.id);
+    logEvent(ctx, 'task.stale_detected', { taskId: r.id, assignee: r.assignee, ttlMinutes: ctx.cfg.ttlMinutes });
   }
-  return released;
+  return [];
 }
 
-// next 动态拉取（Hermes）：未认领 + 已解锁(Ready) + 按优先级取第一条；原子认领。
-export function nextTask(ctx: Ctx, actor: Agent, boardId: string): { task: Task | null; swept: string[] } {
+// next 动态拉取（Hermes + Nomad 调度增强）：
+// next 动态拉取：仅认领明确定向指派给当前工蜂的任务卡（assignee === actor.id || assignee === actor.handle）
+// 禁止公共池抢活与盲抢未指派卡；未指派任务或无本工蜂任务安全返回 { task: null }
+export function nextTask(
+  ctx: Ctx,
+  actor: Agent,
+  boardId: string,
+): { task: Task | null; swept: string[] } {
   getBoard(ctx, boardId); // 404 if missing
   requireExecutingRole(actor);
   requireParticipant(ctx, boardId, actor); // 看板参与限制（worker 须在参与者列表内）
@@ -115,9 +115,13 @@ export function nextTask(ctx: Ctx, actor: Agent, boardId: string): { task: Task 
     const swept = sweepStale(ctx, boardId);
     const candidate = ctx.holder.db
       .prepare(
-        "SELECT id FROM task WHERE board_id = ? AND status='active' AND lane = 'Ready' AND assignee = 'unassigned' ORDER BY priority, created_at, id LIMIT 1",
+        `SELECT id FROM task
+         WHERE board_id = ? AND status='active' AND lane = 'Ready'
+           AND (assignee = ? OR assignee = ?)
+         ORDER BY priority, created_at, id
+         LIMIT 1`,
       )
-      .get(boardId) as { id: string } | undefined;
+      .get(boardId, actor.id, actor.handle) as { id: string } | undefined;
     if (!candidate) return { task: null, swept };
     const task = getTask(ctx, candidate.id);
     const wip = ctx.holder.db
@@ -130,26 +134,67 @@ export function nextTask(ctx: Ctx, actor: Agent, boardId: string): { task: Task 
     return { task: claimed, swept };
   });
 }
+export interface CheckpointInput {
+  note: string;
+  kind?: string;
+  isKeepalive?: boolean;
+  attempt?: number;
+}
 
 export function checkpointTask(
   ctx: Ctx,
   actor: Agent,
   taskId: string,
-  note: string,
+  input: string | CheckpointInput,
 ): { task: Task; pendingMessages: unknown[] } {
-  if (!note?.trim()) throw new HttpError(422, 'note required');
+  const note = (typeof input === 'string' ? input : input?.note)?.trim();
+  if (!note) throw new HttpError(422, 'note required');
   const task = requireTaskRow(ctx, taskId);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${task.id} is cancelled`);
   if (task.lane !== 'InProgress') throw new HttpError(409, `task ${task.id} not InProgress (lane: ${task.lane})`);
-  if (task.assignee !== actor.id && !isElevated(actor)) {
+  if (task.assignee !== actor.id && task.assignee !== actor.handle && !isElevated(actor)) {
     throw new HttpError(403, `only assignee (${task.assignee}) or orchestrator/user may checkpoint`);
   }
-  withWrite(ctx, 'task.checkpoint', () => {
-    ctx.holder.db
-      .prepare('UPDATE task SET last_activity_at = ?, updated_at = ? WHERE id = ?')
-      .run(Date.now(), Date.now(), taskId);
-    logEvent(ctx, 'task.checkpoint', { taskId, by: actor.id, note: note.trim() });
+  const taskAttempt = task.attempt ?? 1;
+  if (taskAttempt > 1) {
+    const reqAttempt = typeof input === 'object' && input !== null ? input.attempt : undefined;
+    if (reqAttempt === undefined) {
+      throw new HttpError(
+        409,
+        `stale or unversioned execution attempt: task ${taskId} has been re-dispatched (attempt ${taskAttempt}); request must include current attempt (upgrade worker SDK)`,
+      );
+    }
+    if (reqAttempt !== taskAttempt) {
+      throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${reqAttempt}`);
+    }
+  } else if (typeof input === 'object' && input !== null && input.attempt !== undefined && input.attempt !== taskAttempt) {
+    throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${input.attempt}`);
+  }
+
+  // T105: 识别保活心跳与真实活动
+  const isExplicitKeepalive = typeof input === 'object' && input !== null && (input.isKeepalive === true || input.kind === 'keepalive');
+  const isLegacyKeepalive = /进行中[：:]\s*任务持续执行/i.test(note) || /^keepalive/i.test(note);
+  const isKeepalive = isExplicitKeepalive || isLegacyKeepalive;
+
+  const now = Date.now();
+  const inputKind = typeof input === 'object' && input !== null ? input.kind : undefined;
+  const activityKind = isKeepalive ? 'keepalive' : (inputKind || 'milestone');
+
+  withWrite(ctx, isKeepalive ? 'task.keepalive' : 'task.checkpoint', () => {
+    if (isKeepalive) {
+      ctx.holder.db
+        .prepare('UPDATE task SET last_activity_at = ?, updated_at = ? WHERE id = ?')
+        .run(now, now, taskId);
+      logEvent(ctx, 'task.keepalive', { taskId, by: actor.id, note });
+    } else {
+      ctx.holder.db
+        .prepare('UPDATE task SET last_activity_at = ?, last_real_activity_at = ?, last_activity_kind = ?, last_progress_at = ?, updated_at = ? WHERE id = ?')
+        .run(now, now, activityKind, now, now, taskId);
+      logEvent(ctx, 'task.checkpoint', { taskId, by: actor.id, note, kind: activityKind });
+    }
   });
-  // checkpoint 是双向同步点：按 agent 投递游标带回全部未达消息（含认领前的干预），并推进游标
+
+  ctx.holder.db.prepare('UPDATE agent SET last_seen_at = ? WHERE id = ?').run(now, actor.id);
   const pendingMessages = deliverPending(ctx, actor);
   return { task: getTask(ctx, taskId), pendingMessages };
 }
@@ -206,8 +251,9 @@ function deliverPending(ctx: Ctx, agent: Agent): PendingMessage[] {
 
 export function releaseTask(ctx: Ctx, actor: Agent, taskId: string, reason?: string): Task {
   const task = requireTaskRow(ctx, taskId);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
   if (task.lane !== 'InProgress') throw new HttpError(409, `task ${task.id} not InProgress (lane: ${task.lane})`);
-  if (task.assignee !== actor.id && !isElevated(actor)) {
+  if (task.assignee !== actor.id && task.assignee !== actor.handle && !isElevated(actor)) {
     throw new HttpError(403, 'only assignee or orchestrator/user may release');
   }
   const depsOk = task.dependsOn.every((d) => {
@@ -217,7 +263,7 @@ export function releaseTask(ctx: Ctx, actor: Agent, taskId: string, reason?: str
   return withWrite(ctx, 'task.release', () => {
     ctx.holder.db
       .prepare(
-        `UPDATE task SET assignee = 'unassigned', lane = ?, claimed_at = NULL, updated_at = ? WHERE id = ?`,
+        `UPDATE task SET assignee = 'unassigned', lane = ?, attempt = attempt + 1, claimed_at = NULL, updated_at = ? WHERE id = ?`,
       )
       .run(depsOk ? 'Ready' : 'Backlog', Date.now(), taskId);
     logEvent(ctx, 'task.released', { taskId, by: actor.id, reason: reason ?? '' });
@@ -230,6 +276,7 @@ export interface SubmitInput {
   evidence?: Task['evidence'];
   /** Explicit no-code results remain in manual Review; they are never auto-approved. */
   noCode?: boolean;
+  attempt?: number;
 }
 
 export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: SubmitInput): Task {
@@ -239,6 +286,20 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   if (task.lane !== 'InProgress') throw new HttpError(409, `task ${task.id} not InProgress (lane: ${task.lane})`);
   if (task.assignee !== actor.id && !isElevated(actor)) {
     throw new HttpError(403, 'only assignee or orchestrator/user may submit');
+  }
+  const taskAttempt = task.attempt ?? 1;
+  if (taskAttempt > 1) {
+    if (input.attempt === undefined) {
+      throw new HttpError(
+        409,
+        `stale or unversioned execution attempt: task ${taskId} has been re-dispatched (attempt ${taskAttempt}); submit must include current attempt (upgrade worker SDK)`,
+      );
+    }
+    if (input.attempt !== taskAttempt) {
+      throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${input.attempt}`);
+    }
+  } else if (input.attempt !== undefined && input.attempt !== taskAttempt) {
+    throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${input.attempt}`);
   }
   // Review 泳道同样受 WIP 约束
   const board = getBoard(ctx, task.boardId);
@@ -263,8 +324,8 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   return withWrite(ctx, 'task.submit', () => {
     const now = Date.now();
     ctx.holder.db
-      .prepare("UPDATE task SET lane='Review', review_status=?, review_attempts=0, review_reworks=CASE WHEN review_status='rework' THEN review_reworks ELSE 0 END, review_summary='', submit_summary=?, evidence=?, last_activity_at=?, updated_at=? WHERE id=?")
-      .run(reviewerEnabled ? 'pending' : 'none', input.summary.trim().slice(0, 6000), JSON.stringify(evidence), now, now, taskId);
+      .prepare("UPDATE task SET lane='Review', review_status=?, review_attempts=0, review_reworks=CASE WHEN review_status='rework' THEN review_reworks ELSE 0 END, review_summary='', submit_summary=?, evidence=?, last_activity_at=?, last_real_activity_at=?, last_activity_kind='submit', last_progress_at=?, updated_at=? WHERE id=?")
+      .run(reviewerEnabled ? 'pending' : 'none', input.summary.trim().slice(0, 6000), JSON.stringify(evidence), now, now, now, now, taskId);
     logEvent(ctx, 'task.submitted', {
       taskId,
       by: actor.id,

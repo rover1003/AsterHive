@@ -19,6 +19,7 @@ export interface PreparedWorkspace {
   dir: string;                         // 实际执行 cwd
   mode: 'repo' | 'scratch' | 'managed'; // repo=持久克隆；scratch=无 repo 一次性目录；managed=服务端托管临时快照
   taskId: string;                      // 所属任务号
+  attempt?: number;                    // 任务当前执行代次
   branch?: string;                     // 任务分支
   baseCommit?: string;                 // 基线提交 hash
   commitHash?: string;                 // 执行后提交的 hash
@@ -35,6 +36,7 @@ export interface PrepareWorkspaceOptions {
   workdirRoot: string;
   boardId: string;
   taskId: string;
+  attempt?: number;
   repo?: string | null;                // legacy repo URL
   repoMode?: 'managed' | 'remote-legacy';
   worker?: Worker;
@@ -113,7 +115,7 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
       } else {
         log(`managed 模式：发现干净的现有任务分支 ${branch}，安全复用临时工作区。`);
       }
-      return { dir: worktreeDir, mode: 'managed', taskId: opts.taskId, branch, worker: opts.worker, cleanup: () => rmSync(baseDir, { recursive: true, force: true }), log };
+      return { dir: worktreeDir, mode: 'managed', taskId: opts.taskId, attempt: opts.attempt, branch, worker: opts.worker, cleanup: () => rmSync(baseDir, { recursive: true, force: true }), log };
     }
     if (existsSync(baseDir) && readdirSync(baseDir).length > 0) {
       throw new Error(`managed 临时路径存在但没有可验证的任务仓库，拒绝覆盖并保留现场：${baseDir}`);
@@ -129,6 +131,7 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
       dir: worktreeDir,
       mode: 'managed',
       taskId: opts.taskId,
+      attempt: opts.attempt,
       branch,
       baseCommit: snap.baseCommit,
       worker: opts.worker,
@@ -141,7 +144,7 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
   if (!repo) {
     const dir = join(opts.workdirRoot, opts.taskId);
     mkdirSync(dir, { recursive: true });
-    return { dir, mode: 'scratch', taskId: opts.taskId };
+    return { dir, mode: 'scratch', taskId: opts.taskId, attempt: opts.attempt };
   }
 
   // ---- repo 模式：持久项目工作区 <workdirRoot>/projects/<boardId> ----
@@ -181,7 +184,7 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
     await git(['checkout', branch], dir, '切换任务分支失败，需人工处理');
   }
 
-  return { dir, mode: 'repo', taskId: opts.taskId, branch, baseCommit, cloned, pulled, push: opts.push, log };
+  return { dir, mode: 'repo', taskId: opts.taskId, attempt: opts.attempt, branch, baseCommit, cloned, pulled, push: opts.push, log };
 }
 
 /** Execution succeeded; code work additionally needs a stored commit before it may be submitted. */
@@ -251,7 +254,7 @@ export async function commitWorkspace(ws: PreparedWorkspace, message: string): P
     const buf = readFileSync(resultBundle);
     const sha256 = createHash('sha256').update(buf).digest('hex');
     log(`正在上传任务 ${ws.taskId} 的结果 bundle（${buf.byteLength} 字节）...`);
-    const res = await ws.worker.uploadTaskResult(ws.taskId, buf, sha256);
+    const res = await ws.worker.uploadTaskResult(ws.taskId, buf, sha256, ws.attempt);
     log(`任务结果已存入服务器仓库：${res.taskRef}@${res.headCommit.slice(0, 8)}`);
     return hash;
   }

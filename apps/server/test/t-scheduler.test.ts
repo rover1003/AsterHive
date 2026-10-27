@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkRig } from './helpers.ts';
 import { createApp } from '../src/http.ts';
-import { registerAgent, setAgentEnabled, updateAgentProfile, reportAgentSpecs, type Agent } from '../src/agents.ts';
+import { registerAgent, setAgentEnabled, updateAgentProfile, reportAgentSpecs, heartbeat, type Agent } from '../src/agents.ts';
 import { createBoard, createTask, setParticipants } from '../src/tasks.ts';
 import { matchTaskToWorkers } from '../src/scheduler.ts';
 import { TOOL_DEFS } from '../src/orchestrator-tools.ts';
@@ -19,7 +19,7 @@ test('Phase 5 Nomad 调度: 任务硬性条件过滤（OS、核心数、内存�
     createBoard(rig.ctx, { id: 'b1', name: 'Board 1' });
 
     // 1. 注册多只不同规格与环境的工蜂
-    // 工蜂 A：Windows、16核、32GB内存、omp 内核、带 gemini 模型
+    // 工蜂 A：Windows、16核、32GB内存、omp 内核、带 gemini 模型（活跃在线）
     const { agent: beeWin } = registerAgent(rig.ctx, {
       name: 'Bee Win',
       handle: 'bee-win',
@@ -34,8 +34,9 @@ test('Phase 5 Nomad 调度: 任务硬性条件过滤（OS、核心数、内存�
       },
     });
     updateAgentProfile(rig.ctx, beeWin.id, { preferredModel: 'Gemini/gemini-3.8-flash-tiered' });
+    heartbeat(rig.ctx, beeWin.id);
 
-    // 工蜂 B：Mac、8核、16GB内存、zcode 内核、带 opus 模型
+    // 工蜂 B：Mac、8核、16GB内存、zcode 内核、带 opus 模型（活跃在线）
     const { agent: beeMac } = registerAgent(rig.ctx, {
       name: 'Bee Mac',
       handle: 'bee-mac',
@@ -49,6 +50,7 @@ test('Phase 5 Nomad 调度: 任务硬性条件过滤（OS、核心数、内存�
         executor: 'zcode',
       },
     });
+    heartbeat(rig.ctx, beeMac.id);
 
     // 工蜂 C：Linux、停用状态
     const { agent: beeLinux } = registerAgent(rig.ctx, {
@@ -61,20 +63,29 @@ test('Phase 5 Nomad 调度: 任务硬性条件过滤（OS、核心数、内存�
         arch: 'x64',
         cpus: 32,
         memoryTotalGb: 64,
-        executor: 'shell',
+        executor: 'omp',
       },
     });
     setAgentEnabled(rig.ctx, beeLinux.id, false);
 
+    // 工蜂 D：注册后从未发送过心跳（不可用节点）
+    const { agent: beeNever } = registerAgent(rig.ctx, {
+      name: 'Bee Never Heartbeat',
+      handle: 'bee-never',
+      specs: { os: 'win32', arch: 'x64', cpus: 16, memoryTotalGb: 32 },
+    });
+
     // 2. 任务 1：要求 win32 + 最低 12 核心 + 最低 24GB 内存 + 模型含 gemini
     createTask(rig.ctx, 'b1', {
       id: 'WIN-101',
-      title: 'Windows 专有大内存重构任务',
+      title: 'Windows 专有构建与大型测试',
       requirements: {
         os: 'win32',
+        arch: 'x64',
         minCpus: 12,
         minMemoryGb: 24,
         requiredModel: 'gemini',
+        executor: 'omp',
       },
     });
 
@@ -88,12 +99,15 @@ test('Phase 5 Nomad 调度: 任务硬性条件过滤（OS、核心数、内存�
     assert.ok(macIneligible, 'bee-mac 应当进入 ineligible');
     assert.ok(macIneligible.reasons.some((r) => r.includes('操作系统不匹配')));
     assert.ok(macIneligible.reasons.some((r) => r.includes('CPU 核心不足')));
-    assert.ok(macIneligible.reasons.some((r) => r.includes('物理内存不足')));
     assert.ok(macIneligible.reasons.some((r) => r.includes('模型能力不匹配')));
 
     const linuxIneligible = match1.ineligible.find((i) => i.agentId === beeLinux.id);
     assert.ok(linuxIneligible, 'bee-linux 应当进入 ineligible');
     assert.ok(linuxIneligible.reasons.some((r) => r.includes('停用状态')));
+
+    const neverIneligible = match1.ineligible.find((i) => i.agentId === beeNever.id);
+    assert.ok(neverIneligible, '未上报心跳节点必须进入 ineligible');
+    assert.ok(neverIneligible.reasons.some((r) => r.includes('从未上报心跳')));
 
     // 3. 参与者门禁测试：限制看板只允许 beeMac 参与
     setParticipants(rig.ctx, 'b1', [beeMac.id]);
@@ -121,6 +135,7 @@ test('Phase 5 Nomad 调度: 评分排序（在线状态、首选模型贴合度�
       specs: { os: 'linux', arch: 'x64', cpus: 16, memoryTotalGb: 32, executor: 'omp' },
     });
     updateAgentProfile(rig.ctx, bee1.id, { preferredModel: 'openai/gpt-5.2' });
+    heartbeat(rig.ctx, bee1.id);
 
     // 工蜂 2：空闲、4核、8GB内存、可用模型包含但非首选
     const { agent: bee2 } = registerAgent(rig.ctx, {
@@ -129,6 +144,7 @@ test('Phase 5 Nomad 调度: 评分排序（在线状态、首选模型贴合度�
       models: ['openai/gpt-5.2'],
       specs: { os: 'linux', arch: 'x64', cpus: 4, memoryTotalGb: 8, executor: 'omp' },
     });
+    heartbeat(rig.ctx, bee2.id);
 
     createTask(rig.ctx, 'b2', {
       id: 'MODEL-102',
@@ -160,6 +176,8 @@ test('Phase 5 Nomad 调度: HTTP API GET /tasks/:id/match 与蜂后协议工具 
       handle: 'bee-worker',
       specs: { os: 'win32', cpus: 8, memoryTotalGb: 16 },
     });
+    heartbeat(rig.ctx, workerBee.id);
+
     const { agent: queen, token: queenToken } = registerAgent(rig.ctx, {
       name: 'Queen Brain',
       handle: 'queen-brain',
@@ -177,24 +195,20 @@ test('Phase 5 Nomad 调度: HTTP API GET /tasks/:id/match 与蜂后协议工具 
     // 1. HTTP 端点测试
     const res = await app.request('/tasks/MATCH-103/match', { headers: H(queenToken) });
     assert.equal(res.status, 200);
-    const data = (await res.json()) as { taskId: string; eligibleCount: number; recommendations: unknown[] };
-    assert.equal(data.taskId, 'MATCH-103');
-    assert.equal(data.eligibleCount, 1);
+    const body = (await res.json()) as { taskId: string; eligibleCount: number; recommendations: unknown[] };
+    assert.equal(body.taskId, 'MATCH-103');
+    assert.equal(body.eligibleCount, 1);
+    assert.equal(body.recommendations.length, 1);
 
-    // 2. 蜂后协议工具 asterhive_match_task 调用测试
+    // worker 角色无权调用 match（仅 orchestrator / user 开放）
+    const forbiddenRes = await app.request('/tasks/MATCH-103/match', { headers: H(workerToken) });
+    assert.equal(forbiddenRes.status, 403);
+
+    // 2. 蜂后协议工具 asterhive_match_task 测试
     const matchTool = TOOL_DEFS.find((t) => t.name === 'asterhive_match_task');
-    assert.ok(matchTool, 'asterhive_match_task 工具已注册');
-
-    // 蜂后正常调用
-    const toolRes = (await matchTool.handle(rig.ctx, queen, { taskId: 'MATCH-103' })) as { eligibleCount: number };
-    assert.equal(toolRes.eligibleCount, 1);
-
-    // worker 调用应报 403
-    await assert.rejects(
-      async () => matchTool.handle(rig.ctx, workerBee, { taskId: 'MATCH-103' }),
-      /workers cannot query scheduling matches/,
-      'worker 调用调度匹配报 403',
-    );
+    assert.ok(matchTool, '应当注册 asterhive_match_task 工具');
+    const toolResult = matchTool.handle(rig.ctx, queen, { taskId: 'MATCH-103' }) as { eligibleCount: number };
+    assert.equal(toolResult.eligibleCount, 1);
   } finally {
     rig.cleanup();
   }

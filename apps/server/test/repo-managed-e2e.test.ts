@@ -10,6 +10,7 @@ import { openDb } from '../src/db.ts';
 import { registerAgent, setAgentEnabled } from '../src/agents.ts';
 import { createBoard, createTask, setBoardRepoState } from '../src/tasks.ts';
 import { RepoManager } from '../src/repo-manager.ts';
+import { claimTask } from '../src/verbs.ts';
 import { TOOL_DEFS } from '../src/orchestrator-tools.ts';
 
 function git(args: string[], cwd: string): string {
@@ -65,7 +66,10 @@ test('Managed repository end-to-end: snapshot -> worker commit -> upload -> brai
       id: 'TASK-1',
       title: 'Add feature file',
       detail: 'Create feature.txt',
+      lane: 'Ready',
+      assignee: worker.agent.id,
     });
+    claimTask(ctx, worker.agent, task.id);
 
     // 5. Worker 请求 snapshot bundle 端点
     const snapRes = await app.request(`/tasks/${task.id}/repo-snapshot`, {

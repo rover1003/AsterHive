@@ -1,8 +1,9 @@
 // 星巢协议工具的单一事实源（T14 重构）：
 // MCP 服务端（mcp.ts）与内置主脑（brain.ts）共用同一张定义表——
 // 名称/描述/zod 参数 schema/执行函数只在此处维护，两侧各自生成自己的注册形态。
-// 约束：全表 15 个工具，全部是"看板/聊天室协议动词"，绝不包含 shell/文件/浏览器
-// 执行面——主脑侧只注册这张表，结构性保证"只分派不执行"。
+// 约束：全部是"看板/聊天室协议动词"与"托管仓库受限只读与整合工具"，绝不包含宿主机 shell 或任意文件写
+// 执行面——主脑侧只注册这张表，结构性保证"只分派不执行，代码只读不越权写"。
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { z } from 'zod';
 import type { ShapeOutput } from '@modelcontextprotocol/sdk/server/zod-compat.js';
 import { HttpError, type Ctx } from './types.ts';
@@ -18,6 +19,7 @@ import {
   cancelTask,
   type Lane,
   type Priority,
+  type TaskRequirements,
 } from './tasks.ts';
 import { claimTask, nextTask, checkpointTask, releaseTask, submitTask } from './verbs.ts';
 import { createMessage, inboxFor, dispatchTask, type MessageKind } from './messages.ts';
@@ -46,6 +48,65 @@ export interface ToolDef {
   shape?: z.ZodRawShape;
   // actor 参数化：MCP 侧传请求身份（Bearer 解析），主脑侧传内置系统身份。
   handle: (ctx: Ctx, actor: Agent, args: Record<string, unknown>) => unknown;
+}
+
+export interface ToolExecutionContext {
+  boardId?: string;
+}
+
+export const toolExecutionContext = new AsyncLocalStorage<ToolExecutionContext>();
+
+export function runWithToolContext<T>(
+  context: ToolExecutionContext,
+  fn: () => T | Promise<T>,
+): Promise<T> {
+  return toolExecutionContext.run(context, fn) as Promise<T>;
+}
+
+function resolveAuthorizedBoardId(
+  ctx: Ctx,
+  actor: Agent,
+  args: { boardId?: string; taskId?: string },
+): string {
+  if (actor.role === 'worker') {
+    throw new HttpError(403, 'workers cannot read repository files directly');
+  }
+
+  const context = toolExecutionContext.getStore();
+  const contextBoardId = context?.boardId;
+
+  // If a context board is bound (e.g. Brain session in a board chat room or MCP request with board header):
+  if (contextBoardId) {
+    if (args.boardId && args.boardId !== contextBoardId) {
+      throw new HttpError(
+        403,
+        `cross-board access denied: current session is bound to board '${contextBoardId}', cannot access board '${args.boardId}'`,
+      );
+    }
+    if (args.taskId) {
+      const task = getTask(ctx, args.taskId);
+      if (task.boardId !== contextBoardId) {
+        throw new HttpError(
+          403,
+          `cross-board access denied: task '${args.taskId}' belongs to board '${task.boardId}', but current session is bound to board '${contextBoardId}'`,
+        );
+      }
+    }
+    return contextBoardId;
+  }
+
+  // If NO context board is bound:
+  // Queen/orchestrator strictly requires an active board context; cannot access arbitrary boards without context
+  if (actor.role === 'orchestrator') {
+    throw new HttpError(403, 'queen repository access requires an active single-board context');
+  }
+
+  // User / admin role without context: must supply explicit boardId or taskId
+  const resolvedBoardId = args.boardId ?? (args.taskId ? getTask(ctx, args.taskId).boardId : undefined);
+  if (!resolvedBoardId) {
+    throw new HttpError(422, 'boardId or taskId must be provided');
+  }
+  return resolvedBoardId;
 }
 
 // 借 SDK 的 ShapeOutput 从 zod raw shape 推导处理器实参类型（zod v3/v4 兼容）
@@ -175,28 +236,44 @@ export const TOOL_DEFS: ToolDef[] = [
   // ---- 主脑侧：派活（角色由领域层强制，worker 调用得 403）----
   tool(
     'asterhive_create_task',
-    '在指定看板立项一张卡（id 形如 T42/BUG-17；默认 Backlog，可带优先级/验收/文件/依赖/工作区）。',
+    '在指定看板立项一张卡（id 形如 T42/BUG-17；默认 Backlog，可带优先级/指派人/验收/文件/依赖/硬件约束/工作区）。',
     {
       boardId: z.string(),
       id: z.string(),
       title: z.string(),
       detail: z.string().optional(),
+      lane: z.enum(LANES).optional(),
       priority: z.enum(PRIORITIES).optional(),
+      assignee: z.string().optional(),
       acceptance: z.string().optional(),
       files: z.array(z.string()).optional(),
       dependsOn: z.array(z.string()).optional(),
       workspace: z.record(z.string(), z.unknown()).optional(),
+      requirements: z
+        .object({
+          os: z.string().optional(),
+          arch: z.string().optional(),
+          minCpus: z.number().int().positive().optional(),
+          minMemoryGb: z.number().positive().optional(),
+          maxCpuPercent: z.number().min(0).max(100).optional(),
+          requiredModel: z.string().optional(),
+          executor: z.string().optional(),
+        })
+        .optional(),
     },
     (ctx, _a, args) =>
       createTask(ctx, args.boardId, {
         id: args.id,
         title: args.title,
         detail: args.detail,
+        lane: args.lane as Lane | undefined,
         priority: args.priority as Priority | undefined,
+        assignee: args.assignee,
         acceptance: args.acceptance,
         files: args.files,
         dependsOn: args.dependsOn,
         workspace: args.workspace as Record<string, unknown> | undefined,
+        requirements: args.requirements as TaskRequirements | undefined,
       }),
   ),
   tool(
@@ -328,6 +405,43 @@ export const TOOL_DEFS: ToolDef[] = [
       const task = getTask(ctx, args.taskId);
       const mgr = new RepoManager(ctx);
       return await mgr.integrateTask(task.boardId, args.taskId);
+    },
+  ),
+  tool(
+    'asterhive_repo_list_files',
+    '只读列出当前看板托管仓库 HEAD 提交下的目录结构与文件清单（可标识 commit；支持指定子路径及递归；拒绝路径逃逸与符号链接穿透）。',
+    {
+      boardId: z.string().optional(),
+      taskId: z.string().optional(),
+      path: z.string().optional(),
+      recursive: z.boolean().optional(),
+      limit: z.number().int().min(1).max(1000).optional(),
+    },
+    async (ctx, a, args) => {
+      const boardId = resolveAuthorizedBoardId(ctx, a, args);
+      const mgr = new RepoManager(ctx);
+      return await mgr.listTree(boardId, {
+        path: args.path,
+        recursive: args.recursive,
+        limit: args.limit,
+      });
+    },
+  ),
+  tool(
+    'asterhive_repo_read_file',
+    '安全读取当前看板托管仓库 HEAD 提交下指定文本文件的内容（只读；标识 commit hash；拒绝敏感文件、符号链接、二进制及超大文件，超限自动安全截断）。',
+    {
+      boardId: z.string().optional(),
+      taskId: z.string().optional(),
+      path: z.string(),
+      maxBytes: z.number().int().min(1).max(1048576).optional(),
+    },
+    async (ctx, a, args) => {
+      const boardId = resolveAuthorizedBoardId(ctx, a, args);
+      const mgr = new RepoManager(ctx);
+      return await mgr.readTextFile(boardId, args.path, {
+        maxBytes: args.maxBytes,
+      });
     },
   ),
 

@@ -26,6 +26,14 @@ export interface PiModelConfig {
   /** Model-specific labels for Pi levels; null explicitly disables a level. */
   thinkingLevelMap?: Partial<Record<PiThinkingLevel, string | null>>;
 }
+export interface PiActivity {
+  kind: 'tool' | 'model';
+  toolName?: string;
+  phase: 'start' | 'end';
+  waitingFor?: string;
+  timestamp: number;
+}
+
 export interface PiRunOptions {
   prompt: string;
   cwd: string;
@@ -34,6 +42,7 @@ export interface PiRunOptions {
   log: (...args: unknown[]) => void;
   /** hive_checkpoint 落点：转发给守护进程的 worker.checkpoint(taskId, note) */
   checkpoint?: (note: string) => Promise<{ pendingMessages?: { author?: string; content?: string }[] }>;
+  onActivity?: (activity: PiActivity) => void | Promise<void>;
   /** 随包技能目录（缺省 = 包内 hive-skills） */
   skillsDir?: string;
   /** Pi agentDir 隔离根（缺省 ~/.asterhive/pi-worker-agent，与用户 ~/.pi 完全隔离） */
@@ -97,7 +106,7 @@ function lastAssistantText(session: PiSessionLike): string {
  * 返回与 CLI 执行器同形的 { stdout, code }：code=0 正常；-1 = 超时中止或未配置。
  */
 export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
-  const { prompt, cwd, config, timeoutMs, log, checkpoint } = opts;
+  const { prompt, cwd, config, timeoutMs, log, checkpoint, onActivity } = opts;
   const pi = await loadPi();
 
   const agentDir = opts.agentDir ?? join(homedir(), '.asterhive', 'pi-worker-agent');
@@ -196,34 +205,113 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
     customTools: [checkpointTool],
   });
 
+  const seenToolStarts = new Set<string>();
+  let unsubscribe: (() => void) | undefined;
+  const subscribable = session as unknown as {
+    subscribe?: (fn: (event: Record<string, unknown>) => void) => () => void;
+  };
+  if (typeof subscribable.subscribe === 'function') {
+    unsubscribe = subscribable.subscribe((event: Record<string, unknown>) => {
+      if (!event || typeof event !== 'object') return;
+      const type = typeof event.type === 'string' ? event.type : '';
+      if (type === 'tool_execution_start') {
+        const toolName = typeof event.toolName === 'string' ? event.toolName : 'tool';
+        onActivity?.({
+          kind: 'tool',
+          toolName,
+          phase: 'start',
+          waitingFor: `tool:${toolName}`,
+          timestamp: Date.now(),
+        });
+      } else if (type === 'tool_execution_end') {
+        const toolName = typeof event.toolName === 'string' ? event.toolName : 'tool';
+        onActivity?.({
+          kind: 'tool',
+          toolName,
+          phase: 'end',
+          timestamp: Date.now(),
+        });
+      } else if (type === 'turn_start' || type === 'message_start') {
+        onActivity?.({
+          kind: 'model',
+          phase: 'start',
+          waitingFor: 'model',
+          timestamp: Date.now(),
+        });
+      } else if (type === 'message_update') {
+        const msg = event.message as { content?: unknown[] } | undefined;
+        if (msg && Array.isArray(msg.content)) {
+          for (let i = 0; i < msg.content.length; i++) {
+            const b = msg.content[i] as { type?: string; name?: string } | undefined;
+            if (b && (b.type === 'tool_call' || b.type === 'tool_use')) {
+              const toolName = typeof b.name === 'string' ? b.name : 'tool';
+              const key = `${toolName}|${i}`;
+              if (!seenToolStarts.has(key)) {
+                seenToolStarts.add(key);
+                onActivity?.({
+                  kind: 'tool',
+                  toolName,
+                  phase: 'start',
+                  waitingFor: `tool:${toolName}`,
+                  timestamp: Date.now(),
+                });
+              }
+            }
+          }
+        }
+      }
+    });
+  }
   let aborted = false;
-  const timer = setTimeout(() => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  timer = setTimeout(() => {
     aborted = true;
-    log(`Pi 会话超时（${Math.round(timeoutMs / 60000)} 分钟），执行中止`);
+    log(`Pi 会话超时（${Math.round(timeoutMs / 60000)} 分钟），触发中止请求，执行结果未知，后台仍在运行中`);
     try {
       void Promise.resolve((session as PiSessionLike).abort()).catch(() => {});
     } catch {
-      /* abort 失败则等待超时自然结束 */
+      /* abort 失败 */
     }
+    // 立即向服务端上报观察到超时的 checkpoint，明确执行结果未知，保活继续，绝不假冒已停止
+    if (checkpoint) {
+      void checkpoint(
+        '执行达到超时上限，已触发中止请求；执行结果未知，后台仍在运行中；保活继续，工作区现场保留',
+      ).catch(() => {});
+    }
+    onActivity?.({
+      kind: 'model',
+      phase: 'start',
+      waitingFor: 'abort_settle',
+      timestamp: Date.now(),
+    });
   }, timeoutMs);
 
   try {
+    // 真实 await 原始 prompt 直到真正 settled；绝不提前 fake-resolve 退出
     await (session as PiSessionLike).prompt(prompt);
+
     const text = lastAssistantText(session as PiSessionLike);
     if (aborted) {
-      return { stdout: `${text}\n[pi-executor] 会话超时被中止，以上为中止前最后输出`.trim(), code: -1 };
+      return {
+        stdout: `${text}\n[pi-executor] 会话超时被中止，已真正中止退出；工作区现场已保留。`.trim(),
+        code: -1,
+      };
     }
     return { stdout: text || '(无文本输出)', code: 0 };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log('Pi 会话执行出错：', msg);
-    // 中止（超时）路径：保留中止前的部分输出，与成功路径同语义标注
     if (aborted) {
       const partial = lastAssistantText(session as PiSessionLike);
-      return { stdout: `${partial}\n[pi-executor] 会话超时被中止，以上为中止前最后输出`.trim(), code: -1 };
+      return {
+        stdout: `${partial}\n[pi-executor] 会话超时被中止，已真正中止退出：${msg}；工作区现场已保留。`.trim(),
+        code: -1,
+      };
     }
     return { stdout: `[pi-executor] 执行出错：${msg}`, code: 1 };
   } finally {
+    unsubscribe?.();
     clearTimeout(timer);
   }
 }

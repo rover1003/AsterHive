@@ -202,7 +202,12 @@ test('参与限制: 空列表开放、列表外 worker 403、列表内正常、u
   try {
     await setupBoardWithTasks(r, 3);
 
-    // 空列表 = 开放给全部（向后兼容）：列表外的 bee2 也能 next
+    // 空列表 = 开放给全部（向后兼容）：派给 bee2 的卡，列表外的 bee2 也能 next
+    await r.app.request('/tasks/T1/dispatch', {
+      method: 'POST',
+      headers: H(orch.token),
+      body: JSON.stringify({ content: '@bee2 请处理 T1', assignee: bee2.agent.id }),
+    });
     let res = await app.request('/boards/b/next', { method: 'POST', headers: H(bee2.token) });
     assert.equal(res.status, 200);
     let body = (await res.json()) as { task: { id: string } | null };
@@ -225,18 +230,27 @@ test('参与限制: 空列表开放、列表外 worker 403、列表内正常、u
     res = await app.request('/tasks/T2/claim', { method: 'POST', headers: H(bee2.token), body: '{}' });
     assert.equal(res.status, 403, '列表外 worker claim 被拒');
 
-    // 列表内 worker 正常
+    // 派给 bee1：列表内 worker 正常
+    await r.app.request('/tasks/T2/dispatch', {
+      method: 'POST',
+      headers: H(orch.token),
+      body: JSON.stringify({ content: '@bee1 请处理 T2', assignee: bee1.agent.id }),
+    });
     res = await app.request('/boards/b/next', { method: 'POST', headers: H(bee1.token) });
     assert.equal(res.status, 200);
     body = (await res.json()) as typeof body;
     assert.equal(body.task?.id, 'T2', '列表内 worker 正常领取');
 
     // user 豁免（匿名即 user）
+    await r.app.request('/tasks/T3/dispatch', {
+      method: 'POST',
+      headers: H(orch.token),
+      body: JSON.stringify({ content: '@user 请处理 T3', assignee: 'user' }),
+    });
     res = await app.request('/boards/b/next', { method: 'POST', headers: JSON_H });
     assert.equal(res.status, 200, 'user 角色豁免参与限制');
     body = (await res.json()) as typeof body;
     assert.equal(body.task?.id, 'T3');
-
     // orchestrator 豁免：作为被派者（非 worker）不受列表约束
     res = await app.request('/tasks/T1/dispatch', {
       method: 'POST',

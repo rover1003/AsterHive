@@ -39,10 +39,21 @@ export interface TaskRequirements {
   minCpus?: number;
   /** 最低物理内存（GB） */
   minMemoryGb?: number;
+  /** 最大允许动态 CPU 占用率 (0~100) */
+  maxCpuPercent?: number;
   /** 必需的模型或系列标识（模糊匹配，如 'gemini' | 'opus' | 'gpt-5'） */
   requiredModel?: string;
   /** 期望执行内核，如 'omp' | 'zcode' */
   executor?: string;
+}
+
+
+export interface TaskProgress {
+  lastActivityAt: number | null;
+  lastActivityKind: string | null;
+  lastProgressAt: number | null;
+  workerLastSeenAt: number | null;
+  status: 'active' | 'no_recent_activity' | 'offline' | 'unknown';
 }
 
 export interface Task {
@@ -68,10 +79,14 @@ export interface Task {
   reviewReworks: number;
   reviewSummary: string;
   submitSummary: string;
+  attempt: number;
   claimedAt: number | null;
   lastActivityAt: number | null;
+  lastRealActivityAt: number | null;
+  lastProgressAt: number | null;
+  lastActivityKind: string | null;
+  progress: TaskProgress | null;
   autoUnblockedAt: number | null;
-  createdAt: number;
   updatedAt: number;
 }
 
@@ -97,13 +112,76 @@ type TaskRow = {
   review_reworks: number;
   review_summary: string;
   submit_summary: string;
+  attempt?: number;
   claimed_at: number | null;
   last_activity_at: number | null;
+  last_real_activity_at?: number | null;
+  last_progress_at?: number | null;
+  last_activity_kind?: string | null;
   auto_unblocked_at: number | null;
   created_at: number;
   updated_at: number;
   status: Task['status'];
 };
+
+export function computeTaskProgress(
+  r: Pick<TaskRow, 'lane' | 'assignee' | 'claimed_at' | 'last_activity_at' | 'last_real_activity_at' | 'last_progress_at' | 'last_activity_kind' | 'status'>,
+  ctx?: Ctx,
+  now: number = Date.now(),
+): TaskProgress | null {
+  if (r.status === 'cancelled' || r.lane !== 'InProgress' || !r.assignee || r.assignee === 'unassigned') {
+    return null;
+  }
+  let workerLastSeenAt: number | null = null;
+  let workerEnabled = true;
+  if (ctx) {
+    try {
+      const agent = ctx.holder.db
+        .prepare('SELECT last_seen_at, enabled FROM agent WHERE id = ? OR handle = ?')
+        .get(r.assignee, r.assignee) as { last_seen_at: number | null; enabled: number } | undefined;
+      if (agent) {
+        workerLastSeenAt = agent.last_seen_at;
+        workerEnabled = agent.enabled === 1;
+      }
+    } catch {
+      /* ignore lookup errors */
+    }
+  }
+
+  // T105: last_activity_at 维持 TTL 租约时钟；last_real_activity_at 独立记录真实模型/工具活动时钟
+  const lastRealActivityAt = r.last_real_activity_at ?? null;
+  const lastProgressAt = r.last_progress_at ?? null;
+  const lastActivityKind = r.last_activity_kind ?? null;
+
+  const OFFLINE_THRESHOLD_MS = 60_000;
+  const NO_RECENT_ACTIVITY_THRESHOLD_MS = 180_000;
+
+  let status: TaskProgress['status'];
+  if (!workerEnabled || workerLastSeenAt === null || now - workerLastSeenAt > OFFLINE_THRESHOLD_MS) {
+    status = 'offline';
+  } else if (lastRealActivityAt !== null) {
+    if (now - lastRealActivityAt <= NO_RECENT_ACTIVITY_THRESHOLD_MS) {
+      status = 'active';
+    } else {
+      status = 'no_recent_activity';
+    }
+  } else {
+    const claimedAt = r.claimed_at;
+    if (claimedAt !== null && now - claimedAt > NO_RECENT_ACTIVITY_THRESHOLD_MS) {
+      status = 'no_recent_activity';
+    } else {
+      status = 'unknown';
+    }
+  }
+
+  return {
+    lastActivityAt: lastRealActivityAt,
+    lastActivityKind,
+    lastProgressAt,
+    workerLastSeenAt,
+    status,
+  };
+}
 
 export function parseRequirements(raw: string | undefined | null): TaskRequirements {
   try {
@@ -115,6 +193,7 @@ export function parseRequirements(raw: string | undefined | null): TaskRequireme
     if (typeof obj.arch === 'string') req.arch = obj.arch.trim().toLowerCase();
     if (typeof obj.minCpus === 'number' && Number.isSafeInteger(obj.minCpus) && obj.minCpus > 0) req.minCpus = obj.minCpus;
     if (typeof obj.minMemoryGb === 'number' && obj.minMemoryGb > 0) req.minMemoryGb = obj.minMemoryGb;
+    if (typeof obj.maxCpuPercent === 'number' && obj.maxCpuPercent >= 0 && obj.maxCpuPercent <= 100) req.maxCpuPercent = obj.maxCpuPercent;
     if (typeof obj.requiredModel === 'string') req.requiredModel = obj.requiredModel.trim();
     if (typeof obj.executor === 'string') req.executor = obj.executor.trim().toLowerCase();
     return req;
@@ -148,6 +227,12 @@ export function normalizeRequirements(raw: unknown): TaskRequirements {
     }
     req.minMemoryGb = obj.minMemoryGb;
   }
+  if (obj.maxCpuPercent !== undefined) {
+    if (typeof obj.maxCpuPercent !== 'number' || obj.maxCpuPercent < 0 || obj.maxCpuPercent > 100) {
+      throw new HttpError(422, 'requirements.maxCpuPercent: number between 0 and 100 required');
+    }
+    req.maxCpuPercent = obj.maxCpuPercent;
+  }
   if (obj.requiredModel !== undefined) {
     if (typeof obj.requiredModel !== 'string') throw new HttpError(422, 'requirements.requiredModel: string required');
     req.requiredModel = obj.requiredModel.trim();
@@ -159,7 +244,7 @@ export function normalizeRequirements(raw: unknown): TaskRequirements {
   return req;
 }
 
-function rowToTask(r: TaskRow): Task {
+function rowToTask(r: TaskRow, ctx?: Ctx): Task {
   return {
     id: r.id,
     boardId: r.board_id,
@@ -183,9 +268,14 @@ function rowToTask(r: TaskRow): Task {
     reviewReworks: r.review_reworks ?? 0,
     reviewSummary: r.review_summary ?? '',
     submitSummary: r.submit_summary ?? '',
+    attempt: r.attempt ?? 1,
     claimedAt: r.claimed_at,
     lastActivityAt: r.last_activity_at,
-    autoUnblockedAt: r.auto_unblocked_at,
+    lastRealActivityAt: r.last_real_activity_at ?? null,
+    lastProgressAt: r.last_progress_at ?? null,
+    lastActivityKind: r.last_activity_kind ?? null,
+    progress: computeTaskProgress(r, ctx),
+    autoUnblockedAt: r.auto_unblocked_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -422,6 +512,7 @@ export interface CreateTaskInput {
   title: string;
   detail?: string;
   lane?: Lane;
+  assignee?: string;
   priority?: Priority;
   category?: string;
   acceptance?: string;
@@ -436,7 +527,7 @@ export interface CreateTaskInput {
 export function getTask(ctx: Ctx, id: string): Task {
   const row = ctx.holder.db.prepare('SELECT * FROM task WHERE id = ?').get(id) as TaskRow | undefined;
   if (!row) throw new HttpError(404, `task not found: ${id}`);
-  return rowToTask(row);
+  return rowToTask(row, ctx);
 }
 
 function requireTaskRow(ctx: Ctx, id: string): TaskRow {
@@ -448,7 +539,7 @@ function requireTaskRow(ctx: Ctx, id: string): TaskRow {
 export function listTasks(
   ctx: Ctx,
   boardId: string,
-  opts: { lane?: Lane; assignee?: string; includeCancelled?: boolean } = {},
+  opts: { lane?: Lane; assignee?: string; reviewStatus?: string; includeCancelled?: boolean } = {},
 ): Task[] {
   getBoard(ctx, boardId); // 404 if missing
   const conds = ['board_id = ?'];
@@ -462,10 +553,14 @@ export function listTasks(
     conds.push('assignee = ?');
     args.push(opts.assignee);
   }
+  if (opts.reviewStatus) {
+    conds.push('review_status = ?');
+    args.push(opts.reviewStatus);
+  }
   const rows = ctx.holder.db
     .prepare(`SELECT * FROM task WHERE ${conds.join(' AND ')} ORDER BY priority, created_at`)
     .all(...(args as [])) as TaskRow[];
-  return rows.map(rowToTask);
+  return rows.map((r) => rowToTask(r, ctx));
 }
 
 function depsDone(ctx: Ctx, dependsOn: string[]): boolean {
@@ -522,8 +617,8 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
       ctx.holder.db
         .prepare(
           `INSERT INTO task (id, board_id, title, detail, lane, priority, category, acceptance,
-             workspace, files, reads, protected_paths, requirements, depends_on, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             workspace, files, reads, protected_paths, requirements, depends_on, assignee, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
@@ -538,8 +633,9 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
           JSON.stringify(input.files ?? []),
           JSON.stringify(input.reads ?? []),
           JSON.stringify(input.protectedPaths ?? []),
-          JSON.stringify(requirements),
+          requirements ? JSON.stringify(requirements) : null,
           JSON.stringify(dependsOn),
+          input.assignee?.trim() || 'unassigned',
           now,
           now,
         );
@@ -595,7 +691,9 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
       try {
         reviewerEnabled = JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && getBoard(ctx, row.board_id).repoMode === 'managed';
       } catch { /* Invalid settings retain manual review behavior. */ }
-      if (reviewerEnabled && row.review_status !== 'none') throw new HttpError(403, 'reviewer workflow owns Review task transitions');
+      if (reviewerEnabled && row.review_status !== 'none' && laneChanges.to !== 'InProgress') {
+        throw new HttpError(403, 'reviewer workflow owns Review task transitions');
+      }
     }
     // 信任分层（§5.2）：Review→Done（及 Done 的任何移出/移入）仅主脑/用户可操作
     if ((laneChanges.to === 'Done' || laneChanges.from === 'Done') && actor.role === 'worker') {
@@ -632,6 +730,13 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
     if (laneChanges) {
       push('lane', laneChanges.to);
       push('last_activity_at', Date.now());
+      if (row.lane === 'Review' && laneChanges.to === 'InProgress') {
+        const nextReworks = (row.review_reworks ?? 0) + 1;
+        push('review_status', 'rework');
+        push('review_reworks', nextReworks);
+        push('last_activity_kind', 'rework');
+        push('last_progress_at', Date.now());
+      }
     }
     push('updated_at', Date.now());
     ctx.holder.db
@@ -650,9 +755,90 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
         by: actor.id,
       });
       if (laneChanges.to === 'Done') unlockDependents(ctx, id);
+      if (row.lane === 'Review' && laneChanges.to === 'InProgress') {
+        logEvent(ctx, 'task.review_rejected', {
+          taskId: id,
+          boardId: row.board_id,
+          reworks: (row.review_reworks ?? 0) + 1,
+          summary: patch.detail ?? 'Moved to InProgress',
+        });
+      }
     }
   });
   return getTask(ctx, id);
+}
+
+export async function returnTaskFromReview(
+  ctx: Ctx,
+  actor: Agent,
+  id: string,
+  input?: { reason?: string; assignee?: string } | string,
+): Promise<Task> {
+  if (actor.role !== 'orchestrator' && actor.role !== 'user') {
+    throw new HttpError(403, 'only user or orchestrator may return review tasks');
+  }
+  const cleanReason = (typeof input === 'string' ? input : input?.reason)?.trim() || '审核退回重做';
+  const targetAssigneeInput = (typeof input === 'object' && input !== null ? input.assignee : undefined)?.trim();
+
+  return withTaskIntegrationLock(id, async () => {
+    const task = getTask(ctx, id);
+    if (task.status === 'cancelled') throw new HttpError(409, `task ${id} is cancelled`);
+    if (task.lane !== 'Review') throw new HttpError(409, `task ${id} not in Review (lane: ${task.lane})`);
+
+    let targetAssignee = task.assignee;
+    if (targetAssigneeInput) {
+      const agent = getAgent(ctx, targetAssigneeInput);
+      requireParticipant(ctx, task.boardId, agent);
+      targetAssignee = agent.id;
+    } else if (targetAssignee === 'unassigned') {
+      throw new HttpError(422, 'designated worker assignee required when task is unassigned');
+    }
+
+    assertWip(ctx, task.boardId, 'InProgress', id);
+
+    return withWrite(ctx, 'task.reviewReturn', () => {
+      const now = Date.now();
+      const nextReworks = (task.reviewReworks ?? 0) + 1;
+      const res = ctx.holder.db
+        .prepare(
+          `UPDATE task
+           SET lane = 'InProgress',
+               review_status = 'rework',
+               review_reworks = ?,
+               review_summary = ?,
+               assignee = ?,
+               attempt = attempt + 1,
+               last_activity_at = ?,
+               last_real_activity_at = ?,
+               last_activity_kind = 'rework',
+               last_progress_at = ?,
+               updated_at = ?
+           WHERE id = ? AND lane = 'Review' AND status = 'active'`,
+        )
+        .run(nextReworks, cleanReason, targetAssignee, now, now, now, now, id);
+
+      if (Number(res.changes) !== 1) {
+        throw new HttpError(409, `task ${id} state changed concurrently`);
+      }
+
+      logEvent(ctx, 'task.review_returned', {
+        taskId: id,
+        boardId: task.boardId,
+        by: actor.id,
+        assignee: targetAssignee,
+        reason: cleanReason,
+        reworks: nextReworks,
+      });
+      logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'InProgress', by: actor.id });
+      messageInner(ctx, {
+        boardId: task.boardId,
+        author: actor.id,
+        kind: 'intervention',
+        content: `@${targetAssignee} ${id} 已退回重做：\n\n${cleanReason}`,
+      });
+      return getTask(ctx, id);
+    });
+  });
 }
 
 export async function cancelTask(ctx: Ctx, actor: Agent, id: string, reason: string): Promise<Task> {

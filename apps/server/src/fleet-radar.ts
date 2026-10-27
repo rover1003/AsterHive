@@ -1,5 +1,5 @@
 import type { Ctx } from './types.ts';
-import { listAgents, type Agent } from './agents.ts';
+import { listAgents, findAgent, getAgentTelemetryHistory, isTelemetryFresh, type Agent, type AgentSpecs, type AgentTelemetry } from './agents.ts';
 import { getOverview, type AgentOverview } from './overview.ts';
 import { listTasks, type Task } from './tasks.ts';
 
@@ -26,6 +26,30 @@ export interface InterventionAuditRecord {
   timestamp: number;
 }
 
+export interface AgentTelemetryDetail {
+  agentId: string;
+  handle: string;
+  name: string;
+  status: 'idle' | 'working' | 'stale' | 'disabled';
+  specs: AgentSpecs;
+  telemetry: AgentTelemetry | null;
+  history: AgentTelemetry[];
+}
+
+export interface FleetTelemetrySummary {
+  timestamp: number;
+  totalNodes: number;
+  reportingNodes: number;
+  metrics: {
+    avgCpuPercent: number | null;
+    totalMemoryGb: number;
+    totalUsedMemoryGb: number;
+    totalFreeMemoryGb: number;
+    avgMemoryPercent: number | null;
+  };
+  nodes: AgentTelemetryDetail[];
+}
+
 export interface FleetRadarReport {
   timestamp: number;
   summary: {
@@ -37,6 +61,12 @@ export interface FleetRadarReport {
     totalMemoryGb: number;
     executors: Record<string, number>;
     uniqueModels: string[];
+    realtime?: {
+      avgCpuPercent: number | null;
+      totalMemoryUsedGb: number;
+      totalMemoryFreeGb: number;
+      reportingCount: number;
+    };
   };
   alerts: StagnationAlert[];
   recentInterventions: InterventionAuditRecord[];
@@ -67,6 +97,13 @@ export function getFleetRadar(ctx: Ctx): FleetRadarReport {
   let staleCount = 0;
   let workingCount = 0;
 
+  let sumCpu = 0;
+  let cpuCount = 0;
+  let sumUsedMem = 0;
+  let memCount = 0;
+  let sumFreeMem = 0;
+  let reportingCount = 0;
+
   for (const w of workers) {
     const ov = overviewMap.get(w.id);
     const status = ov?.status ?? 'stale';
@@ -88,12 +125,33 @@ export function getFleetRadar(ctx: Ctx): FleetRadarReport {
       }
     }
 
+    if (w.telemetry && isTelemetryFresh(w.telemetry)) {
+      reportingCount++;
+      if (typeof w.telemetry.cpuPercent === 'number') {
+        sumCpu += w.telemetry.cpuPercent;
+        cpuCount++;
+      }
+      if (typeof w.telemetry.memoryUsedGb === 'number') {
+        sumUsedMem += w.telemetry.memoryUsedGb;
+        memCount++;
+      }
+      if (typeof w.telemetry.memoryFreeGb === 'number') {
+        sumFreeMem += w.telemetry.memoryFreeGb;
+      }
+    }
+
     if (Array.isArray(w.models)) {
       for (const m of w.models) modelSet.add(m);
     }
     if (w.preferredModel) modelSet.add(w.preferredModel);
   }
 
+  const realtime = reportingCount > 0 ? {
+    avgCpuPercent: cpuCount > 0 ? Math.round((sumCpu / cpuCount) * 10) / 10 : null,
+    totalMemoryUsedGb: Math.round(sumUsedMem * 10) / 10,
+    totalMemoryFreeGb: Math.round(sumFreeMem * 10) / 10,
+    reportingCount,
+  } : undefined;
   // 2. 停滞预警（Stagnation Alerts）
   // 阈值：任务进行超过 15 分钟，且自最近一次 checkpoint 以来无进展超过 10 分钟
   const alerts: StagnationAlert[] = [];
@@ -106,16 +164,18 @@ export function getFleetRadar(ctx: Ctx): FleetRadarReport {
       assignee: string;
       claimed_at: number | null;
       last_activity_at: number | null;
+      last_real_activity_at?: number | null;
     }[];
 
   for (const t of activeTasks) {
     const claimedAt = t.claimed_at ?? now;
     const elapsedMins = Math.max(0, Math.round((now - claimedAt) / 60000));
-    const lastActive = t.last_activity_at ?? claimedAt;
+    const lastActive = t.last_real_activity_at ?? claimedAt;
     const idleMins = Math.max(0, Math.round((now - lastActive) / 60000));
 
-    const worker = workers.find((w) => w.id === t.assignee);
+    const worker = workers.find((w) => w.id === t.assignee || w.handle === t.assignee);
     const handle = worker?.handle ?? t.assignee;
+    const isWorkerOnline = worker?.lastSeenAt ? (now - worker.lastSeenAt <= 60_000) : false;
 
     if (elapsedMins >= 15 && idleMins >= 10) {
       const isCritical = elapsedMins >= 30 || idleMins >= 20;
@@ -129,8 +189,8 @@ export function getFleetRadar(ctx: Ctx): FleetRadarReport {
         idleCheckpointMinutes: idleMins,
         severity: isCritical ? 'critical' : 'warning',
         recommendation: isCritical
-          ? `任务已执行 ${elapsedMins} 分钟且已 ${idleMins} 分钟无进展；建议调用 asterhive_worker_probe 探活，必要时调用 asterhive_worker_restart 或解绑重排`
-          : `任务执行耗时较长（${elapsedMins} 分钟）；建议调用 asterhive_worker_probe 检查其执行日志与通道`,
+          ? `任务已执行 ${elapsedMins} 分钟且已 ${idleMins} 分钟无真实进展${isWorkerOnline ? '（工蜂持续保活中，疑似停滞）' : '（工蜂失联）'}；建议调用 asterhive_worker_probe 探活，必要时调用 asterhive_worker_restart 或解绑重排`
+          : `任务执行耗时较长（${elapsedMins} 分钟，已 ${idleMins} 分钟无新活动）；建议调用 asterhive_worker_probe 检查其执行日志与通道`,
       });
     }
   }
@@ -188,8 +248,83 @@ export function getFleetRadar(ctx: Ctx): FleetRadarReport {
       totalMemoryGb: Math.round(totalMemoryGb * 10) / 10,
       executors: executorCounts,
       uniqueModels: [...modelSet].sort(),
+      realtime,
     },
     alerts,
     recentInterventions,
+  };
+}
+
+export function getFleetTelemetry(ctx: Ctx, agentId?: string): FleetTelemetrySummary | AgentTelemetryDetail | null {
+  const now = Date.now();
+  const allAgents = listAgents(ctx);
+  const workers = allAgents.filter((a) => a.role === 'worker');
+  const overview = getOverview(ctx);
+  const overviewMap = new Map<string, AgentOverview>();
+  for (const a of overview.agents) overviewMap.set(a.id, a);
+
+  if (agentId) {
+    const target = workers.find((w) => w.id === agentId);
+    if (!target) return null;
+    const ov = overviewMap.get(target.id);
+    return {
+      agentId: target.id,
+      handle: target.handle,
+      name: target.name,
+      status: ov?.status ?? 'stale',
+      specs: target.specs,
+      telemetry: target.telemetry ?? null,
+      history: getAgentTelemetryHistory(ctx, target.id),
+    };
+  }
+
+  let sumCpu = 0;
+  let cpuCount = 0;
+  let sumUsedMem = 0;
+  let memCount = 0;
+  let sumFreeMem = 0;
+  let totalMemoryGb = 0;
+  let reportingCount = 0;
+
+  const nodes: AgentTelemetryDetail[] = workers.map((w) => {
+    const ov = overviewMap.get(w.id);
+    if (w.specs?.memoryTotalGb) totalMemoryGb += w.specs.memoryTotalGb;
+    if (w.telemetry && isTelemetryFresh(w.telemetry)) {
+      reportingCount++;
+      if (typeof w.telemetry.cpuPercent === 'number') {
+        sumCpu += w.telemetry.cpuPercent;
+        cpuCount++;
+      }
+      if (typeof w.telemetry.memoryUsedGb === 'number') {
+        sumUsedMem += w.telemetry.memoryUsedGb;
+        memCount++;
+      }
+      if (typeof w.telemetry.memoryFreeGb === 'number') {
+        sumFreeMem += w.telemetry.memoryFreeGb;
+      }
+    }
+    return {
+      agentId: w.id,
+      handle: w.handle,
+      name: w.name,
+      status: ov?.status ?? 'stale',
+      specs: w.specs,
+      telemetry: w.telemetry ?? null,
+      history: getAgentTelemetryHistory(ctx, w.id),
+    };
+  });
+
+  return {
+    timestamp: now,
+    totalNodes: workers.length,
+    reportingNodes: reportingCount,
+    metrics: {
+      avgCpuPercent: cpuCount > 0 ? Math.round((sumCpu / cpuCount) * 10) / 10 : null,
+      totalMemoryGb: Math.round(totalMemoryGb * 10) / 10,
+      totalUsedMemoryGb: Math.round(sumUsedMem * 10) / 10,
+      totalFreeMemoryGb: Math.round(sumFreeMem * 10) / 10,
+      avgMemoryPercent: totalMemoryGb > 0 && memCount > 0 ? Math.round((sumUsedMem / totalMemoryGb) * 100 * 10) / 10 : null,
+    },
+    nodes,
   };
 }

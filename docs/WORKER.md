@@ -197,24 +197,62 @@ Windows、Linux 和 macOS 的 `install-bee` 一键安装/升级脚本提供思�
 
 ## 取活与生命周期
 
-**轮询即心跳**：进程常驻，每 `POLL_MS` 轮询一次；执行任务期间不并发取活。绑单板时只巡检该板；多板巡检模式（`ASTERHIVE_BOARD` 缺省）逐板尝试、命中即止（一次仍只做一张卡），非参与者板 403 自动跳过。每板取活三通道，按序命中即止：
+**轮询与心跳遥测**：进程常驻，每 `POLL_MS` 轮询一次；执行任务期间不并发取活。绑单板时只巡检该板；多板巡检模式（`ASTERHIVE_BOARD` 缺省）逐板尝试、命中即止（一次仍只做一张卡），非参与者板 403 自动跳过。
 
-| 优先级 | 通道 | 说明 |
-|---|---|---|
-| 1 | 被退回重做的任务 | 泳道 InProgress 且指派给我的——主脑/用户在聊天室的反馈（最近 3 条）会注入重做 prompt，逐条落实 |
-| 2 | 派给我的 Ready | 主动 claim 认领 |
-| 3 | 未指派池 | `POST /boards/:b/next` 原子领牌，多 worker 并发不重复 |
+取活通道与定向派发：
++ **蜂后定向分派（主导模式）**：新任务进入 Ready 泳道后，蜂后调用 `asterhive_match_task` 获取节点动态硬件性能与模型通道评分（Nomad 风格两阶段评估），使用 `asterhive_dispatch` 直接指定 `task.assignee = worker.handle`。
++ **工蜂取活通道**：工蜂优先检查属于自己的任务（被退回重做任务与指派给自己的 Ready 任务），通过 `worker.claim(taskId)` 原子认领开工；不再全局盲抢未指派任务。
++ **旧工蜂兼容性**：未被定向指派任务的旧工蜂向 `POST /boards/:b/next` 请求取活时，安全返回 `{ task: null }`，既杜绝跨设备冲突抢活，也不会打断定向 claim。
+
+### 实时硬件性能遥测（Telemetry Heartbeat）
+
+工蜂端（如 `@asterhive/sdk`）定时向 `POST /agents/:id/heartbeat` 上报当前设备负载帧：
+```json
+{
+  "specs": {
+    "os": "win32",
+    "arch": "x64",
+    "cpus": 16,
+    "memoryTotalGb": 32,
+    "executor": "omp"
+  },
+  "telemetry": {
+    "cpuPercent": 18.5,
+    "memoryUsedGb": 12.4,
+    "memoryTotalGb": 32.0,
+    "memoryFreeGb": 19.6,
+    "memoryPercent": 38.8,
+    "loadAvg": [1.2, 0.9, 0.5],
+    "uptimeSec": 84200,
+    "taskInProgress": null
+  }
+}
+```
+
+**安全鉴权与身份防伪**：
++ `POST /agents/:id/heartbeat` 强制校验调用凭据（`Authorization: Bearer <token>`），未提供凭据报 401；
++ 严格限制 `actor.id === id`（仅允许工蜂自身或管理员上报），跨工蜂冒名发送心跳与遥测直接报 403 拒绝。
+
+**字段空值与新鲜度语义**：
++ `cpuPercent`: 首样本无间隔或系统调用失败时为 `null`，严禁伪报 0%；
++ `loadAvg`: 在 Windows 等不支持平台为 `null`；
++ `timestamp`: 服务端记录时以**接收时间**为准，防止设备端时钟偏移；
++ 数据有效期为 60 秒（`TELEMETRY_FRESHNESS_MS`），超过 60 秒未更新自动降为非新鲜，调度器不采信过期负载。
+
+**旧工蜂兼容保证**：
++ 未升级遥测的旧工蜂：仍可正常上报静态 `specs` 或仅更新在线时间戳；
++ 调度器在评估旧工蜂时，标记“未上报实时动态遥测”，不伪装零负载，而是基于已知静态规格给予中性基准分，确保旧设备仍可平滑获得任务指派。
 
 单任务生命周期：
 
 | 阶段 | 动作 |
 |---|---|
-| 领取 | 三通道按序取活，准备工作区：repo 看板 clone/pull --rebase + 切任务分支（见上节）；无 repo 建一次性 `work/<任务号>` 目录 |
+| 领取 | 检查指派给自己的任务（退回重做或 Ready），调用 `claim` 认领并准备工作区：repo 看板 clone/pull --rebase + 切任务分支；无 repo 建一次性 `work/<任务号>` 目录 |
 | 开工 | checkpoint("开始执行")——**checkpoint 是双向同步点**：响应带回自上次以来 @ 本 worker 的消息，用户/主脑的干预直达 |
-| 执行 | 拉起执行内核，prompt 含任务卡（标题/说明/验收标准/预期触碰文件/禁止触碰路径）与退回反馈；超 `TASK_TIMEOUT_MS` 强杀 |
+| 执行与保活 | 运行执行内核。守护进程每分钟发送带有 `isKeepalive: true` 的保活心跳维持存活；模型通过 `hive_checkpoint` 主动汇报明确里程碑，真实推进 `lastActivityAt` 与 `lastProgressAt`（保活与真实进展分离） |
+| 异常/超时 | 超时或异常时保留工作区与现场，上报 `kind: 'error'` 或 `'timeout'` 的 checkpoint 明确记录可恢复现场，任务保持 InProgress 并由看板雷达预警，避免盲目重派与丢失现场 |
 | 上交 | submit：summary（执行输出末 6 行，repo 模式附本地提交信息）+ 证据——repo 模式为本任务变更文件 + `git:<分支>@<hash>`；scratch 模式递归收集工作目录全部文件（跳过 `.git`/`node_modules`），记录相对路径与本机机器名 |
-| 被退回 | Review 打回 InProgress 后，下轮轮询由通道 1 重新领取，反馈注入重做 prompt |
-
+| 被退回 | 用户或主脑可通过受控指令（`/tasks/:id/review/return`）将 Review 状态任务原子退回指定工蜂，转为 `InProgress`（`reviewStatus: 'rework'`），由工蜂在下轮轮询重新领取断点续做 |
 ## 交互会话型 worker（桌面版 agent）
 
 worker 的合同只是「能发 HTTP」，不要求常驻守护进程。任何交互式桌面 agent 会话（如 ZCode Desktop）都可以当 worker：注册拿到 token 后，由人打开会话说「领活」，会话内 agent 用 Bash+curl（或 `@asterhive/sdk`）完成领活→执行→上交全流程；聊天室 @派活 会进它的收件箱（`GET /agents/me/inbox`）。
@@ -237,7 +275,7 @@ curl -s -X POST http://<your-server-ip>:8067/tasks/<任务号>/submit \
   -d '{"summary":"完成","evidence":[{"path":"docs/x.md","machine":"本机名"}]}'
 ```
 
-与 CLI 守护型的差异：非常驻、随会话存活；执行者是完整桌面 agent——有全部工具与套餐额度，不受 CLI 独立计费影响（zcode CLI 接入失败的根因：独立 CLI 进程走 bigmodel API 需资源包，与 Desktop 套餐额度分属两套计费）。
+与 CLI 守护型的差异：非常驻、随会话存活；执行者是完整桌面 agent——有全部工具与套餐额度，不受 CLI 独立计费影响。
 
 ## 自定义 worker（其他语言）
 
@@ -246,13 +284,14 @@ curl -s -X POST http://<your-server-ip>:8067/tasks/<任务号>/submit \
 | 端点 | 用途 |
 |---|---|
 | `POST /agents/register` | 注册（body：`name`、`handle`，可选 `role`、`host`（接入设备名）、`models`（自报模型清单））；**token 只返回这一次**，调用方自行持久化 |
-| `POST /boards/:b/next` | 从未指派池原子领一个任务；无任务返回 `{task: null}` |
-| `POST /tasks/:id/checkpoint` | 上报进度（body：`note`）；响应带回 @ 我的待达消息 |
+| `POST /agents/:id/heartbeat` | 心跳与硬件遥测上报（带 Bearer 令牌，body：`specs?`、`telemetry?`） |
+| `POST /boards/:b/next` | 从定向指派池原子领属于自己的任务；无指派任务安全返回 `{task: null}` |
+| `POST /tasks/:id/claim` | 明确认领定向指派给自己的任务（支持并发原子抢锁与文件冲突检测） |
+| `POST /tasks/:id/checkpoint` | 上报进度或保活（body：`note`，可选 `kind`、`isKeepalive`）；响应带回 @ 我的待达消息 |
+| `POST /tasks/:id/review/return` | 将 Review 状态任务退回指定工蜂重做（仅 user/orchestrator，body：`reason`、可选 `assignee`） |
 | `POST /tasks/:id/submit` | 上交（body：`summary`、`evidence?`——`{path, machine}` 数组） |
-| `POST /tasks/:id/release` | 释放认领（body：`reason?`） |
 
 TS/Node 侧也可直接用 [`@asterhive/sdk`](../packages/sdk/src/index.ts) 的 `Worker` 类（register / next / claim / checkpoint / submit / release / heartbeat，附 inbox / postMessage / getTask），不必手写请求。
-
 ## 安全注意
 
 - **worker token 等同设备身份**：妥善保管；一旦泄露，在 Web 界面 Agent 页吊销即可（吊销后该 token 全部请求 401），再注册/重发新 token 恢复接入。

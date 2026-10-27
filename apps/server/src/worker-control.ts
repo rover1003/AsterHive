@@ -5,7 +5,7 @@ import { getAgent, type Agent } from './agents.ts';
 import { getTask, updateTask, type Task } from './tasks.ts';
 import { getOverview, type AgentOverview } from './overview.ts';
 import { withWrite, logEvent } from './write.ts';
-
+import { withTaskIntegrationLock } from './task-integration-lock.ts';
 export interface WorkerProbeResult {
   agentId: string;
   handle: string;
@@ -226,8 +226,14 @@ export async function restartWorkerService(
   return output;
 }
 
+export interface ReleaseStuckTaskOptions {
+  confirmedStopped?: boolean;
+}
+
 /**
- * 蜂后解除挂起/卡死任务占用：当工蜂失联且需将任务回收回 Ready 重新派工时调用。
+ * 仅用户角色可受控解除挂起/卡死任务占用：
+ * 网络断连不等于物理停止；任何在线/离线状态均默认拒绝释放（409）；
+ * 仅明确由用户角色提供 confirmedStopped: true 才可继续，主脑（orchestrator）绝不可代替用户提供确认。
  */
 export async function releaseStuckTask(
   ctx: Ctx,
@@ -235,26 +241,44 @@ export async function releaseStuckTask(
   agentId: string,
   taskId: string,
   reason: string,
+  options?: ReleaseStuckTaskOptions,
 ): Promise<Task> {
-  if (actor.role === 'worker') {
-    throw new HttpError(403, 'workers cannot force release tasks assigned to others');
+  if (actor.role !== 'user') {
+    throw new HttpError(
+      403,
+      'only user role may confirm worker stopped and force release tasks; orchestrator cannot arbitrate physical execution stop',
+    );
   }
   const task = getTask(ctx, taskId);
   if (task.assignee !== agentId) {
     throw new HttpError(400, `task ${taskId} is currently assigned to ${task.assignee}, not ${agentId}`);
   }
 
-  const cleanReason = (reason ?? '').trim() || '蜂后受控解除挂起占用';
+  // 物理停止确认门禁（计划 §4.3.6）：
+  // 无论工蜂在线还是离线，网络断连均不等于物理停止。默认拒绝释放以防止写冲突；
+  // 必须由用户角色明确提供 confirmedStopped: true 确认旧工蜂执行已物理停止后方可释放。
+  if (options?.confirmedStopped !== true) {
+    throw new HttpError(
+      409,
+      `网络断连不等于物理停止，默认拒绝解绑以保护外部仓库；必须由用户明确提供 confirmedStopped: true 确认旧工蜂执行已物理停止后方可释放。`,
+    );
+  }
 
-  const updated = updateTask(ctx, actor, taskId, {
-    assignee: 'unassigned',
-    lane: 'Ready',
+  const cleanReason = (reason ?? '').trim() || '用户明确确认物理停止后受控解除挂起占用';
+  return withTaskIntegrationLock(taskId, async () => {
+    const updated = updateTask(ctx, actor, taskId, {
+      assignee: 'unassigned',
+      lane: 'Ready',
+    });
+    ctx.holder.db.prepare('UPDATE task SET attempt = attempt + 1 WHERE id = ?').run(taskId);
+    logEvent(ctx, 'task.force_released', {
+      taskId,
+      agentId,
+      by: actor.id,
+      reason: cleanReason,
+      userConfirmedStopped: true,
+      fencedAttempt: task.attempt + 1,
+    });
+    return getTask(ctx, taskId);
   });
-  logEvent(ctx, 'task.force_released', {
-    taskId,
-    agentId,
-    by: actor.id,
-    reason: cleanReason,
-  });
-  return updated;
 }

@@ -15,6 +15,18 @@ export interface AgentSpecs {
   gpu?: string; // 可选 GPU 标识
 }
 
+export interface AgentTelemetry {
+  cpuPercent: number | null; // 0-100，首样本无间隔或采样失败为 null，不伪造 0%
+  memoryUsedGb: number | null; // 物理内存采集失败为 null
+  memoryTotalGb: number | null;
+  memoryFreeGb: number | null;
+  memoryPercent: number | null; // 0-100
+  loadAvg?: number[] | null; // Windows 等平台或不可用时为 null
+  uptimeSec?: number | null;
+  taskInProgress?: string | null;
+  timestamp: number; // 服务端接收时间戳（防客户端时钟偏移）
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -33,6 +45,8 @@ export interface Agent {
   host: string;
   /** 设备能力规格（操作系统、架构、CPU、内存等） */
   specs: AgentSpecs;
+  /** 节点动态遥测快照（内存时序缓冲区最新帧） */
+  telemetry?: AgentTelemetry | null;
 }
 
 // 蜂群主脑保留句柄，不允许普通注册占用
@@ -125,8 +139,168 @@ export function normalizeSpecs(raw: unknown): AgentSpecs {
   }
   return out;
 }
+const TELEMETRY_WINDOW_MS = 60_000;
+export const TELEMETRY_FRESHNESS_MS = 60_000;
+const MAX_TELEMETRY_POINTS_PER_AGENT = 60;
+const MAX_TELEMETRY_AGENTS_PER_CTX = 200;
 
-function rowToAgent(r: AgentRow): Agent {
+// 按 Ctx 弱引用隔离遥测时序快照，避免跨 context 泄漏与无界增长
+const ctxTelemetryBuffers = new WeakMap<Ctx, Map<string, AgentTelemetry[]>>();
+
+function getCtxBuffer(ctx: Ctx): Map<string, AgentTelemetry[]> {
+  let buf = ctxTelemetryBuffers.get(ctx);
+  if (!buf) {
+    buf = new Map<string, AgentTelemetry[]>();
+    ctxTelemetryBuffers.set(ctx, buf);
+  }
+  return buf;
+}
+
+export function isTelemetryFresh(telemetry: AgentTelemetry | null | undefined): boolean {
+  if (!telemetry) return false;
+  return Date.now() - telemetry.timestamp <= TELEMETRY_FRESHNESS_MS;
+}
+
+export function normalizeTelemetry(raw: unknown): AgentTelemetry {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new HttpError(422, 'invalid telemetry payload');
+  }
+  const r = raw as Record<string, unknown>;
+
+  let cpuPercent: number | null = null;
+  if (r.cpuPercent !== null && r.cpuPercent !== undefined) {
+    const cpu = Number(r.cpuPercent);
+    if (Number.isFinite(cpu)) {
+      cpuPercent = Math.max(0, Math.min(100, Math.round(cpu * 10) / 10));
+    }
+  }
+
+  let memoryTotalGb: number | null = null;
+  if (r.memoryTotalGb !== null && r.memoryTotalGb !== undefined) {
+    const total = Number(r.memoryTotalGb);
+    if (Number.isFinite(total) && total >= 0) {
+      memoryTotalGb = Math.round(total * 10) / 10;
+    }
+  }
+
+  let memoryUsedGb: number | null = null;
+  if (r.memoryUsedGb !== null && r.memoryUsedGb !== undefined) {
+    const used = Number(r.memoryUsedGb);
+    if (Number.isFinite(used) && used >= 0) {
+      memoryUsedGb = Math.round(used * 10) / 10;
+    }
+  }
+
+  let memoryFreeGb: number | null = null;
+  if (r.memoryFreeGb !== null && r.memoryFreeGb !== undefined) {
+    const free = Number(r.memoryFreeGb);
+    if (Number.isFinite(free) && free >= 0) {
+      memoryFreeGb = Math.round(free * 10) / 10;
+    }
+  } else if (memoryTotalGb !== null && memoryUsedGb !== null) {
+    memoryFreeGb = Math.max(0, Math.round((memoryTotalGb - memoryUsedGb) * 10) / 10);
+  }
+
+  let memoryPercent: number | null = null;
+  if (r.memoryPercent !== null && r.memoryPercent !== undefined) {
+    const pct = Number(r.memoryPercent);
+    if (Number.isFinite(pct) && pct >= 0) {
+      memoryPercent = Math.max(0, Math.min(100, Math.round(pct * 10) / 10));
+    }
+  } else if (memoryTotalGb !== null && memoryUsedGb !== null && memoryTotalGb > 0) {
+    memoryPercent = Math.max(0, Math.min(100, Math.round((memoryUsedGb / memoryTotalGb) * 100 * 10) / 10));
+  }
+
+  let loadAvg: number[] | null = null;
+  if (Array.isArray(r.loadAvg)) {
+    loadAvg = r.loadAvg.map((n) => (Number.isFinite(Number(n)) ? Number(n) : 0));
+  }
+
+  let uptimeSec: number | null = null;
+  if (typeof r.uptimeSec === 'number' && Number.isFinite(r.uptimeSec) && r.uptimeSec >= 0) {
+    uptimeSec = Math.round(r.uptimeSec);
+  }
+
+  const taskInProgress = typeof r.taskInProgress === 'string' ? r.taskInProgress.trim() || null : null;
+
+  // 服务端接收时间，防止客户端时钟偏移
+  const timestamp = Date.now();
+
+  return {
+    cpuPercent,
+    memoryUsedGb,
+    memoryTotalGb,
+    memoryFreeGb,
+    memoryPercent,
+    loadAvg,
+    uptimeSec,
+    taskInProgress,
+    timestamp,
+  };
+}
+
+export function recordAgentTelemetry(ctx: Ctx, agentId: string, rawTelemetry: unknown): AgentTelemetry {
+  const telemetry = normalizeTelemetry(rawTelemetry);
+  const buf = getCtxBuffer(ctx);
+  let history = buf.get(agentId);
+  if (!history) {
+    if (buf.size >= MAX_TELEMETRY_AGENTS_PER_CTX) {
+      const oldestKey = buf.keys().next().value;
+      if (oldestKey) buf.delete(oldestKey);
+    }
+    history = [];
+    buf.set(agentId, history);
+  }
+  history.push(telemetry);
+  const cutoff = Date.now() - TELEMETRY_WINDOW_MS;
+  const pruned = history.filter((pt) => pt.timestamp >= cutoff);
+  if (pruned.length > MAX_TELEMETRY_POINTS_PER_AGENT) {
+    pruned.splice(0, pruned.length - MAX_TELEMETRY_POINTS_PER_AGENT);
+  }
+  buf.set(agentId, pruned);
+  return telemetry;
+}
+
+export function getAgentTelemetry(ctx: Ctx, agentId: string): AgentTelemetry | null {
+  const buf = ctxTelemetryBuffers.get(ctx);
+  if (!buf) return null;
+  const history = buf.get(agentId);
+  if (!history || history.length === 0) return null;
+  return history[history.length - 1];
+}
+
+export function getAgentTelemetryHistory(ctx: Ctx, agentId: string, windowMs = TELEMETRY_WINDOW_MS): AgentTelemetry[] {
+  const buf = ctxTelemetryBuffers.get(ctx);
+  if (!buf) return [];
+  const history = buf.get(agentId);
+  if (!history || history.length === 0) return [];
+  const cutoff = Date.now() - windowMs;
+  return history.filter((pt) => pt.timestamp >= cutoff);
+}
+
+export function getAllAgentsLatestTelemetry(ctx: Ctx): Record<string, AgentTelemetry> {
+  const buf = ctxTelemetryBuffers.get(ctx);
+  if (!buf) return {};
+  const result: Record<string, AgentTelemetry> = {};
+  for (const [id, history] of buf.entries()) {
+    if (history.length > 0) {
+      result[id] = history[history.length - 1];
+    }
+  }
+  return result;
+}
+
+export function clearAgentTelemetry(ctx: Ctx, agentId?: string): void {
+  const buf = ctxTelemetryBuffers.get(ctx);
+  if (!buf) return;
+  if (agentId) {
+    buf.delete(agentId);
+  } else {
+    buf.clear();
+  }
+}
+
+function rowToAgent(r: AgentRow, ctx?: Ctx): Agent {
   return {
     id: r.id,
     name: r.name,
@@ -140,6 +314,7 @@ function rowToAgent(r: AgentRow): Agent {
     note: r.note ?? '',
     host: r.host ?? '',
     specs: parseSpecs(r.specs),
+    telemetry: ctx ? getAgentTelemetry(ctx, r.id) : null,
   };
 }
 
@@ -267,7 +442,7 @@ export function ensureBrainAgent(ctx: Ctx): Agent {
       });
       return getAgent(ctx, BRAIN_AGENT_ID);
     }
-    return rowToAgent(row);
+    return rowToAgent(row, ctx);
   }
   return registerSystemAgent(ctx, {
     id: BRAIN_AGENT_ID,
@@ -280,18 +455,18 @@ export function ensureBrainAgent(ctx: Ctx): Agent {
 export function getAgent(ctx: Ctx, id: string): Agent {
   const row = ctx.holder.db.prepare('SELECT * FROM agent WHERE id = ?').get(id) as AgentRow | undefined;
   if (!row) throw new HttpError(404, `agent not found: ${id}`);
-  return rowToAgent(row);
+  return rowToAgent(row, ctx);
 }
 
 // 按 id 查找，不存在返回 null（与 getAgent 的 404 语义互补；单用户模块探测用）。
 export function findAgent(ctx: Ctx, id: string): Agent | null {
   const row = ctx.holder.db.prepare('SELECT * FROM agent WHERE id = ?').get(id) as AgentRow | undefined;
-  return row ? rowToAgent(row) : null;
+  return row ? rowToAgent(row, ctx) : null;
 }
 
 export function listAgents(ctx: Ctx): Agent[] {
   const rows = ctx.holder.db.prepare('SELECT * FROM agent ORDER BY created_at').all() as AgentRow[];
-  return rows.map(rowToAgent);
+  return rows.map((r) => rowToAgent(r, ctx));
 }
 
 // 启停 agent（领域层只管落库与事件；HTTP 层用 requireElevated 做 user/orchestrator 角色闸门）。
@@ -396,6 +571,7 @@ export function deleteAgent(ctx: Ctx, id: string): void {
     throw new HttpError(422, '单用户身份不可删除：可在设置页修改用户名');
   }
   const agent = getAgent(ctx, id); // 404 if missing
+  clearAgentTelemetry(ctx, id);
   withWrite(ctx, 'agent.delete', () => {
     ctx.holder.db.prepare('DELETE FROM agent WHERE id = ?').run(id);
     logEvent(ctx, 'agent.deleted', { agentId: id, handle: agent.handle, role: agent.role });
@@ -413,13 +589,17 @@ export function authByToken(ctx: Ctx, token: string | null | undefined): Agent |
   const row = rows[0];
   // 心跳属在线状态元数据，不进事件台账、不走快照管线（Hermes 纪律只约束结构化写）
   ctx.holder.db.prepare('UPDATE agent SET last_seen_at = ? WHERE id = ?').run(Date.now(), row.id);
-  return rowToAgent(row);
+  return rowToAgent(row, ctx);
 }
 
-export function heartbeat(ctx: Ctx, id: string): Agent {
-  const agent = getAgent(ctx, id);
+export function heartbeat(ctx: Ctx, id: string, telemetry?: unknown): Agent {
+  getAgent(ctx, id);
+  if (telemetry !== undefined) {
+    recordAgentTelemetry(ctx, id, telemetry);
+  }
   ctx.holder.db.prepare('UPDATE agent SET last_seen_at = ? WHERE id = ?').run(Date.now(), id);
   return rowToAgent(
     ctx.holder.db.prepare('SELECT * FROM agent WHERE id = ?').get(id) as AgentRow,
+    ctx,
   );
 }

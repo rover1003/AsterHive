@@ -13,6 +13,154 @@ import { withTaskIntegrationLock } from './task-integration-lock.ts';
 
 export type RepoInitMode = 'empty' | 'clone';
 
+export interface RepoTreeEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'directory' | 'symlink' | 'submodule';
+  size?: number;
+  mode: string;
+}
+
+export interface RepoTreeResult {
+  boardId: string;
+  commit: string;
+  path: string;
+  entries: RepoTreeEntry[];
+  truncated: boolean;
+  total: number;
+}
+
+export interface RepoFileContent {
+  boardId: string;
+  commit: string;
+  path: string;
+  size: number;
+  content: string;
+  truncated: boolean;
+  totalLines: number;
+}
+
+const BINARY_EXTENSIONS: Record<string, true> = {
+  '.png': true, '.jpg': true, '.jpeg': true, '.gif': true, '.ico': true, '.webp': true, '.bmp': true, '.tiff': true,
+  '.pdf': true, '.zip': true, '.tar': true, '.gz': true, '.tgz': true, '.7z': true, '.rar': true, '.bz2': true, '.xz': true,
+  '.exe': true, '.dll': true, '.so': true, '.dylib': true, '.bin': true, '.iso': true, '.dmg': true, '.class': true,
+  '.jar': true, '.war': true, '.pyc': true, '.pyo': true, '.wasm': true, '.mp3': true, '.mp4': true, '.wav': true,
+  '.ogg': true, '.flac': true, '.avi': true, '.mov': true, '.mkv': true, '.db': true, '.sqlite': true, '.sqlite3': true,
+  '.ttf': true, '.woff': true, '.woff2': true, '.eot': true,
+};
+
+export function hasBinaryExtension(filePath: string): boolean {
+  const ext = filePath.includes('.') ? filePath.slice(filePath.lastIndexOf('.')).toLowerCase() : '';
+  return Boolean(BINARY_EXTENSIONS[ext]);
+}
+
+export function hasNullBytes(sample: string): boolean {
+  return sample.includes('\0');
+}
+
+export function isSensitivePath(filePath: string): boolean {
+  if (!filePath) return false;
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+  const parts = normalized.split('/').filter(Boolean);
+  const baseName = parts[parts.length - 1] ?? '';
+
+  // .env and variations
+  if (baseName === '.env' || baseName.startsWith('.env.')) return true;
+
+  // Private keys and certificates
+  if (/\.(pem|key|pkcs12|pfx|p12|kdbx)$/i.test(baseName)) return true;
+  if (/^(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.pub)?$/i.test(baseName)) {
+    return true;
+  }
+
+  // Common secret configuration files
+  if (
+    /^(credentials|secret|secrets|token|tokens|masterkey)(\..+)?$/i.test(baseName) ||
+    /(credentials|secrets?|tokens?|api[-_]?keys?)\.(json|ya?ml|toml|txt|conf|ini|properties)$/i.test(baseName)
+  ) {
+    return true;
+  }
+
+  // Password files
+  if (baseName === '.htpasswd' || baseName === 'htpasswd') return true;
+
+  // Sensitive hidden directory names
+  if (parts.some((p) => p === '.aws' || p === '.ssh' || p === '.gnupg' || p === '.git')) return true;
+
+  return false;
+}
+
+/**
+ * 基于常见凭据格式与键值特征的启发式输出遮蔽。
+ * 注意：本函数针对通用凭据模式（私钥块、特定前缀 Token、常见密码与 API 密钥键值等）提供纵深防御，
+ * 无法保证对所有隐蔽、混淆或未知编码凭据的 100% 绝对通用检测。
+ */
+export function maskSensitiveContent(rawText: string): { content: string; redactedCount: number } {
+  let redactedCount = 0;
+  let text = rawText;
+
+  // 1. PEM 格式私钥块
+  const privateKeyPattern = /-----BEGIN[ A-Z0-9_-]*PRIVATE KEY-----[\s\S]*?-----END[ A-Z0-9_-]*PRIVATE KEY-----/g;
+  text = text.replace(privateKeyPattern, () => {
+    redactedCount++;
+    return '[REDACTED_PRIVATE_KEY]';
+  });
+
+  // 2. 特征前缀 API Key / Token（如 sk-..., ghp_..., AKIA...）
+  const prefixedTokens = /\b(?:(?:sk|pk|rk)-(?:live|test|proj|ant)?[a-zA-Z0-9_-]{20,}|(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}|glpat-[a-zA-Z0-9_-]{20,}|xox[baprs]-[0-9a-zA-Z]{10,48}|(?:AKIA|ASIA|AROA)[0-9A-Z]{16})\b/g;
+  text = text.replace(prefixedTokens, () => {
+    redactedCount++;
+    return '[REDACTED_TOKEN]';
+  });
+
+  // 3. Bearer Token
+  const bearerPattern = /\bBearer\s+([a-zA-Z0-9._~+/-]{20,})/gi;
+  text = text.replace(bearerPattern, () => {
+    redactedCount++;
+    return 'Bearer [REDACTED_TOKEN]';
+  });
+
+  // 4. JSON / YAML / 代码中常见密码与密钥键值对（支持嵌套、单双引号与不同分隔符）
+  const keyValueSecretPattern = /(["']?(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|db[_-]?password|private[_-]?key)["']?\s*[:=]\s*)(["'])(?:(?!\2).){6,}\2/gi;
+  text = text.replace(keyValueSecretPattern, (_match, prefix, quote) => {
+    redactedCount++;
+    return `${prefix}${quote}[REDACTED_SECRET]${quote}`;
+  });
+
+  return { content: text, redactedCount };
+}
+
+export function sanitizeRepoPath(rawPath?: string): string {
+  if (!rawPath) return '';
+  if (typeof rawPath !== 'string') throw new HttpError(400, 'path must be a string');
+  if (rawPath.includes('\0')) throw new HttpError(400, 'path contains illegal null character');
+
+  const normalized = rawPath.replace(/\\/g, '/').trim();
+  if (/^[a-zA-Z]:/.test(normalized)) {
+    throw new HttpError(400, 'absolute paths with drive letters are not allowed');
+  }
+
+  const clean = normalized.replace(/^\/+|\/+$/g, '');
+  if (!clean || clean === '.') return '';
+
+  const segments = clean.split('/');
+  const resolved: string[] = [];
+  for (const seg of segments) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      throw new HttpError(400, 'path traversal (..) is not allowed');
+    }
+    if (seg.startsWith('-')) {
+      throw new HttpError(400, 'path segments starting with hyphen are not allowed');
+    }
+    if (seg.length > 255) {
+      throw new HttpError(400, 'path segment exceeds maximum length');
+    }
+    resolved.push(seg);
+  }
+  return resolved.join('/');
+}
+
 function validRemote(remote: string): boolean {
   if (!remote || remote.length > 2048 || /[\u0000-\u001f\u007f]/.test(remote) || remote.startsWith('-')) return false;
   if (/^https:\/\//i.test(remote)) {
@@ -393,6 +541,202 @@ export class RepoManager {
     }
   }
 
+  async listTree(
+    boardId: string,
+    options?: { path?: string; recursive?: boolean; limit?: number },
+  ): Promise<RepoTreeResult> {
+    const repo = this.repoPath(boardId);
+    const board = getBoard(this.#ctx, boardId);
+    if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
+    if (board.repoStatus !== 'ready') throw new HttpError(409, `server repository is not ready (${board.repoStatus})`);
+    if (!existsSync(repo)) throw new HttpError(409, 'server repository does not exist');
+
+    const rev = await runGit(['rev-parse', 'HEAD'], repo);
+    if (rev.code !== 0 || !rev.stdout.trim()) {
+      throw new HttpError(409, 'server repository has no resolvable HEAD (repository may be empty)');
+    }
+    const headCommit = rev.stdout.trim();
+
+    const cleanPath = sanitizeRepoPath(options?.path);
+    if (cleanPath && isSensitivePath(cleanPath)) {
+      throw new HttpError(403, `access to sensitive path '${cleanPath}' is prohibited`);
+    }
+
+    if (cleanPath) {
+      const typeRes = await runGit(['cat-file', '-t', `HEAD:${cleanPath}`], repo);
+      if (typeRes.code !== 0 || !typeRes.stdout.trim()) {
+        throw new HttpError(404, `path '${cleanPath}' not found in repository HEAD`);
+      }
+      const objType = typeRes.stdout.trim();
+      if (objType === 'blob') {
+        throw new HttpError(400, `path '${cleanPath}' is a file, not a directory`);
+      }
+      if (objType !== 'tree') {
+        throw new HttpError(400, `path '${cleanPath}' is not a directory (${objType})`);
+      }
+    }
+
+    const lsArgs = ['ls-tree', '-l'];
+    if (options?.recursive) {
+      lsArgs.push('-r', '-t');
+    }
+    lsArgs.push(cleanPath ? `HEAD:${cleanPath}` : 'HEAD');
+
+    const lsRes = await runGit(lsArgs, repo);
+    if (lsRes.code !== 0) {
+      throw new HttpError(500, `failed to list repository tree: ${safeError(lsRes.stderr)}`);
+    }
+
+    const allEntries: RepoTreeEntry[] = [];
+    const lines = lsRes.stdout.split('\n');
+    for (const line of lines) {
+      const tabIdx = line.indexOf('\t');
+      if (tabIdx === -1) continue;
+      const meta = line.slice(0, tabIdx).trim();
+      const rawEntryPath = line.slice(tabIdx + 1);
+      const tokens = meta.split(/\s+/);
+      if (tokens.length < 3) continue;
+      const mode = tokens[0]!;
+      const objType = tokens[1]!;
+      const sizeStr = tokens[3];
+
+      let entryType: RepoTreeEntry['type'] = 'file';
+      if (mode === '120000') {
+        entryType = 'symlink';
+      } else if (objType === 'tree') {
+        entryType = 'directory';
+      } else if (objType === 'commit') {
+        entryType = 'submodule';
+      } else {
+        entryType = 'file';
+      }
+
+      const entryRelPath = cleanPath ? `${cleanPath}/${rawEntryPath}` : rawEntryPath;
+      const entryName = rawEntryPath.includes('/') ? rawEntryPath.slice(rawEntryPath.lastIndexOf('/') + 1) : rawEntryPath;
+      // 严格拒绝在目录树中暴露敏感路径（如 .env、.ssh、private keys 等，含递归）
+      if (isSensitivePath(entryRelPath) || isSensitivePath(entryName) || isSensitivePath(rawEntryPath)) {
+        continue;
+      }
+
+
+      const entry: RepoTreeEntry = {
+        name: entryName,
+        path: entryRelPath,
+        type: entryType,
+        mode,
+      };
+
+      if (sizeStr && sizeStr !== '-') {
+        const size = parseInt(sizeStr, 10);
+        if (Number.isFinite(size)) entry.size = size;
+      }
+
+      allEntries.push(entry);
+    }
+
+    const limit = options?.limit !== undefined ? Math.max(1, options.limit) : 1000;
+    const total = allEntries.length;
+    const truncated = total > limit;
+    const entries = truncated ? allEntries.slice(0, limit) : allEntries;
+
+    return {
+      boardId,
+      commit: headCommit,
+      path: cleanPath,
+      entries,
+      truncated,
+      total,
+    };
+  }
+
+  async readTextFile(
+    boardId: string,
+    filePath: string,
+    options?: { maxBytes?: number },
+  ): Promise<RepoFileContent> {
+    const repo = this.repoPath(boardId);
+    const board = getBoard(this.#ctx, boardId);
+    if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
+    if (board.repoStatus !== 'ready') throw new HttpError(409, `server repository is not ready (${board.repoStatus})`);
+    if (!existsSync(repo)) throw new HttpError(409, 'server repository does not exist');
+
+    const rev = await runGit(['rev-parse', 'HEAD'], repo);
+    if (rev.code !== 0 || !rev.stdout.trim()) {
+      throw new HttpError(409, 'server repository has no resolvable HEAD (repository may be empty)');
+    }
+    const headCommit = rev.stdout.trim();
+
+    const cleanPath = sanitizeRepoPath(filePath);
+    if (!cleanPath) throw new HttpError(400, 'file path cannot be empty');
+
+    if (isSensitivePath(cleanPath)) {
+      throw new HttpError(403, `access to sensitive file '${cleanPath}' is prohibited`);
+    }
+
+    const typeRes = await runGit(['cat-file', '-t', `HEAD:${cleanPath}`], repo);
+    if (typeRes.code !== 0 || !typeRes.stdout.trim()) {
+      throw new HttpError(404, `path '${cleanPath}' not found in repository HEAD`);
+    }
+    const objType = typeRes.stdout.trim();
+    if (objType === 'tree') {
+      throw new HttpError(400, `path '${cleanPath}' is a directory, not a file; use asterhive_repo_list_files to list directories`);
+    }
+    if (objType !== 'blob') {
+      throw new HttpError(400, `path '${cleanPath}' is not a readable file (${objType})`);
+    }
+
+    const lsTree = await runGit(['ls-tree', '-l', 'HEAD', '--', cleanPath], repo);
+    if (lsTree.code === 0 && lsTree.stdout.trim()) {
+      const firstLine = lsTree.stdout.trim().split('\n')[0]!;
+      const mode = firstLine.split(/\s+/)[0];
+      if (mode === '120000') {
+        throw new HttpError(400, `path '${cleanPath}' is a symbolic link; symbolic links cannot be read`);
+      }
+    }
+
+    if (hasBinaryExtension(cleanPath)) {
+      throw new HttpError(415, `file '${cleanPath}' appears to be binary and cannot be read as text`);
+    }
+
+    const sizeRes = await runGit(['cat-file', '-s', `HEAD:${cleanPath}`], repo);
+    const size = parseInt(sizeRes.stdout.trim(), 10) || 0;
+    const HARD_MAX_BYTES = 10 * 1024 * 1024; // 10MB
+    if (size > HARD_MAX_BYTES) {
+      throw new HttpError(413, `file '${cleanPath}' (${size} bytes) exceeds maximum allowable size of 10MB`);
+    }
+
+    const contentRes = await runGit(['cat-file', '-p', `HEAD:${cleanPath}`], repo);
+    if (contentRes.code !== 0) {
+      throw new HttpError(500, `failed to read object content: ${safeError(contentRes.stderr)}`);
+    }
+    const rawContent = contentRes.stdout;
+
+    if (hasNullBytes(rawContent)) {
+      throw new HttpError(415, `file '${cleanPath}' appears to be binary and cannot be read as text`);
+    }
+
+    // 输出前敏感内容纵深遮蔽保护
+    const { content: sanitizedContent } = maskSensitiveContent(rawContent);
+
+    const DEFAULT_MAX_BYTES = 256 * 1024; // 256KB
+    const requestedMax = options?.maxBytes ? Math.min(options.maxBytes, 1024 * 1024) : DEFAULT_MAX_BYTES;
+    let truncated = false;
+    let content = sanitizedContent;
+    if (sanitizedContent.length > requestedMax) {
+      content = sanitizedContent.slice(0, requestedMax);
+      truncated = true;
+    }
+    const totalLines = sanitizedContent.length ? sanitizedContent.split('\n').length : 0;
+    return {
+      boardId,
+      commit: headCommit,
+      path: cleanPath,
+      size,
+      content,
+      truncated,
+      totalLines,
+    };
+  }
   async waitForJob(boardId: string): Promise<void> {
     await this.#jobs.get(boardId);
   }

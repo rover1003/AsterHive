@@ -11,6 +11,7 @@ import {
   setWorkerControlDriverForTest,
   restoreWorkerControlDriver,
   type WorkerControlDriver,
+  releaseStuckTask,
 } from '../src/worker-control.ts';
 
 function H(token?: string): Record<string, string> {
@@ -52,6 +53,7 @@ test('Phase 6 工蜂受控诊断: probeWorker 探活与 HTTP 端点 (受控通�
       id: 'STUCK-1',
       title: '正在执行的疑似卡死任务',
       lane: 'Ready',
+      assignee: 'omp-bee',
     });
     claimTask(rig.ctx, worker, 'STUCK-1');
 
@@ -180,11 +182,16 @@ test('Phase 6 工蜂受控干预: releaseStuckTask 强制解绑卡死任务并�
       handle: 'queen-orch',
       role: 'orchestrator',
     });
-
+    const { agent: user, token: userToken } = registerAgent(rig.ctx, {
+      name: 'Boss',
+      handle: 'boss',
+      role: 'user',
+    });
     createTask(rig.ctx, 'b-release', {
       id: 'HANG-1',
       title: '被挂起的测试任务',
       lane: 'Ready',
+      assignee: 'bee-a',
     });
     claimTask(rig.ctx, workerA, 'HANG-1');
     assert.equal(getTask(rig.ctx, 'HANG-1').lane, 'InProgress');
@@ -192,17 +199,32 @@ test('Phase 6 工蜂受控干预: releaseStuckTask 强制解绑卡死任务并�
 
     const app = createApp(rig.ctx);
 
-    // 1. 蜂后强制解绑卡死任务
-    const res = await app.request(`/agents/${workerA.id}/control/release-task`, {
+    // 1. 蜂后不可代替用户确认物理停止，解绑报 403
+    const queenRes = await app.request(`/agents/${workerA.id}/control/release-task`, {
       method: 'POST',
       headers: H(queenToken),
-      body: JSON.stringify({ taskId: 'HANG-1', reason: '工蜂离线超时，蜂后强制回收任务' }),
+      body: JSON.stringify({ taskId: 'HANG-1', reason: '蜂后尝试强行解绑', confirmedStopped: true }),
+    });
+    assert.equal(queenRes.status, 403, '蜂后尝试伪造或确认物理停止必须报 403 拒绝');
+
+    // 2. 用户解绑未传 confirmedStopped: true 时，报 409 拒绝（网络断连不等于物理停止）
+    const unconfirmedRes = await app.request(`/agents/${workerA.id}/control/release-task`, {
+      method: 'POST',
+      headers: H(userToken),
+      body: JSON.stringify({ taskId: 'HANG-1', reason: '未确认停止' }),
+    });
+    assert.equal(unconfirmedRes.status, 409, '未经用户明确确认物理停止必须报 409 拒绝');
+
+    // 3. 用户明确提供 confirmedStopped: true 后受控解绑成功
+    const res = await app.request(`/agents/${workerA.id}/control/release-task`, {
+      method: 'POST',
+      headers: H(userToken),
+      body: JSON.stringify({ taskId: 'HANG-1', reason: '用户核实已物理停机', confirmedStopped: true }),
     });
     assert.equal(res.status, 200);
     const updated = (await res.json()) as { task: { lane: string; assignee: string } };
     assert.equal(updated.task.lane, 'Ready');
     assert.equal(updated.task.assignee, 'unassigned');
-
     // 数据库状态同步
     const onDisk = getTask(rig.ctx, 'HANG-1');
     assert.equal(onDisk.lane, 'Ready');
@@ -213,6 +235,12 @@ test('Phase 6 工蜂受控干预: releaseStuckTask 强制解绑卡死任务并�
     assert.ok(events.some((e) => e.type === 'task.force_released'), 'task.force_released 事件落账');
 
     // 2. 权限隔离：其他 worker 尝试解绑报 403
+    const reassigned = await app.request('/tasks/HANG-1/dispatch', {
+      method: 'POST',
+      headers: H(queenToken),
+      body: JSON.stringify({ assignee: 'bee-a', content: '@bee-a 继续处理任务' }),
+    });
+    assert.equal(reassigned.status, 201, '蜂后将释放回 Ready 的任务重新指派给原 worker');
     claimTask(rig.ctx, workerA, 'HANG-1');
     const workerBAttempt = await app.request(`/agents/${workerA.id}/control/release-task`, {
       method: 'POST',
@@ -241,7 +269,7 @@ test('Phase 6 协议工具: 蜂后调用 asterhive_worker_probe / restart / rele
     createBoard(rig.ctx, { id: 'b-tool', name: 'Tool Board' });
     const { agent: worker, token: workerToken } = registerAgent(rig.ctx, { name: 'Bee', handle: 'bee' });
     const { agent: queen } = registerAgent(rig.ctx, { name: 'Queen', handle: 'queen-orch', role: 'orchestrator' });
-    createTask(rig.ctx, 'b-tool', { id: 'TOOL-1', title: 'Tool task', lane: 'Ready' });
+    createTask(rig.ctx, 'b-tool', { id: 'TOOL-1', title: 'Tool task', lane: 'Ready', assignee: 'bee' });
     claimTask(rig.ctx, worker, 'TOOL-1');
 
     const probeTool = TOOL_DEFS.find((t) => t.name === 'asterhive_worker_probe');
@@ -261,15 +289,21 @@ test('Phase 6 协议工具: 蜂后调用 asterhive_worker_probe / restart / rele
     })) as { ok: boolean };
     assert.equal(restartRes.ok, true);
 
-    // 3. 蜂后调用 releaseTool
-    const releaseRes = (await releaseTool.handle(rig.ctx, queen, {
-      agentId: worker.id,
-      taskId: 'TOOL-1',
-      reason: '蜂后重置卡死任务',
-    })) as { lane: string; assignee: string };
+    // 3. 蜂后不可代替用户确认物理停止调用 releaseTool（报 403）
+    await assert.rejects(
+      async () => releaseTool.handle(rig.ctx, queen, {
+        agentId: worker.id,
+        taskId: 'TOOL-1',
+        reason: '蜂后尝试解绑',
+      }),
+      /only user role may confirm worker stopped/i,
+    );
+
+    // 4. 用户显式确认物理停止后受控解绑
+    const { agent: userAgent } = registerAgent(rig.ctx, { name: 'Boss User', handle: 'boss-user', role: 'user' });
+    const releaseRes = await releaseStuckTask(rig.ctx, userAgent, worker.id, 'TOOL-1', '用户确认停止', { confirmedStopped: true });
     assert.equal(releaseRes.lane, 'Ready');
     assert.equal(releaseRes.assignee, 'unassigned');
-
     // 4. worker 角色调用均报 403
     await assert.rejects(async () => probeTool.handle(rig.ctx, worker, { agentId: worker.id }), /workers cannot probe/);
     await assert.rejects(async () => restartTool.handle(rig.ctx, worker, { agentId: worker.id, reason: 'x' }), /workers cannot restart/);

@@ -17,6 +17,16 @@ export interface Board {
   wip: Record<string, number>;
   createdAt: number;
 }
+export type TaskProgressStatus = 'active' | 'no_recent_activity' | 'offline' | 'unknown';
+
+export interface TaskProgress {
+  lastActivityAt: number | null;
+  lastActivityKind: string | null;
+  lastProgressAt: number | null;
+  workerLastSeenAt: number | null;
+  status: TaskProgressStatus;
+}
+
 export interface Task {
   id: string;
   boardId: string;
@@ -37,12 +47,12 @@ export interface Task {
   reviewReworks: number;
   reviewSummary: string;
   submitSummary: string;
-  repoMode?: 'managed' | 'remote-legacy';
   claimedAt: number | null;
   lastActivityAt: number | null;
   autoUnblockedAt: number | null;
   createdAt: number;
   updatedAt: number;
+  progress?: TaskProgress | null;
 }
 export interface RepoTaskDiff {
   base: string;
@@ -91,6 +101,34 @@ export interface Agent {
   /** 设备能力规格（OS/架构/CPU/内存等） */
   specs?: AgentSpecs;
 }
+export interface AgentTelemetry {
+  cpuPercent: number | null;
+  memoryUsedGb: number | null;
+  memoryTotalGb: number | null;
+  memoryFreeGb: number | null;
+  memoryPercent: number | null;
+  loadAvg: number[] | null;
+  uptimeSec: number | null;
+  taskInProgress: string | null;
+  timestamp: number;
+}
+export interface FleetTelemetryNode {
+  agentId: string;
+  handle: string;
+  name: string;
+  status: string;
+  specs?: AgentSpecs | null;
+  telemetry: AgentTelemetry | null;
+  history: AgentTelemetry[];
+}
+export interface FleetTelemetryReport {
+  timestamp: number;
+  totalNodes: number;
+  reportingNodes: number;
+  metrics: Record<string, unknown>;
+  nodes: FleetTelemetryNode[];
+}
+
 export interface AgentOverview {
   id: string;
   name: string;

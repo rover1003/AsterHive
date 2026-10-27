@@ -41,7 +41,7 @@ async function seed(app: ReturnType<typeof createApp>, rig: ReturnType<typeof mk
   await app.request('/boards/b/tasks', {
     method: 'POST',
     headers: H(orch.token),
-    body: JSON.stringify({ id: 'T1', title: '活', lane: 'Ready' }),
+    body: JSON.stringify({ id: 'T1', title: '活', lane: 'Ready', assignee: bee.agent.id }),
   });
   await app.request('/tasks/T1/claim', { method: 'POST', headers: H(bee.token), body: '{}' });
   await app.request('/tasks/T1/checkpoint', {

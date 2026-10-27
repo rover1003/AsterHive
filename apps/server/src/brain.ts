@@ -42,7 +42,7 @@ import { withWrite, logEvent } from './write.ts';
 import { ensureBrainAgent, BRAIN_AGENT_ID, type Agent } from './agents.ts';
 import { getOrchestratorSettings, activeGroup, reviewerGroup, type ActiveOrchestratorGroup } from './settings.ts';
 import { messageInner } from './messages.ts';
-import { TOOL_DEFS, type ToolDef } from './orchestrator-tools.ts';
+import { TOOL_DEFS, type ToolDef, runWithToolContext } from './orchestrator-tools.ts';
 import { getBoard, getTask, listBoards, listTasks, LANES, finalizeTaskReview, claimTaskForReview, failTaskReview, recoverReviewerClaims } from './tasks.ts';
 import { RepoManager } from './repo-manager.ts';
 import type { PiRuntimeManager } from './pi-runtime.ts';
@@ -175,18 +175,22 @@ const BRAIN_SYSTEM_PROMPT = (userHandle: string) => `你是 AsterHive（星巢�
 你的产出只有五种：追问、任务卡、分派、验收结论、汇报。其余一切都不是你的工作。
 
 ## 身份边界（结构性约束，不是自觉）
-你可用的工具只有 15 个 asterhive_* 协议工具；没有 shell、文件读写、浏览器等任何执行面。
+你可用的工具只有星巢提供的 asterhive_* 协议工具；没有宿主机 shell、任意写文件、浏览器等外部执行面。
+你有受限的**当前看板托管仓库安全只读能力**（\`asterhive_repo_list_files\`、\`asterhive_repo_read_file\`），仅限于查看当前项目仓库 HEAD 提交的代码与文件结构；绝无仓库写入权、绝无命令执行权、绝不跨看板读取。
 claim/next/checkpoint/submit 是工蜂 worker 的动词，你调用会被领域层 403，绝不尝试绕过。
 推论：哪怕一件事你"顺手就能做"——写一段代码、跑一条命令、查一个网页——也必须建成卡
-分派给合适工蜂（Worker Bee）。你永远不参与任何实际的具体任务；你亲手干活的那一刻就是系统失职的那一刻。
+分派给合适工蜂（Worker Bee）。你永远不越权写入或参与任何具体代码实现任务；工蜂负责干活，你负责规划、指挥与验收。
 
-## 纪律一：先澄清真实意图，再动手拆解
-用户的目标往往带着隐含假设。建卡前自检四问：目标是什么？边界内/边界外各是什么？怎样算
-完成（可检验的证据）？优先级与顺序？
+## 纪律一：先自主查清代码事实，亲自规划与拆解，杜绝工蜂代看
+当用户提出新需求、重构、修 Bug 或路线规划时：
+- **蜂后必须亲自调查事实**：必须主动调用 \`asterhive_repo_list_files\` 和 \`asterhive_repo_read_file\` 直接查看当前项目源码、目录架构、配置与依赖，亲自理解项目现状与真实技术上下文；
+- **绝对禁止建卡让工蜂代查代读**：绝不可为了"调查项目结构"、"看看有什么文件"、"读一下 package.json" 而建立任务卡分派给工蜂！调研代码事实、架构规划与任务拆解是蜂后的核心职责，工蜂只负责具体代码实现与验证；
+- **基于真实代码事实拆卡**：在建卡前通过只读工具确认涉及的具体文件路径、函数与接口契约，把确切文件列表写进任务卡 files 与 detail，杜绝凭空想象拆解；
+- **严格只读、不越权写**：蜂后只读取仓库 HEAD，严禁越权写入代码，任何修改均须拆解为任务卡由工蜂在独立沙箱执行并提交。
+建卡前自检四问：目标是什么？边界内/边界外各是什么？怎样算完成（可检验的证据）？优先级与顺序？
 - 四问中有任何一问模糊且影响拆解方向 → 先用 asterhive_message 向用户追问：给具体选项
   （"是 A 还是 B？各意味着什么"），不抛开放性问题；一次问全，不挤牙膏式反复打扰。
-- 用户已表达清楚 → 建完卡用一两句复述你的理解与拆解思路即可，不逐张卡求确认。
-
+- 用户已表达清楚且代码事实已查明 → 建完卡用一两句复述你的理解与拆解思路即可，不逐张卡求确认。
 ## 纪律二：拆解 = 有明确边界的 Todo 列表
 用 asterhive_create_task 建卡。每张卡必须同时具备，缺一就是不合格的卡：
 - title：动词开头的一句话（如"对接 GitHub Actions 产物上传"）；禁用"优化/完善/处理"
@@ -198,10 +202,10 @@ claim/next/checkpoint/submit 是工蜂 worker 的动词，你调用会被领域�
   这只允许无代码结果进入人工验收，不代表自动通过。普通代码任务不得标记 noCode。
 一次性把完整路线图建全：先行卡放 Ready，后续卡留 Backlog 靠依赖解锁，不建半截路线图。
 
-## 纪律三：分派
-用 asterhive_dispatch 把 Ready 的卡派给合适的 worker：按卡面 category 与对方自报 models
-选人，@handle 写清任务要点、涉及文件与验收标准。只分派，绝不执行。
-
+## 纪律三：定向分派
+当收到任务进入 Ready 队列事件时，必须调用 asterhive_match_task 查看工蜂的匹配情况与动态资源评分建议（0~100 分），
+综合任务硬件/模型需求与节点实际算力富余度，使用 asterhive_dispatch 将任务定向指派给最合适的目标工蜂（assignee），
+并在消息中 @handle 写清任务要点、涉及文件与验收标准。不要将任务滞留在 unassigned 状态。只分派，绝不执行。
 ## 纪律四：回收与验收
 worker submit 后，用 asterhive_get_task 读提交摘要、checkpoint 链与 evidence（文件清单、
 commit hash），对照卡面 acceptance **逐条**核对：
@@ -498,6 +502,8 @@ export class Brain {
   #streamer: ThrottledStream | null = null; // 本轮 brain.stream 节流发布器（null = 本轮不发流）
   #streamUnsub: (() => void) | null = null; // Pi 会话增量订阅退订器
   #streamBoardId: string | null = null; // 最近一次消息触发唤醒所在板：流式发布的目标板（非消息触发的轮为 null）
+  #currentTurnBoardId: string | null = null; // 当前正在执行的单一看板上下文（多板/周期轮为 null）
+  #pendingBoardIds = new Set<string>(); // 待处理唤醒原因涉及的看板集合
   #reviewJobs = new Map<string, Promise<void>>();
   #reviewQueueTimer: ReturnType<typeof setTimeout> | null = null;
   #reviewQueueRunning = false;
@@ -559,6 +565,8 @@ export class Brain {
     }
     this.#dirty = false;
     this.#reasons = [];
+    this.#pendingBoardIds.clear();
+    this.#currentTurnBoardId = null;
     this.#streamBoardId = null;
     this.#stopStreamer(); // 停用即收尾流式发布：退订增量 + 补发 end 相位（web 收到即撤流式气泡）；方法幂等，轮次 finally 再调是空操作
     this.#disposeSession();
@@ -612,8 +620,14 @@ export class Brain {
     const s = getOrchestratorSettings(this.#ctx);
     if (!s.enabled) return;
     const wakeOn = s.wakeOn ?? {};
+    let eventBoardId: string | null = null;
     if (typeof payload.boardId === 'string' && payload.boardId) {
+      eventBoardId = payload.boardId;
       this.#lastBoardId = payload.boardId; // 失败提示要发回事件所在板的房间
+    } else if (typeof payload.taskId === 'string' && payload.taskId) {
+      try {
+        eventBoardId = getTask(this.#ctx, payload.taskId).boardId;
+      } catch { /* ignored */ }
     }
     if (type === 'message.created' && typeof payload.messageId === 'number') {
       this.#lastMessageId = payload.messageId;
@@ -648,7 +662,18 @@ export class Brain {
       case 'task.lane_changed':
         if (payload.to === 'Review' && wakeOn.taskSubmitted !== false) {
           reason = `任务 ${payload.taskId} 进入 Review`;
+        } else if (payload.to === 'Ready') {
+          reason = `任务 ${payload.taskId} 进入 Ready 队列待分派：请评估工蜂并调用 asterhive_match_task 定向分派`;
         }
+        break;
+      case 'task.created':
+        if (payload.lane === 'Ready') {
+          reason = `新建任务 ${payload.taskId} 进入 Ready 队列待分派：请评估工蜂并定向分派`;
+        }
+        break;
+      case 'task.unblocked':
+      case 'task.auto_unlocked':
+        reason = `前置依赖完成，任务 ${payload.taskId} 解锁进入 Ready 待分派`;
         break;
       case 'agent.registered':
         reason = `新 agent 加入 @${payload.handle}（role=${payload.role}）`;
@@ -677,21 +702,27 @@ export class Brain {
     if (this.#reasons.length < 10) this.#reasons.push(reason);
     // 消息触发的唤醒：记下所在板——本轮的 brain.stream 流式发布推到这个房间。
     // task.submitted 等非消息触发的轮不设置（#turn 里为 null 即不发流式事件）。
+    if (eventBoardId) this.#pendingBoardIds.add(eventBoardId);
     if (type === 'message.created' && typeof payload.boardId === 'string') {
       this.#streamBoardId = payload.boardId;
     }
 
-    // 运行中干预：SDK 支持 steer（注入当前运行）；成功排队即由本轮消化（原因出列），
-    // 失败/未排队则保留原因排到下一轮
+    // 运行中干预：SDK 支持 steer（注入当前运行）；
+    // 关键安全隔离：只有与当前运行轮次完全同属一个单一可信看板的消息，才允许 steer 注入当前运行；
+    // 来自不同看板或跨板消息绝对禁止插话当前会话，必须保留原因排到下一轮！
     if (steerable && this.#running && this.#session) {
-      const idx = this.#reasons.length - 1;
-      this.#session
-        .steer(`[房间插话] ${reason}`)
-        .then((r) => {
-          if (r === 'queued') this.#reasons.splice(idx, 1);
-          else this.#markDirty();
-        })
-        .catch(() => this.#markDirty());
+      if (eventBoardId && this.#currentTurnBoardId === eventBoardId) {
+        const idx = this.#reasons.length - 1;
+        this.#session
+          .steer(`[房间插话] ${reason}`)
+          .then((r) => {
+            if (r === 'queued') this.#reasons.splice(idx, 1);
+            else this.#markDirty();
+          })
+          .catch(() => this.#markDirty());
+        return;
+      }
+      this.#markDirty();
       return;
     }
     this.#markDirty();
@@ -702,7 +733,6 @@ export class Brain {
       this.#dirty = true; // 本轮结束后由 finally 排下一轮
       return;
     }
-    if (this.#timer) return; // 去抖窗口已开：合并
     this.#timer = setTimeout(() => {
       this.#timer = null;
       void this.#turn();
@@ -899,12 +929,17 @@ export class Brain {
     const started = Date.now();
     const reasons = this.#reasons;
     this.#reasons = [];
+    const pendingBoards = Array.from(this.#pendingBoardIds);
+    this.#pendingBoardIds.clear();
+    // 仅在明确绑定单一可信看板的回合可用；多板、无板或周期轮无可信单一上下文则为 null
+    const activeBoard = pendingBoards.length === 1 ? pendingBoards[0]! : null;
+    this.#currentTurnBoardId = activeBoard;
     // 流式发布目标板：取走即清——本轮固定推这个板；中途 steer 进来的新消息由下一轮决定
     const streamBoardId = this.#streamBoardId;
     this.#streamBoardId = null;
     withWrite(this.#ctx, 'brain.turnStart', () => {
       // groupName/groupId：排查"这次轮次用的哪条通道"（多模型组切换后对账用）
-      logEvent(this.#ctx, 'brain.turn_started', { reasons, groupId: g.id, groupName: g.name });
+      logEvent(this.#ctx, 'brain.turn_started', { reasons, groupId: g.id, groupName: g.name, boardId: activeBoard });
     });
     try {
       const agent = ensureBrainAgent(this.#ctx);
@@ -930,8 +965,13 @@ export class Brain {
       // 仅消息触发的轮发布（streamBoardId 非空）；异常/超时路径由 finally 兜底收尾。
       if (streamBoardId) this.#startStreamer(session, streamBoardId);
       try {
-        await session.prompt(prompt);
+        if (activeBoard) {
+          await runWithToolContext({ boardId: activeBoard }, () => session.prompt(prompt));
+        } else {
+          await session.prompt(prompt);
+        }
       } finally {
+        this.#currentTurnBoardId = null;
         clearTimeout(timer);
         this.#stopStreamer(); // 补发全文余量 + phase:'end'（无产出轮一帧不发）
       }
@@ -1173,7 +1213,7 @@ export class Brain {
       settingsManager: pi.SettingsManager.inMemory({}),
       sessionManager: pi.SessionManager.continueRecent(workspace, sessionsDir),
       noTools: 'builtin', // 关闭全部内置工具（read/bash/edit/write…）
-      customTools: TOOL_DEFS.map((d) => toPiTool(d, agent, this.#ctx)), // 只有 15 个协议工具
+      customTools: TOOL_DEFS.map((d) => toPiTool(d, agent, this.#ctx)), // 协议工具 + 托管主仓受限只读与整合工具
     });
     // 触发 session_start：社区插件（如 MCP 类扩展）在此连接。无扩展时是空操作。
     await session.bindExtensions({}).catch(() => {});

@@ -14,7 +14,7 @@ test('explicit cancellation persists history, hides task from board lists, and b
   try {
     const board = createBoard(rig.ctx, { id: 'cancel-board', name: 'Cancel', repo: '' });
     const worker = registerAgent(rig.ctx, { id: 'worker-cancel', name: 'Worker', handle: 'worker-cancel', role: 'worker' }).agent;
-    createTask(rig.ctx, board.id, { id: 'CAN-1', title: 'Cancel me', lane: 'Ready' });
+    createTask(rig.ctx, board.id, { id: 'CAN-1', title: 'Cancel me', lane: 'Ready', assignee: worker.id });
     rig.ctx.holder.db.prepare("UPDATE task SET evidence='[{\"path\":\"proof.txt\",\"note\":\"kept\"}]' WHERE id='CAN-1'").run();
     claimTask(rig.ctx, worker, 'CAN-1');
     const cancelled = await cancelTask(rig.ctx, user, 'CAN-1', '用户决定停止');
@@ -34,7 +34,7 @@ test('cancelled reviewer completion cannot finalize or release dependencies', as
     const worker = registerAgent(rig.ctx, { id: 'cancel-review-worker', name: 'Worker', handle: 'cancel-review-worker', role: 'worker' }).agent;
     createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
     putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
-    createTask(rig.ctx, board.id, { id: 'CAN-2', title: 'Review task', lane: 'Ready' });
+    createTask(rig.ctx, board.id, { id: 'CAN-2', title: 'Review task', lane: 'Ready', assignee: worker.id });
     const dep = createTask(rig.ctx, board.id, { id: 'CAN-3', title: 'Dependent', lane: 'Backlog', dependsOn: ['CAN-2'] });
     claimTask(rig.ctx, worker, 'CAN-2');
     const submitted = submitTask(rig.ctx, worker, 'CAN-2', { summary: 'submitted for review' });

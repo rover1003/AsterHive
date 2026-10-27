@@ -256,11 +256,10 @@ test('主脑：启用后用户消息唤醒——建卡/汇报/turn_finished 落�
     assert.equal(mock.requestBodies[5]?.reasoning_effort, undefined, 'thinkingLevel=off 不向上游发送 reasoning_effort');
     // ---- worker 语义不受影响：领卡/交活动词照常 ----
     const bee = registerAgent(rig.ctx, { name: '工蜂', handle: 'bee' });
-    createTask(rig.ctx, 'b', { id: 'T1', title: '执行卡', lane: 'Ready' });
+    createTask(rig.ctx, 'b', { id: 'T1', title: '执行卡', lane: 'Ready', assignee: bee.agent.id });
     const claimed = nextTask(rig.ctx, bee.agent, 'b');
     assert.equal(claimed.task?.id, 'T1');
     assert.equal(claimed.task?.assignee, bee.agent.id);
-
     // 主脑结构性约束：orchestrator 调执行动词被领域层 403
     assert.throws(() => nextTask(rig.ctx, getAgent(rig.ctx, 'asterhive-brain'), 'b'), /orchestrator never executes/);
 

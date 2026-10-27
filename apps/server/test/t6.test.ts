@@ -51,7 +51,7 @@ test('T6: 审计覆盖——各类结构化写均可在 /audit 查到', async ()
     await app.request('/boards/b/tasks', {
       method: 'POST',
       headers: OH,
-      body: JSON.stringify({ id: 'T1', title: '卡', lane: 'Ready' }),
+      body: JSON.stringify({ id: 'T1', title: '卡', lane: 'Ready', assignee: 'zcode' }),
     });
     await app.request('/tasks/T1/claim', { method: 'POST', headers: H(bee.token), body: '{}' });
     await app.request('/tasks/T1/checkpoint', {

@@ -60,14 +60,165 @@ function repoBadge(board: Board): string {
     : '';
 }
 
+interface NormalizedTaskProgress {
+  status: 'active' | 'no_recent_activity' | 'offline' | 'unknown';
+  workerLastSeenAt: number | null;
+  lastActivityAt: number | null;
+  lastActivityKind: string | null;
+  lastProgressAt: number | null;
+}
+
+function normalizeProgress(progress?: unknown): NormalizedTaskProgress {
+  if (!progress || typeof progress !== 'object') {
+    return {
+      status: 'unknown',
+      workerLastSeenAt: null,
+      lastActivityAt: null,
+      lastActivityKind: null,
+      lastProgressAt: null,
+    };
+  }
+  const p = progress as Record<string, unknown>;
+  const rawStatus = typeof p.status === 'string' ? p.status : '';
+  const status: NormalizedTaskProgress['status'] =
+    rawStatus === 'active' || rawStatus === 'no_recent_activity' || rawStatus === 'offline' || rawStatus === 'unknown'
+      ? rawStatus
+      : 'unknown';
+
+  const parseEpoch = (v: unknown): number | null =>
+    typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
+  const parseKind = (v: unknown): string | null =>
+    typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
+
+  return {
+    status,
+    workerLastSeenAt: parseEpoch(p.workerLastSeenAt),
+    lastActivityAt: parseEpoch(p.lastActivityAt),
+    lastActivityKind: parseKind(p.lastActivityKind),
+    lastProgressAt: parseEpoch(p.lastProgressAt),
+  };
+}
+
+function formatProgressTime(ts: number | null): string {
+  if (!ts) return '暂无记录';
+  const now = Date.now();
+  const diff = now - ts;
+  const clock = fmtTime(ts);
+  if (diff < 0) return clock;
+  if (diff < 60_000) return `刚刚 (${clock})`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前 (${clock})`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前 (${clock})`;
+  return `${Math.floor(diff / 86_400_000)} 天前 (${clock})`;
+}
+
+const PROGRESS_STATUS_META: Record<
+  NormalizedTaskProgress['status'],
+  { label: string; short: string; badgeClass: string; desc: string; calloutClass: string; calloutText: string }
+> = {
+  active: {
+    label: '活跃执行',
+    short: '活跃',
+    badgeClass: 'prog-active',
+    desc: '最近有可观察活动',
+    calloutClass: 'alert-active',
+    calloutText: '最近有可观察活动。',
+  },
+  no_recent_activity: {
+    label: '等待 / 疑似无活动',
+    short: '疑似无活动',
+    badgeClass: 'prog-warn',
+    desc: '近期未观察到新活动',
+    calloutClass: 'alert-warn',
+    calloutText: '近期未观察到新活动；心跳保活不代表实际进展。',
+  },
+  offline: {
+    label: '失联',
+    short: '失联',
+    badgeClass: 'prog-offline',
+    desc: '近期未收到心跳',
+    calloutClass: 'alert-danger',
+    calloutText: '近期未收到心跳。',
+  },
+  unknown: {
+    label: '状态未知',
+    short: '未知',
+    badgeClass: 'prog-unknown',
+    desc: '无活动遥测数据',
+    calloutClass: 'alert-unknown',
+    calloutText: '无活动遥测数据（旧工蜂或尚未上报）。',
+  },
+};
+
+function renderCardProgress(t: Task): string {
+  if (t.lane !== 'InProgress') return '';
+  const p = normalizeProgress(t.progress);
+  const meta = PROGRESS_STATUS_META[p.status];
+  const heartPart = p.workerLastSeenAt ? ` · 心跳 ${fmtTime(p.workerLastSeenAt)}` : '';
+  const actPart = p.lastActivityAt ? ` · 活动 ${fmtTime(p.lastActivityAt)}` : '';
+  const tip = `${meta.label}（${meta.desc}）${actPart}${heartPart} · 心跳保活不代表实际进展`;
+  return `<div class="card-progress ${meta.badgeClass}" title="${esc(tip)}"><span class="card-progress-dot"></span><span class="card-progress-text">${esc(meta.short)}</span></div>`;
+}
+
+function renderDrawerProgress(t: Task): string {
+  if (t.lane !== 'InProgress') return '';
+
+  const p = normalizeProgress(t.progress);
+  const meta = PROGRESS_STATUS_META[p.status];
+
+  return `
+    <div class="field">
+      <label>工蜂执行与进展遥测</label>
+      <div class="progress-panel">
+        <div class="progress-panel-head">
+          <span class="progress-status-badge ${meta.badgeClass}">
+            <span class="status-dot"></span>
+            <b>${esc(meta.label)}</b>
+          </span>
+          <span class="progress-panel-desc">${esc(meta.desc)}</span>
+        </div>
+        <div class="progress-alert ${meta.calloutClass}">
+          ${esc(meta.calloutText)}
+        </div>
+        <div class="progress-grid">
+          <div class="progress-row">
+            <div class="progress-row-header">
+              <span class="progress-row-label">工蜂保活心跳</span>
+              <span class="progress-row-val">${esc(formatProgressTime(p.workerLastSeenAt))}</span>
+            </div>
+            <div class="progress-row-hint muted">仅表示心跳上报，不代表任务有实质进展</div>
+          </div>
+          <div class="progress-row">
+            <div class="progress-row-header">
+              <span class="progress-row-label">最近可观察活动</span>
+              <span class="progress-row-val">${esc(formatProgressTime(p.lastActivityAt))}${p.lastActivityKind ? ` · <code class="activity-kind">${esc(p.lastActivityKind)}</code>` : ''}</span>
+            </div>
+            <div class="progress-row-hint muted">可观察到的事件记录</div>
+          </div>
+          <div class="progress-row">
+            <div class="progress-row-header">
+              <span class="progress-row-label">最近进展里程碑</span>
+              <span class="progress-row-val">${esc(formatProgressTime(p.lastProgressAt))}</span>
+            </div>
+            <div class="progress-row-hint muted">阶段进展或里程碑更新时间</div>
+          </div>
+        </div>
+        <div class="progress-evidence-note muted">
+          证据原则：仅展示可观察证据，无数据或旧工蜂显示未知；不要从心跳保活推断正在工作。
+        </div>
+      </div>
+    </div>`;
+}
+
 function cardHtml(t: Task): string {
   // 紧凑卡（176×88）：首行 P 色点 + 任务号（金色等宽）+ 负责人（蓝灰靠右），标题两行截断；
   // 依赖 / 附件 / 解锁等详情全部收进抽屉，卡面只留「扫一眼」信息
   const assignee = t.assignee !== 'unassigned' ? `<span class="card-assignee">@${esc(t.assignee)}</span>` : '';
+  const progressBadge = renderCardProgress(t);
   return `
     <div class="card ${PRIORITY_CLASS[t.priority] ?? 'p1'}" data-task="${esc(t.id)}" title="${esc(t.title)}">
       <div class="card-top"><span class="card-dot"></span><span class="card-id">${esc(t.id)}</span>${assignee}</div>
       <div class="card-title">${esc(t.title)}</div>
+      ${progressBadge}
     </div>`;
 }
 
@@ -124,6 +275,7 @@ function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): str
         .map((m) => `<div class="msg-mini"><b>${esc(m.author)}</b> <time>${fmtTime(m.createdAt)}</time><div>${esc(m.content)}</div></div>`)
         .join('')
     : '<div class="muted">该任务暂无关联消息</div>';
+  const progressSection = renderDrawerProgress(t);
 
   return `
     <div class="drawer-mask" id="drawer-mask"></div>
@@ -140,6 +292,7 @@ function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): str
         ${t.detail ? `<div class="field"><label>说明</label><div>${esc(t.detail)}</div></div>` : ''}
         ${t.acceptance ? `<div class="field"><label>验收标准</label><div class="acceptance">${esc(t.acceptance)}</div></div>` : ''}
         ${reviewState}${submitSummary}${reviewSummary}
+        ${progressSection}
         <div class="field"><label>负责人</label><div>${t.assignee === 'unassigned' ? '<span class="muted">未指派</span>' : '@' + esc(t.assignee)}</div></div>
         <div class="field"><label>依赖</label><div>${deps}</div></div>
         <div class="field"><label>工作区</label><div>${workspace}</div></div>

@@ -134,7 +134,7 @@ test('Reviewer: managed no-code submission remains available for manual review w
     createBoard(rig.ctx, { id: 'research-review', name: 'Research', repoMode: 'managed', repoStatus: 'ready' });
     createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
     putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
-    createTask(rig.ctx, 'research-review', { id: 'REV-20', title: 'Research without code', lane: 'Ready', workspace: { noCode: true } });
+    createTask(rig.ctx, 'research-review', { id: 'REV-20', title: 'Research without code', lane: 'Ready', assignee: 'research-worker', workspace: { noCode: true } });
     claimTask(rig.ctx, worker, 'REV-20');
 
     const app = createApp(rig.ctx);
@@ -152,7 +152,7 @@ test('Reviewer: managed no-code submission remains available for manual review w
     assert.ok(!listEvents(rig.ctx, { type: 'task.review_queued', limit: 10 }).some((e) => e.payload.taskId === 'REV-20'));
     assert.equal(updateTask(rig.ctx, ensureBrainAgent(rig.ctx), 'REV-20', { lane: 'Done' }).lane, 'Done', 'manual review can explicitly accept no-code work');
 
-    createTask(rig.ctx, 'research-review', { id: 'REV-22', title: 'Code task', lane: 'Ready' });
+    createTask(rig.ctx, 'research-review', { id: 'REV-22', title: 'Code task', lane: 'Ready', assignee: 'research-worker' });
     claimTask(rig.ctx, worker, 'REV-22');
     assert.throws(() => submitTask(rig.ctx, worker, 'REV-22', { summary: 'not code', noCode: true }), /not authorized/);
     assert.equal(getTask(rig.ctx, 'REV-22').lane, 'InProgress');
@@ -167,7 +167,7 @@ test('Reviewer: submitted managed code without a server task ref fails with acti
     createBoard(rig.ctx, { id: 'missing-ref', name: 'Missing Ref', repoMode: 'managed', repoStatus: 'ready' });
     createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
     putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
-    createTask(rig.ctx, 'missing-ref', { id: 'REV-21', title: 'Code change without uploaded ref', lane: 'Ready' });
+    createTask(rig.ctx, 'missing-ref', { id: 'REV-21', title: 'Code change without uploaded ref', lane: 'Ready', assignee: 'missing-ref-worker' });
     claimTask(rig.ctx, worker, 'REV-21');
     submitTask(rig.ctx, worker, 'REV-21', { summary: '提交了代码改动' });
 
@@ -195,7 +195,7 @@ test('Reviewer: managed submit queues automatically; legacy submit preserves man
     createBoard(rig.ctx, { id: 'legacy-review', name: 'Legacy', repo: 'https://example.invalid/repo.git' });
     putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
 
-    createTask(rig.ctx, 'managed-review', { id: 'REV-1', title: 'Managed review', lane: 'Ready', acceptance: 'File exists' });
+    createTask(rig.ctx, 'managed-review', { id: 'REV-1', title: 'Managed review', lane: 'Ready', acceptance: 'File exists', assignee: 'review-worker' });
     claimTask(rig.ctx, workerReg.agent, 'REV-1');
     const managed = submitTask(rig.ctx, workerReg.agent, 'REV-1', { summary: 'Done', evidence: [{ path: 'feature.ts' }] });
     assert.equal(managed.lane, 'Review');
@@ -204,7 +204,7 @@ test('Reviewer: managed submit queues automatically; legacy submit preserves man
     assert.equal(managed.reviewSummary, '');
     assert.equal(managed.submitSummary, 'Done');
 
-    createTask(rig.ctx, 'legacy-review', { id: 'REV-2', title: 'Legacy review', lane: 'Ready' });
+    createTask(rig.ctx, 'legacy-review', { id: 'REV-2', title: 'Legacy review', lane: 'Ready', assignee: 'review-worker' });
     claimTask(rig.ctx, workerReg.agent, 'REV-2');
     const legacy = submitTask(rig.ctx, workerReg.agent, 'REV-2', { summary: 'Done' });
     assert.equal(legacy.reviewStatus, 'none');
@@ -220,7 +220,7 @@ test('Reviewer: rejection allows two reworks, third rejection blocks, manual pas
     createBoard(rig.ctx, { id: 'review-board', name: 'Review Board', repoMode: 'managed', repoStatus: 'ready' });
     createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
     putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
-    createTask(rig.ctx, 'review-board', { id: 'REV-3', title: 'Review target', lane: 'Ready' });
+    createTask(rig.ctx, 'review-board', { id: 'REV-3', title: 'Review target', lane: 'Ready', assignee: 'review-worker-3' });
     claimTask(rig.ctx, worker, 'REV-3');
     submitTask(rig.ctx, worker, 'REV-3', { summary: 'First submission' });
 
@@ -255,7 +255,7 @@ test('Reviewer: failed runs require explicit retry and interrupted claims are re
     createBoard(rig.ctx, { id: 'review-recovery', name: 'Review Recovery', repoMode: 'managed', repoStatus: 'ready' });
     createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
     putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
-    createTask(rig.ctx, 'review-recovery', { id: 'REV-4', title: 'Review target', lane: 'Ready' });
+    createTask(rig.ctx, 'review-recovery', { id: 'REV-4', title: 'Review target', lane: 'Ready', assignee: 'review-worker-4' });
     claimTask(rig.ctx, worker, 'REV-4');
     submitTask(rig.ctx, worker, 'REV-4', { summary: 'Submitted' });
     assert.ok(claimTaskForReview(rig.ctx, 'REV-4'));
@@ -288,7 +288,7 @@ test('Reviewer: managed diff endpoint returns bounded diff; legacy mode is rejec
       git(['push', '-q', manager.repoPath(board.id), 'main'], seed);
       git(['symbolic-ref', 'HEAD', 'refs/heads/main'], manager.repoPath(board.id));
       const worker = registerAgent(rig.ctx, { name: 'Diff Worker', handle: 'diff-worker' });
-      createTask(rig.ctx, board.id, { id: 'DIF-1', title: 'Add feature', lane: 'Ready' });
+      createTask(rig.ctx, board.id, { id: 'DIF-1', title: 'Add feature', lane: 'Ready', assignee: 'diff-worker' });
       claimTask(rig.ctx, worker.agent, 'DIF-1');
       const clone = join(root, 'clone');
       git(['clone', '-q', manager.repoPath(board.id), clone]);
@@ -337,7 +337,7 @@ async function prepareManagedSubmission(rig: ReturnType<typeof mkRig>, boardId: 
     const { setBoardRepoState } = await import('../src/tasks.ts');
     setBoardRepoState(rig.ctx, boardId, { status: 'ready', head: sourceHead });
 
-    createTask(rig.ctx, boardId, { id: taskId, title: 'Add feature', lane: 'Ready', acceptance: 'feature.txt contains expected text' });
+    createTask(rig.ctx, boardId, { id: taskId, title: 'Add feature', lane: 'Ready', acceptance: 'feature.txt contains expected text', assignee: `worker-${taskId.toLowerCase()}` });
     claimTask(rig.ctx, workerReg.agent, taskId);
     const cloneDir = join(root, 'worker');
     git(['clone', '-q', bare, cloneDir]);
@@ -393,7 +393,7 @@ test('审核后 Diff 固定到任务基线：已合并任务仍保留原始代�
       await manager.importTaskResult('diff-after-merge', 'DIF-3', [bytes], bytes.length, createHash('sha256').update(bytes).digest('hex'));
 
       const worker = registerAgent(rig.ctx, { name: 'Worker', handle: 'diff-worker' }).agent;
-      const task = createTask(rig.ctx, 'diff-after-merge', { id: 'DIF-3', title: 'Show diff after merge', lane: 'Ready' });
+      const task = createTask(rig.ctx, 'diff-after-merge', { id: 'DIF-3', title: 'Show diff after merge', lane: 'Ready', assignee: 'diff-worker' });
       claimTask(rig.ctx, worker, task.id);
       submitTask(rig.ctx, worker, task.id, { summary: 'Added feature' });
       assert.ok(claimTaskForReview(rig.ctx, task.id));

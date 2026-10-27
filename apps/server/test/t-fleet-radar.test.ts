@@ -60,6 +60,7 @@ test('Phase 9 舰队体检雷达: 任务长时间执行且无进展的停滞预�
       id: 'STALL-1',
       title: '复杂大模块改写',
       lane: 'Ready',
+      assignee: worker.id,
     });
     claimTask(rig.ctx, worker, 'STALL-1');
 
@@ -82,6 +83,7 @@ test('Phase 9 舰队体检雷达: 任务长时间执行且无进展的停滞预�
     rig.cleanup();
   }
 });
+
 
 test('Phase 9 舰队体检雷达: HTTP 端点 GET /api/fleet/radar 与蜂后协议工具 asterhive_fleet_radar', async () => {
   const rig = mkRig();
