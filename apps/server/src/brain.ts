@@ -46,6 +46,7 @@ import { TOOL_DEFS, type ToolDef, runWithToolContext } from './orchestrator-tool
 import { getBoard, getTask, listBoards, listTasks, LANES, finalizeTaskReview, claimTaskForReview, failTaskReview, recoverReviewerClaims } from './tasks.ts';
 import { RepoManager } from './repo-manager.ts';
 import type { PiRuntimeManager } from './pi-runtime.ts';
+import { findCurrentExecutionReport } from './evidence.ts';
 
 // 单轮超时（默认 10 分钟）；去抖默认 3 秒——测试用环境变量缩短。
 const TURN_TIMEOUT_MS = Number(process.env.ASTERHIVE_BRAIN_TURN_TIMEOUT_MS ?? 600_000);
@@ -193,15 +194,13 @@ claim/next/checkpoint/submit 是工蜂 worker 的动词，你调用会被领域�
 - 用户已表达清楚且代码事实已查明 → 建完卡用一两句复述你的理解与拆解思路即可，不逐张卡求确认。
 ## 纪律二：拆解 = 有明确边界的 Todo 列表
 用 asterhive_create_task 建卡。每张卡必须同时具备，缺一就是不合格的卡：
-- title：动词开头的一句话（如"对接 GitHub Actions 产物上传"）；禁用"优化/完善/处理"
-  这类无法验收的词。
+- title：动词开头的一句话（如"对接 GitHub Actions 产物上传"）；禁用"优化/完善/处理"这类无法验收的词。
 - detail：做什么 + **明确不做什么**（范围外写"本卡不含…"）+ 涉及文件/模块。
-- acceptance：可检验的证据清单，逐条列（文件路径、测试名、命令输出、commit hash）。
+- acceptance：依风险分级的最小可核验验收标准清单（低风险只检查卡面相关的局部行为；高风险关注并发边界与防御；里程碑卡才做完整跨模块集成验证；禁止要求无关的重构或风格改动）。
+- workspace：声明验证计划，包括 \`validationCommands?: string[]\`（工蜂提交前必须在原生 shell 运行的测试命令清单，如 \`["npm test -- test/feature.test.ts"]\`）与 \`validationScope?: 'task' | 'integration'\`。历史旧卡未提供时默认 task。
 - dependsOn：依赖的先行卡。粒度：一个 worker 一次领取可完成；需要半天以上的活就是没拆开。
-- 只有明确无需改动仓库源码的研究/调查任务，才在 workspace 设置 \`noCode: true\`；
-  这只允许无代码结果进入人工验收，不代表自动通过。普通代码任务不得标记 noCode。
+- 只有明确无需改动仓库源码的研究/调查任务，才在 workspace 设置 \`noCode: true\`；这只允许无代码结果进入人工验收，不代表自动通过。普通代码任务不得标记 noCode。
 一次性把完整路线图建全：先行卡放 Ready，后续卡留 Backlog 靠依赖解锁，不建半截路线图。
-
 ## 纪律三：定向分派
 当收到任务进入 Ready 队列事件时，必须调用 asterhive_match_task 查看工蜂的匹配情况与动态资源评分建议（0~100 分），
 综合任务硬件/模型需求与节点实际算力富余度，使用 asterhive_dispatch 将任务定向指派给最合适的目标工蜂（assignee），
@@ -262,26 +261,48 @@ worker 协作模型对三者完全一致。用户项目含未公开内容时：
    - 用户确认开始新建空项目 → 调用 \`asterhive_board_repo_init(boardId, 'empty')\` 建立初始空主仓。
 4. **仓库就绪前绝不盲目建业务卡**：在仓库状态就绪（ready）之前，不要盲目拆解具体的代码开发任务，因为工蜂无处拉取快照。`;
 
-const REVIEWER_SYSTEM_PROMPT = `你是 AsterHive 内置的独立代码审核员。你只对照验收标准检查本次代码差异，不参与任务规划、派发或实现。
+const REVIEWER_SYSTEM_PROMPT = `你是 AsterHive 内置的独立代码审核员。你对照任务卡验收标准与声明的验证要求，综合本次代码差异（Git diff）与实际执行报告（Execution Report）做出裁决。你只做独立审核，不参与任务规划、派发或实现。
 
-输入仅包含原始验收标准、执行者提交摘要、变更文件和 Git diff。不要推断未提供的实现，也不要因为摘要声称完成而通过。
+输入包含：原始验收标准、执行者提交摘要、变更文件、Git diff、声明的验证命令（validationCommands 与 validationScope），以及当前执行轮次的受控执行报告（Execution Report）。不要推断未提供的实现，也不要因为摘要声称完成而通过。
 
-审核要求：
-- 只有所有可检查的验收标准都有 diff 中的直接证据，且没有明显回归、严重错误或安全问题时才 pass。
-- 如果材料不足以核验、diff 截断、缺少有效改动或有任何必须修复的问题，必须 reject，并列出具体路径、问题、影响及可执行的修复要求。
-- 不要要求与验收标准无关的重构、风格改动或附加工作。
-- 只输出一个 JSON 对象，不要 Markdown 围栏或对象外文字：{"verdict":"pass"|"reject","summary":"中文、证据明确的结论"}`;
+审核裁决分类（四分类）：
+- pass: 只有所有可检查的验收标准都有 diff 中的直接代码证据，且执行报告表明声明的验证命令实际执行成功（退出码 0），没有明显回归、严重缺陷或安全隐患时才 pass。
+- reject: 仅用于确认存在实质性代码缺陷、逻辑错误、实现与卡面验收要求明确冲突或引入破坏性安全隐患。此裁决会消耗任务的代码重做次数。不要因为执行环境故障或缺少执行证据而使用 reject。
+- environment_blocked: 前置检查或执行证据表明是环境受阻（如缺失系统依赖、Node/Git/Shell 前置不满足、WSL/容器资源不足等非代码缺陷）。不消耗代码重做次数。
+- needs_evidence: 缺少当前代次的有效执行报告、执行报告损坏/截断、关键验证命令未执行或输出被截断导致无法确认验收结果，且当前代码差异未发现明显实质代码缺陷。不消耗代码重做次数。
 
-const REVIEWER_PROMPT = (input: { taskId: string; title: string; acceptance: string; workerSummary: string; base: string; head: string; diffStat: string; changedFiles: string[]; diffText: string }) => JSON.stringify({
+重要原则：
+- 代码 diff 证明实现，执行报告证明实际运行；文字摘要不能代替执行证据。
+- 若代码差异本身存在明确实质代码缺陷，即使执行证据不全也可以直接 reject 并指明缺陷。
+- 不要要求与卡面验收标准及验证命令无关的重构、代码风格变动或附加工作。
+- 只输出一个 JSON 对象，不要 Markdown 围栏或对象外文字：{"verdict":"pass"|"reject"|"environment_blocked"|"needs_evidence","summary":"中文、证据明确的结论"}`;
+
+const REVIEWER_PROMPT = (input: {
+  taskId: string;
+  title: string;
+  acceptance: string;
+  workerSummary: string;
+  base: string;
+  head: string;
+  diffStat: string;
+  changedFiles: string[];
+  diffText: string;
+  executionReport: unknown;
+  validationCommands?: string[];
+  validationScope?: string;
+}) => JSON.stringify({
   taskId: input.taskId,
   title: input.title,
-  acceptanceCriteria: input.acceptance || '未填写验收标准：仅可依据标题和明确可验证的预期判断；若无法形成可核验依据则 reject。',
+  acceptanceCriteria: input.acceptance || '未填写验收标准：仅可依据标题和明确可验证的预期判断；若无法形成可核验依据则 needs_evidence。',
   workerSummary: input.workerSummary,
   baseCommit: input.base,
   taskCommit: input.head,
   diffStat: input.diffStat,
   changedFiles: input.changedFiles,
   diff: input.diffText,
+  validationCommands: input.validationCommands ?? [],
+  validationScope: input.validationScope ?? 'task',
+  executionReport: input.executionReport,
 }, null, 2);
 
 // ---- zod → TypeBox (Pi ToolDefinition.parameters 用 TypeBox schema) ----
@@ -787,8 +808,17 @@ export class Brain {
           ? '任务 diff 超过 50KB 审核上下文上限；需人工核验，不得自动通过。'
           : '任务 diff 为空；需人工核验，不得自动通过。');
       }
+      const reviewAttempt = task.attempt ?? 1;
+      const reviewHead = diff.head;
+      const reportRes = findCurrentExecutionReport(this.#ctx, taskId, task.assignee, reviewAttempt, reviewHead);
+      const executionReport = 'report' in reportRes ? reportRes.report : { status: 'missing_or_invalid', error: reportRes.error };
+
+      const workspace = (task.workspace ?? {}) as Record<string, unknown>;
+      const validationCommands = Array.isArray(workspace.validationCommands) ? workspace.validationCommands.map(String) : undefined;
+      const validationScope = typeof workspace.validationScope === 'string' ? workspace.validationScope : undefined;
+
       const group = reviewerGroup(this.#ctx);
-    if (!group?.baseURL || !group.model || !group.apiKey) throw new Error('审核员模型组未配置完整的 Base URL、模型或 API Key。');
+      if (!group?.baseURL || !group.model || !group.apiKey) throw new Error('审核员模型组未配置完整的 Base URL、模型或 API Key。');
       const result = await this.#reviewOnce(group, REVIEWER_PROMPT({
         taskId,
         title: task.title,
@@ -799,21 +829,61 @@ export class Brain {
         diffStat: diff.diffStat,
         changedFiles: diff.changedFiles,
         diffText: diff.diffText,
+        executionReport,
+        validationCommands,
+        validationScope,
       }));
       const currentSettings = getOrchestratorSettings(this.#ctx);
       if (!currentSettings.enabled || !currentSettings.reviewerEnabled) return;
-      if (result.verdict === 'pass') {
-        await new RepoManager(this.#ctx).integrateTask(task.boardId, taskId);
-        await finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { integrated: true, maxReworks: 2 });
+
+      // 确定性复核：即使模型选择 pass，若缺少当前代次有效执行报告或报告记录验证失败，不可自动 pass，降级为 needs_evidence 或 environment_blocked
+      let effectiveVerdict = result.verdict;
+      let effectiveSummary = result.summary;
+
+      if (effectiveVerdict === 'pass') {
+        if (!('report' in reportRes)) {
+          effectiveVerdict = 'needs_evidence';
+          effectiveSummary = `代码审核通过，但未提供有效的当前代次执行报告，不可自动合入：${reportRes.error}`;
+        } else if (reportRes.report.outcome === 'environment_blocked') {
+          effectiveVerdict = 'environment_blocked';
+          effectiveSummary = `代码审核通过，但执行报告记录执行环境受阻：${reportRes.report.summary}`;
+        } else if (reportRes.report.outcome !== 'completed') {
+          effectiveVerdict = 'needs_evidence';
+          effectiveSummary = `代码审核通过，但执行报告显示命令验证未完成（${reportRes.report.outcome}）：${reportRes.report.summary}`;
+        } else if (validationCommands && validationCommands.length > 0 && (!reportRes.report.commands || reportRes.report.commands.length === 0)) {
+          effectiveVerdict = 'needs_evidence';
+          effectiveSummary = '代码审核通过，但任务卡声明了验证命令且报告未包含任何执行记录，不可自动合入。';
+        } else if (reportRes.report.commands && reportRes.report.commands.some((cmd) => cmd.exitCode !== 0 || cmd.truncated)) {
+          const failedCmd = reportRes.report.commands.find((cmd) => cmd.exitCode !== 0 || cmd.truncated);
+          const reason = failedCmd?.truncated ? '输出被截断无法证明成功' : `命令退出码非零（${failedCmd?.exitCode}）`;
+          effectiveVerdict = 'needs_evidence';
+          effectiveSummary = `代码审核通过，但执行报告中的验证命令未通过核验（${reason}）：${failedCmd?.command ?? ''}`;
+        }
+      }
+
+      if (effectiveVerdict === 'pass') {
+        await new RepoManager(this.#ctx).integrateTask(task.boardId, taskId, {
+          attempt: reviewAttempt,
+          head: reviewHead,
+        });
+        await finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, { verdict: 'pass', summary: effectiveSummary }, {
+          integrated: true,
+          maxReworks: 2,
+          attempt: reviewAttempt,
+          head: reviewHead,
+        });
       } else {
-        await finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { maxReworks: 2 });
+        await finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, { verdict: effectiveVerdict, summary: effectiveSummary }, {
+          maxReworks: 2,
+          attempt: reviewAttempt,
+          head: reviewHead,
+        });
       }
     } catch (err) {
       failTaskReview(this.#ctx, taskId, err instanceof Error ? err.message : String(err));
     }
   }
-
-  async #reviewOnce(group: ActiveOrchestratorGroup, input: string): Promise<{ verdict: 'pass' | 'reject'; summary: string }> {
+  async #reviewOnce(group: ActiveOrchestratorGroup, input: string): Promise<{ verdict: 'pass' | 'reject' | 'environment_blocked' | 'needs_evidence'; summary: string }> {
     const rt = this.#runtime.ensureRuntimeEntry();
     const key = JSON.stringify([rt.entryUrl, group.baseURL, group.model, group.apiKey]);
     const brainDir = join(this.#ctx.cfg.dataDir, 'brain-session');
@@ -878,9 +948,12 @@ export class Brain {
       const match = answer.match(/\{[\s\S]*\}/);
       if (!match) throw new Error('reviewer returned no JSON verdict');
       const parsed = JSON.parse(match[0]) as { verdict?: unknown; summary?: unknown };
-      if (parsed.verdict !== 'pass' && parsed.verdict !== 'reject') throw new Error('reviewer verdict must be pass or reject');
+      const validVerdicts = ['pass', 'reject', 'environment_blocked', 'needs_evidence'];
+      if (!validVerdicts.includes(String(parsed.verdict))) {
+        throw new Error('reviewer verdict must be pass, reject, environment_blocked, or needs_evidence');
+      }
       if (typeof parsed.summary !== 'string' || !parsed.summary.trim()) throw new Error('reviewer verdict summary is missing');
-      return { verdict: parsed.verdict, summary: parsed.summary.trim().slice(0, 6000) };
+      return { verdict: parsed.verdict as 'pass' | 'reject' | 'environment_blocked' | 'needs_evidence', summary: parsed.summary.trim().slice(0, 6000) };
     } finally {
       session.dispose();
       try {

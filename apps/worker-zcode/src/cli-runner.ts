@@ -69,7 +69,7 @@ export function resolveCommandTarget(cmd: string): CliCommandTarget {
  * % ! ^ & | < > ( ) " 及 ASCII 0-31 / 127
  * 遇到上述任一字符均在派生前立即 fail-closed 阻断，杜绝二次变量展开、多指令执行与重定向注入。
  */
-export const BATCH_UNSAFE_REGEX = /[\x00-\x1f\x7f%"!^&|<>]/;
+export const BATCH_UNSAFE_REGEX = /[\x00-\x1f\x7f%"!^&|<>()]/;
 
 export function containsUnsafeBatchArguments(args: string[]): boolean {
   return args.some((arg) => BATCH_UNSAFE_REGEX.test(arg));

@@ -179,7 +179,7 @@ function validRemote(remote: string): boolean {
   return /^git@[A-Za-z0-9.-]+:[A-Za-z0-9._/-]+(?:\.git)?$/.test(remote);
 }
 
-function runGit(args: string[], cwd?: string, allowLocalTransport = false): Promise<{ code: number | null; stdout: string; stderr: string }> {
+export function runGit(args: string[], cwd?: string, allowLocalTransport = false): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn('git', args, {
       cwd,
@@ -519,8 +519,8 @@ export class RepoManager {
     };
   }
 
-  async integrateTask(boardId: string, taskId: string): Promise<{ mergedCommit: string }> {
-    return withTaskIntegrationLock(taskId, () => this.#integrateTask(boardId, taskId));
+  async integrateTask(boardId: string, taskId: string, expected?: { attempt?: number; head?: string }): Promise<{ mergedCommit: string }> {
+    return withTaskIntegrationLock(taskId, () => this.#integrateTask(boardId, taskId, expected));
   }
 
   async acceptManualTask(taskId: string, actor: Agent): Promise<{ task: Task; mergedCommit: string | null }> {
@@ -535,7 +535,7 @@ export class RepoManager {
       const hasTaskRef = board.repoMode === 'managed' && existsSync(repo)
         ? (await runGit(['rev-parse', '--verify', targetRef], repo)).code === 0
         : false;
-      const shouldIntegrate = board.repoMode === 'managed' && task.workspace.noCode !== true && hasTaskRef;
+      const shouldIntegrate = board.repoMode === 'managed' && task.workspace.noCode !== true;
       const mergedCommit = shouldIntegrate
         ? (await this.#integrateTask(task.boardId, task.id)).mergedCommit
         : null;
@@ -544,12 +544,15 @@ export class RepoManager {
     });
   }
 
-  async #integrateTask(boardId: string, taskId: string): Promise<{ mergedCommit: string }> {
+  async #integrateTask(boardId: string, taskId: string, expected?: { attempt?: number; head?: string }): Promise<{ mergedCommit: string }> {
     const board = getBoard(this.#ctx, boardId);
     const task = getTask(this.#ctx, taskId);
     if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
     if (task.lane !== 'Review') throw new HttpError(409, `task ${taskId} is not in Review`);
     if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
+    if (expected?.attempt !== undefined && (task.attempt ?? 1) !== expected.attempt) {
+      throw new HttpError(409, `task ${taskId} attempt changed concurrently: expected ${expected.attempt}, got ${task.attempt}`);
+    }
     const repo = this.repoPath(boardId);
     const targetRef = `refs/asterhive/tasks/${taskId}`;
     const headRes = await runGit(['rev-parse', targetRef], repo);
@@ -557,7 +560,9 @@ export class RepoManager {
       throw new HttpError(404, `task ref ${targetRef} not found; confirm the worker successfully uploaded a task result bundle via POST /tasks/${taskId}/repo-result (HTTP 200), then retry integration`);
     }
     const taskCommit = headRes.stdout.trim();
-
+    if (expected?.head !== undefined && taskCommit !== expected.head) {
+      throw new HttpError(409, `task ${taskId} ref head changed concurrently: expected ${expected.head}, got ${taskCommit}`);
+    }
     // 结构化合并：在临时工作树中尝试 merge 到 bare 仓库 HEAD 指向的默认分支
     const tempWork = join(this.root, `.integrate-${boardId}-${taskId}-${randomUUID()}`);
     mkdirSync(tempWork, { recursive: true, mode: 0o700 });

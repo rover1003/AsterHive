@@ -179,9 +179,9 @@ export function checkpointTask(
   const now = Date.now();
   const inputKind = typeof input === 'object' && input !== null ? input.kind : undefined;
   const activityKind = isKeepalive ? 'keepalive' : (inputKind || 'milestone');
-  if ((task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout')
-      && !isKeepalive && activityKind !== 'error' && activityKind !== 'timeout') {
-    throw new HttpError(409, 'task execution failed; 确认工蜂停止后受控恢复');
+  if ((task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout' || task.lastActivityKind === 'environment_blocked')
+      && !isKeepalive && activityKind !== 'error' && activityKind !== 'timeout' && activityKind !== 'environment_blocked') {
+    throw new HttpError(409, 'task execution failed or environment blocked; 确认工蜂停止后受控恢复');
   }
 
   withWrite(ctx, isKeepalive ? 'task.keepalive' : 'task.checkpoint', () => {
@@ -296,8 +296,8 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   } else if (input.attempt !== undefined && input.attempt !== taskAttempt) {
     throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${input.attempt}`);
   }
-  if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout') {
-    throw new HttpError(409, 'task execution failed; 确认工蜂停止后受控恢复');
+  if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout' || task.lastActivityKind === 'environment_blocked') {
+    throw new HttpError(409, 'task execution failed or environment blocked; 确认工蜂停止后受控恢复');
   }
   // Review 泳道同样受 WIP 约束
   const board = getBoard(ctx, task.boardId);

@@ -6,6 +6,15 @@ import { HttpError } from './types.ts';
 import { getTask, getBoard, requireParticipant, type Task } from './tasks.ts';
 import type { Agent } from './agents.ts';
 import { withWrite, logEvent } from './write.ts';
+import {
+  EXECUTION_REPORT_FILENAME,
+  EXECUTION_REPORT_MAX_BYTES,
+  parseExecutionReport,
+  type ExecutionReport,
+} from '../../../packages/sdk/src/execution-report.ts';
+
+export { EXECUTION_REPORT_FILENAME, EXECUTION_REPORT_MAX_BYTES };
+
 
 // 证据文件分层存储（立项计划 §10）：
 // - 小文件（<= 512KiB）直接入库（SQLite BLOB，随库快照备份）
@@ -24,6 +33,7 @@ export interface EvidenceFile {
   note: string;
   uploadedBy: string;
   createdAt: number;
+  attempt?: number | null;
 }
 
 type EvidenceFileRow = {
@@ -39,6 +49,7 @@ type EvidenceFileRow = {
   note: string;
   uploaded_by: string;
   created_at: number;
+  attempt: number | null;
 };
 
 function rowToFile(r: EvidenceFileRow): EvidenceFile {
@@ -53,6 +64,7 @@ function rowToFile(r: EvidenceFileRow): EvidenceFile {
     note: r.note,
     uploadedBy: r.uploaded_by,
     createdAt: r.created_at,
+    attempt: r.attempt ?? null,
   };
 }
 
@@ -70,10 +82,16 @@ export function ensureEvidenceTable(ctx: Ctx): void {
       disk_path    TEXT,
       note         TEXT NOT NULL DEFAULT '',
       uploaded_by  TEXT NOT NULL,
-      created_at   INTEGER NOT NULL
+      created_at   INTEGER NOT NULL,
+      attempt      INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence_file (task_id);
   `);
+  try {
+    ctx.holder.db.exec('ALTER TABLE evidence_file ADD COLUMN attempt INTEGER;');
+  } catch {
+    /* 列已存在 */
+  }
 }
 
 // 文件名安全化：去路径分隔符与控制字符，防目录穿越；保留中文与常用符号
@@ -97,13 +115,39 @@ export function storeEvidenceFile(
   content: Uint8Array,
   note = '',
   expectedSha256 = '',
+  attempt?: number,
 ): EvidenceFile {
   ensureEvidenceTable(ctx);
   const task = getTask(ctx, taskId);
-  // worker 角色必须是该板参与者（与 repo-result 同门禁）；user/orchestrator 豁免
-  if (actor.role === 'worker') requireParticipant(ctx, task.boardId, actor);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+  let resolvedAttempt: number | null = null;
+  if (actor.role === 'worker') {
+    requireParticipant(ctx, task.boardId, actor);
+    if (task.assignee !== actor.id) {
+      throw new HttpError(403, `worker ${actor.id} is not the current assignee of task ${taskId}`);
+    }
+    if (task.lane !== 'InProgress') {
+      throw new HttpError(409, `task ${taskId} is not InProgress (current lane: ${task.lane})`);
+    }
+    const taskAttempt = task.attempt ?? 1;
+    if (taskAttempt > 1) {
+      if (attempt === undefined || Number.isNaN(attempt)) {
+        throw new HttpError(
+          409,
+          `stale or unversioned execution attempt: task ${taskId} has been re-dispatched (attempt ${taskAttempt}); request must include current attempt (upgrade worker SDK)`,
+        );
+      }
+      if (attempt !== taskAttempt) {
+        throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${attempt}`);
+      }
+    } else if (attempt !== undefined && !Number.isNaN(attempt) && attempt !== taskAttempt) {
+      throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${attempt}`);
+    }
+    resolvedAttempt = taskAttempt;
+  } else {
+    resolvedAttempt = attempt !== undefined && !Number.isNaN(attempt) ? attempt : (task.attempt ?? null);
+  }
   getBoard(ctx, task.boardId);
-
   const safeName = sanitizeFilename(filename);
   if (content.byteLength < 1) throw new HttpError(422, 'evidence file must not be empty');
   if (content.byteLength > EVIDENCE_MAX_BYTES) {
@@ -122,8 +166,8 @@ export function storeEvidenceFile(
     // 先插行拿 id，再决定落盘位置（disk 行的 disk_path 用 id 命名防冲突）
     const result = ctx.holder.db
       .prepare(
-        `INSERT INTO evidence_file (task_id, board_id, filename, size, sha256, storage, content, disk_path, note, uploaded_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO evidence_file (task_id, board_id, filename, size, sha256, storage, content, disk_path, note, uploaded_by, created_at, attempt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         taskId,
@@ -137,6 +181,7 @@ export function storeEvidenceFile(
         cleanNote,
         actor.id,
         now,
+        resolvedAttempt,
       ) as { lastInsertRowid: number | bigint };
     const rowId = Number(result.lastInsertRowid);
 
@@ -169,6 +214,7 @@ export function storeEvidenceFile(
       sha256,
       storage,
       by: actor.id,
+      attempt: resolvedAttempt,
     });
     return rowId;
   });
@@ -222,6 +268,7 @@ export function deleteEvidenceFile(ctx: Ctx, actor: Agent, taskId: string, fileI
   if (actor.role === 'worker') throw new HttpError(403, 'workers cannot delete evidence files');
   ensureEvidenceTable(ctx);
   const task: Task = getTask(ctx, taskId);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
   const file = getEvidenceFile(ctx, taskId, fileId);
   withWrite(ctx, 'task.evidence_deleted', () => {
     // 磁盘行先取回实际路径再删行
@@ -241,4 +288,62 @@ export function deleteEvidenceFile(ctx: Ctx, actor: Agent, taskId: string, fileI
       .run(JSON.stringify(evidence), Date.now(), taskId);
     logEvent(ctx, 'task.evidence_deleted', { taskId, fileId, by: actor.id });
   });
+}
+
+/**
+ * 检索并校验当前代次的执行报告：
+ * 必须由当前 assignee 上传、代次匹配、大小严格受限（<=256KiB）、schema 合法，
+ * 且当存在被审提交时核验 commitHash 一致性。
+ */
+export function findCurrentExecutionReport(
+  ctx: Ctx,
+  taskId: string,
+  assignee: string,
+  attempt: number,
+  expectedCommitHash?: string,
+): { report: ExecutionReport; file: EvidenceFile } | { error: string } {
+  ensureEvidenceTable(ctx);
+  const files = listEvidenceFiles(ctx, taskId);
+  const candidates = files
+    .filter(
+      (f) =>
+        f.filename === EXECUTION_REPORT_FILENAME &&
+        f.uploadedBy === assignee &&
+        f.attempt === attempt,
+    )
+    .sort((a, b) => b.id - a.id);
+
+  if (candidates.length === 0) {
+    return { error: `missing execution report for task ${taskId} attempt ${attempt} by ${assignee}` };
+  }
+
+  const latestFile = candidates[0];
+  if (latestFile.size > EXECUTION_REPORT_MAX_BYTES) {
+    return { error: `execution report file exceeds ${EXECUTION_REPORT_MAX_BYTES} bytes` };
+  }
+
+  const { content } = readEvidenceContent(ctx, taskId, latestFile.id);
+  const report = parseExecutionReport(content);
+  if (!report) {
+    return { error: `malformed execution report schema for task ${taskId}` };
+  }
+
+  if (report.taskId !== taskId) {
+    return { error: `report taskId ${report.taskId} does not match ${taskId}` };
+  }
+
+  if (report.attempt !== attempt) {
+    return { error: `report attempt ${report.attempt} does not match expected attempt ${attempt}` };
+  }
+
+  if (expectedCommitHash) {
+    if (!report.commitHash) {
+      return { error: `report missing commitHash for task ${taskId}; expected ${expectedCommitHash}` };
+    }
+    if (report.commitHash !== expectedCommitHash) {
+      return { error: `report commitHash ${report.commitHash} does not match reviewed head ${expectedCommitHash}` };
+    }
+  }
+
+  return { report, file: latestFile };
 }

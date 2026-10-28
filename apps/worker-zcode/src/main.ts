@@ -22,15 +22,30 @@ import {
   detectDeviceSpecs,
   type Task,
   type PendingMessage,
+  EXECUTION_REPORT_FILENAME,
+  EXECUTION_REPORT_MAX_BYTES,
+  serializeExecutionReport,
+  redactExecutionText,
+  type ExecutionReport,
+  type ExecutionCommand,
+  type ExecutionPreflightCheck,
 } from './sdk.ts';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canSubmitExecution, commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
+import { canSubmitExecution, commitWorkspace, prepareWorkspace, git, type PreparedWorkspace } from './workspace.ts';
 import { firstSkip, nextBoardsToPoll, pollNextDirectedTask } from './polling.ts';
+import {
+  runPreclaimPreflight,
+  checkNodePreflight,
+  checkGitPreflight,
+  checkShellPreflight,
+  runWorkspaceDependencyPreflight,
+} from './preflight.ts';
+import { runValidationCommands } from './verification.ts';
 import { TelemetryReporter } from './telemetry-reporter.ts';
 import { runCliExecutor } from './cli-runner.ts';
 import { runPiPrompt, type PiThinkingLevel } from './pi-executor.ts';
@@ -578,6 +593,16 @@ async function main(): Promise<void> {
       // 不再盲抢未指派公共池（worker.next 彻底废除，完全由主脑基于硬件与负载定向指派）。
       // 某板 403（非参与者）→ 该板本轮跳过，只 log 一次（Set 防刷屏）；下轮自然再试，
       // 参与者在页面里被勾上后无需任何处理即自动恢复。
+      // 领活前环境预检（Node、Git、Shell 探针）
+      const preclaim = await runPreclaimPreflight({
+        executor: detectExecutorKind(),
+        repoMode: true,
+      });
+      if (!preclaim.ok) {
+        log(`领活前环境预检未通过，本轮暂不领活：${preclaim.error}`);
+        return;
+      }
+
       let reworkNotes: string[] = [];
       let rpcStopBoard: string | null = null;
       const pollResult = await pollNextDirectedTask(decision.poll, {
@@ -656,6 +681,48 @@ async function main(): Promise<void> {
       }
       if (ws.cloned) log(`已 clone 项目工作区：${ws.dir}`);
       if (ws.pulled) log(`已同步远端（pull --rebase）：${ws.dir}`);
+      // 工作区依赖前置预检（npm package-lock.json 与 node_modules）
+      const depPreflight = await runWorkspaceDependencyPreflight(ws.dir);
+      if (!depPreflight.ok) {
+        const reason = `工作区依赖预检未通过：${depPreflight.error}；工作区已保留（${ws.dir}），现场可恢复，任务结果未上交。`;
+        log(`[${task.id}] ${reason}`);
+        await worker.checkpoint(task.id, {
+          note: reason,
+          kind: 'environment_blocked',
+          attempt: task.attempt,
+        });
+
+        const envReport: ExecutionReport = {
+          schemaVersion: 1,
+          taskId: task.id,
+          attempt: task.attempt ?? 1,
+          baseCommit: ws.baseCommit,
+          commitHash: ws.commitHash,
+          outcome: 'environment_blocked',
+          summary: reason,
+          startedAt: Date.now(),
+          finishedAt: Date.now(),
+          preflight: [
+            ...(preclaim.checks ?? []),
+            ...(depPreflight.check ? [depPreflight.check] : []),
+          ],
+          commands: [],
+        };
+        try {
+          const reportJson = serializeExecutionReport(envReport);
+          const reportBuf = Buffer.from(reportJson, 'utf8');
+          await worker.uploadEvidence(
+            task.id,
+            EXECUTION_REPORT_FILENAME,
+            reportBuf,
+            '任务执行与验收报告（环境受阻）',
+            task.attempt,
+          );
+        } catch (uploadErr) {
+          log('上传环境受阻报告失败（非致命）：', uploadErr instanceof Error ? uploadErr.message : uploadErr);
+        }
+        return;
+      }
 
       const cp1 = await worker.checkpoint(task.id, {
         note: reworkNotes.length ? '收到退回反馈，开始重做' : '开始执行',
@@ -723,7 +790,59 @@ async function main(): Promise<void> {
           : `执行器退出码 ${code}，任务结果未上交；工作区已保留（${ws.dir}），现场可恢复。`;
         await worker.checkpoint(task.id, { note: reason, kind: isTimeout ? 'timeout' : 'error', attempt: task.attempt });
         log(`${reason}；任务保持 InProgress 保留现场，等待干预`);
+
+        const execFailReport: ExecutionReport = {
+          schemaVersion: 1,
+          taskId: task.id,
+          attempt: task.attempt ?? 1,
+          baseCommit: ws.baseCommit,
+          commitHash: ws.commitHash,
+          outcome: 'execution_failed',
+          summary: reason,
+          startedAt: startTime,
+          finishedAt: Date.now(),
+          preflight: [
+            ...(preclaim.checks ?? []),
+            ...(depPreflight.check ? [depPreflight.check] : []),
+          ],
+          commands: [],
+        };
+        try {
+          const reportJson = serializeExecutionReport(execFailReport);
+          const reportBuf = Buffer.from(reportJson, 'utf8');
+          await worker.uploadEvidence(
+            task.id,
+            EXECUTION_REPORT_FILENAME,
+            reportBuf,
+            '任务执行报告（执行失败）',
+            task.attempt,
+          );
+        } catch (uploadErr) {
+          log('上传执行失败报告出错（非致命）：', uploadErr instanceof Error ? uploadErr.message : uploadErr);
+        }
         return;
+      }
+
+      // 显式验证计划执行：workspace.validationCommands
+      const validationCommands = Array.isArray((task.workspace as { validationCommands?: unknown })?.validationCommands)
+        ? (task.workspace as { validationCommands: string[] }).validationCommands
+        : [];
+      let verificationCommands: ExecutionCommand[] = [];
+      let verificationFailed = false;
+      let verificationFailureNote = '';
+
+      if (validationCommands.length > 0) {
+        log(`[${task.id}] 正在执行声明的验证命令（共 ${validationCommands.length} 条）...`);
+        const vResult = await runValidationCommands(validationCommands, ws.dir, {
+          log,
+          timeoutMs: CFG.taskTimeoutMs,
+        });
+        verificationCommands = vResult.commands;
+        if (!vResult.ok) {
+          verificationFailed = true;
+          verificationFailureNote = `验证命令执行失败（命令 "${vResult.failedCommand?.command}" 退出码 ${vResult.failedCommand?.exitCode}）：${vResult.failedCommand?.output.slice(-300)}`;
+          log(`[${task.id}] ${verificationFailureNote}`);
+        }
       }
 
       // 代码仓库任务必须有真实提交；明确标记的无代码任务进入人工验收。
@@ -739,8 +858,25 @@ async function main(): Promise<void> {
             evidence = (ws.changedFiles ?? []).map((p) => ({ path: p, machine: hostname() }));
             evidence.push({ path: `git:${ws.branch}@${commitHash}`, machine: hostname() });
           } else {
-            commitNote = '\n[workspace] 工作区无代码变更，作为探索/分析任务成果上交审核。';
-            log(`[${task.id}] 工作区未产生文件修改，作为探索/无代码任务交付成果进入 Review`);
+            // 没有产生新提交。检查是否是真实重做且上一轮已有 taskRef 提交（initialCommit 与 baseCommit 不同）
+            const isReworkWithPriorCommit = Boolean(
+              ws.initialCommit &&
+              ws.baseCommit &&
+              ws.initialCommit !== ws.baseCommit,
+            );
+            if (isReworkWithPriorCommit) {
+              const headHash = (await git(['rev-parse', 'HEAD'], ws.dir, '校验当前 HEAD 失败')).trim();
+              if (headHash === ws.initialCommit) {
+                commitHash = ws.initialCommit;
+                commitNote = `\n[workspace] 补验重做：保留并关联上一轮提交 ${ws.branch}@${commitHash}，上交补充验证报告。`;
+                log(`[${task.id}] 重做阶段无新增源码变更，复用上一轮提交 ${commitHash.slice(0, 8)} 作为代码凭据进入审核`);
+                evidence = [{ path: `git:${ws.branch}@${commitHash}`, machine: hostname() }];
+              }
+            }
+            if (!commitHash) {
+              commitNote = '\n[workspace] 工作区无代码变更，作为探索/分析任务成果上交审核。';
+              log(`[${task.id}] 工作区未产生文件修改，作为探索/无代码任务交付成果进入 Review`);
+            }
           }
         } catch (err) {
           commitFailed = true;
@@ -748,6 +884,43 @@ async function main(): Promise<void> {
           commitNote = `\n[workspace] 提交失败：${reason}`;
           log(`提交失败（现场已保留，不会上交）：${reason}`);
         }
+      }
+
+      if (verificationFailed) {
+        const reason = `任务验证命令未通过：${verificationFailureNote}；工作区 ${ws.dir} 已保留，现场可恢复。`;
+        await worker.checkpoint(task.id, { note: reason, kind: 'error', attempt: task.attempt });
+        log(`${reason}；任务保持 InProgress 保留现场，等待干预`);
+
+        const failReport: ExecutionReport = {
+          schemaVersion: 1,
+          taskId: task.id,
+          attempt: task.attempt ?? 1,
+          baseCommit: ws.baseCommit,
+          commitHash,
+          outcome: 'verification_failed',
+          summary: reason,
+          startedAt: startTime,
+          finishedAt: Date.now(),
+          preflight: [
+            ...(preclaim.checks ?? []),
+            ...(depPreflight.check ? [depPreflight.check] : []),
+          ],
+          commands: verificationCommands,
+        };
+        try {
+          const reportJson = serializeExecutionReport(failReport);
+          const reportBuf = Buffer.from(reportJson, 'utf8');
+          await worker.uploadEvidence(
+            task.id,
+            EXECUTION_REPORT_FILENAME,
+            reportBuf,
+            '任务执行与验收报告（验证失败）',
+            task.attempt,
+          );
+        } catch (uploadErr) {
+          log('上传验证失败报告出错（非致命）：', uploadErr instanceof Error ? uploadErr.message : uploadErr);
+        }
+        return;
       }
 
       const effectiveNoCode = noCode || (!commitHash && !commitFailed);
@@ -765,7 +938,48 @@ async function main(): Promise<void> {
         return;
       }
 
-      const summary = (stdout.trim().split('\n').slice(-6).join('\n') || '(无输出)') + commitNote;
+      const secretsToRedact: string[] = [];
+      if (CFG.piModel?.apiKey) secretsToRedact.push(CFG.piModel.apiKey);
+      const redactedStdout = redactExecutionText(stdout.trim(), secretsToRedact);
+      const boundedAnswer = redactedStdout.length > 4000
+        ? `${redactedStdout.slice(0, 2000)}\n\n... [中间输出已省略] ...\n\n${redactedStdout.slice(-1800)}`
+        : redactedStdout || '(无输出)';
+      const summary = `${boundedAnswer}${commitNote}`.slice(0, 5000);
+
+      // 上报 execution-report.json
+      const executionReport: ExecutionReport = {
+        schemaVersion: 1,
+        taskId: task.id,
+        attempt: task.attempt ?? 1,
+        baseCommit: ws.baseCommit,
+        commitHash,
+        outcome: 'completed',
+        summary: redactExecutionText(summary, secretsToRedact),
+        startedAt: startTime,
+        finishedAt: Date.now(),
+        preflight: [
+          ...(preclaim.checks ?? []),
+          ...(depPreflight.check ? [depPreflight.check] : []),
+        ],
+        commands: verificationCommands,
+      };
+
+      try {
+        const reportJson = serializeExecutionReport(executionReport);
+        const reportBuf = Buffer.from(reportJson, 'utf8');
+        const uploaded = await worker.uploadEvidence(
+          task.id,
+          EXECUTION_REPORT_FILENAME,
+          reportBuf,
+          '任务执行与验收报告',
+          task.attempt,
+        );
+        evidence.push({ path: EXECUTION_REPORT_FILENAME, machine: hostname(), note: `report-id:${uploaded.id}` });
+        log(`已上传任务执行与验收报告（${reportBuf.byteLength} 字节）`);
+      } catch (uploadErr) {
+        log('上传任务执行报告失败（不阻断交活，保留现场）：', uploadErr instanceof Error ? uploadErr.message : uploadErr);
+      }
+
       await worker.submit(task.id, summary, evidence, { noCode: effectiveNoCode, attempt: task.attempt });
       log(`已上交 ${task.id}，证据 ${evidence.length} 项`);
 

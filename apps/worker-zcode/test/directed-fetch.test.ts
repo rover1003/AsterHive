@@ -97,12 +97,13 @@ test('pollNextDirectedTask: 遇到 403 非参与者板时触发 onSkip403 并平
   const skippedBoards: string[] = [];
 
   const result = await pollNextDirectedTask(['b-forbidden', 'b-valid'], {
-    listMine: async (boardId) => {
+    listMine: async (boardId, lane) => {
       if (boardId === 'b-forbidden') {
         const err = new Error('Forbidden');
         Object.assign(err, { status: 403 });
         throw err;
       }
+      if (lane === 'InProgress') return [];
       return [readyTask];
     },
     claim: async (id) => ({ id, title: '有效任务' }),

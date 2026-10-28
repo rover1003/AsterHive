@@ -79,7 +79,7 @@ export async function pollNextDirectedTask<T extends { id: string }>(
       if (inProgress.length > 0) {
         const reworks = inProgress.filter((t) => {
           const task = t as { reviewStatus?: string; lastActivityKind?: string | null };
-          if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout') return false;
+          if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout' || task.lastActivityKind === 'environment_blocked' || task.reviewStatus === 'environment_blocked') return false;
           return channels.isRework ? channels.isRework(t) : task.reviewStatus === 'rework';
         });
         if (channels.checkGate) {

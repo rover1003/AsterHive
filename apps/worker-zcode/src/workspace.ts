@@ -68,7 +68,7 @@ interface GitResult {
 // 跑一条 git 命令（照 main.ts 的 spawn 包 Promise 风格）。
 // GIT_TERMINAL_PROMPT=0：headless worker 没人应答凭据交互，需要用户名/密码时让 git 快速失败
 // 而不是挂到任务超时——凭据本就应完全走设备自己的 git 配置（credential manager / ssh 等）。
-function runGit(args: string[], cwd: string): Promise<GitResult> {
+export function runGit(args: string[], cwd: string): Promise<GitResult> {
   return new Promise((res) => {
     const child = spawn('git', args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
     let stdout = '';
@@ -87,7 +87,7 @@ function tail(s: string, n = 200): string {
 }
 
 /** 跑 git 并要求成功；失败抛出带「人工处理提示 + stderr 尾部」的错误 */
-async function git(args: string[], cwd: string, hint: string): Promise<string> {
+export async function git(args: string[], cwd: string, hint: string): Promise<string> {
   const r = await runGit(args, cwd);
   if (r.code !== 0) {
     throw new Error(`git ${args[0]} 失败（${hint}，exit=${r.code}）：${tail(r.stderr)}`);
@@ -278,6 +278,8 @@ export function canSubmitExecution(input: {
   noCode?: boolean;
 }): boolean {
   if (input.exitCode !== 0 || input.commitFailed) return false;
+  if (input.noCode === true) return true;
+  if (!input.commitHash) return false;
   return true;
 }
 

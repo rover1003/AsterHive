@@ -48,7 +48,7 @@ export interface Task {
   workspace: Record<string, string>;
   files: string[];
   evidence: { path: string; machine?: string; note?: string }[];
-  reviewStatus: 'none' | 'pending' | 'reviewing' | 'passed' | 'rework' | 'blocked' | 'failed';
+  reviewStatus: 'none' | 'pending' | 'reviewing' | 'passed' | 'rework' | 'blocked' | 'failed' | 'environment_blocked' | 'needs_evidence';
   reviewAttempts: number;
   reviewReworks: number;
   reviewSummary: string;

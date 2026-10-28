@@ -26,6 +26,7 @@ import { createApp } from '../src/http.ts';
 import { listEvents } from '../src/write.ts';
 import { listMessages } from '../src/messages.ts';
 import { RepoManager } from '../src/repo-manager.ts';
+import { storeEvidenceFile } from '../src/evidence.ts';
 import { Brain } from '../src/brain.ts';
 import { PiRuntimeManager } from '../src/pi-runtime.ts';
 
@@ -345,6 +346,21 @@ async function prepareManagedSubmission(rig: ReturnType<typeof mkRig>, boardId: 
     writeFileSync(join(cloneDir, 'feature.txt'), 'expected text\n');
     git(['add', '-A'], cloneDir);
     git(['commit', '-q', '-m', `asterhive(${taskId}): add feature`], cloneDir);
+    const taskCommit = git(['rev-parse', 'HEAD'], cloneDir);
+    const report = {
+      schemaVersion: 1,
+      taskId,
+      attempt: 1,
+      commitHash: taskCommit,
+      outcome: 'completed',
+      summary: 'feature.txt contains expected text',
+      startedAt: Date.now() - 1000,
+      finishedAt: Date.now(),
+      preflight: [{ name: 'node', ok: true, detail: 'v24' }],
+      commands: [{ tool: 'bash', command: 'test', startedAt: 1, finishedAt: 2, exitCode: 0, output: 'ok', truncated: false }],
+    };
+    const reportBytes = Buffer.from(JSON.stringify(report), 'utf8');
+    storeEvidenceFile(rig.ctx, workerReg.agent, taskId, 'execution-report.json', reportBytes, 'report', '', 1);
     const bundle = join(root, 'result.bundle');
     git(['bundle', 'create', bundle, `asterhive/${taskId}`], cloneDir);
     const bytes = readFileSync(bundle);

@@ -3,6 +3,7 @@
 // 七个调用：register（一次性）/ next / claim / checkpoint / submit / release / heartbeat
 // 附：inbox / postMessage（聊天室）、getTask 与 getBoards / getBoard（看板元数据，含 repo）。
 
+export * from './execution-report.ts';
 import { createHash } from 'node:crypto';
 import { platform, arch, cpus, totalmem, freemem, loadavg, uptime } from 'node:os';
 
@@ -526,12 +527,13 @@ export class Worker {
   }
 
   /** 上传证据文件（小文件入库、大文件登记校验和；<= 50MiB） */
-  async uploadEvidence(taskId: string, filename: string, content: Uint8Array, note = ''): Promise<EvidenceFileInfo> {
+  async uploadEvidence(taskId: string, filename: string, content: Uint8Array, note = '', attempt?: number): Promise<EvidenceFileInfo> {
     const headers: Record<string, string> = {
       'content-type': 'application/octet-stream',
       'content-length': String(content.byteLength),
       'x-filename': encodeURIComponent(filename),
       'x-content-sha256': createHash('sha256').update(content).digest('hex'),
+      ...(attempt !== undefined ? { 'x-task-attempt': String(attempt) } : {}),
     };
     if (note) headers['x-note'] = encodeURIComponent(note);
     if (this.#token) headers.authorization = `Bearer ${this.#token}`;

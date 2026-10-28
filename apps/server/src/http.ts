@@ -806,8 +806,10 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     let note = rawNote;
     try { note = decodeURIComponent(rawNote); } catch { /* 原样使用 */ }
     const expectedSha = c.req.header('x-content-sha256') || '';
+    const rawAttempt = c.req.header('x-task-attempt') || c.req.query('attempt');
+    const attempt = rawAttempt !== undefined && rawAttempt !== '' ? Number(rawAttempt) : undefined;
     const buf = new Uint8Array(await c.req.arrayBuffer());
-    const file = storeEvidenceFile(ctx, actor, taskId, filename, buf, note, expectedSha);
+    const file = storeEvidenceFile(ctx, actor, taskId, filename, buf, note, expectedSha, attempt);
     return c.json({ file }, 201);
   });
 

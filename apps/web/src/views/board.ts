@@ -272,7 +272,7 @@ function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): str
     if (t.reviewStatus === 'none') {
       actions.push(`<button data-move="Done" class="primary">验收 Done</button>`);
       actions.push(`<button data-move="InProgress">退回执行</button>`);
-    } else if (t.reviewStatus === 'failed') {
+    } else if (t.reviewStatus === 'failed' || t.reviewStatus === 'environment_blocked' || t.reviewStatus === 'needs_evidence') {
       actions.push(`<button data-review-retry="1" class="primary">重试独立审核</button>`);
       actions.push(`<button data-move="Done">人工验收通过</button>`);
       actions.push(`<button data-move="InProgress">人工退回执行</button>`);
@@ -291,14 +291,14 @@ function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): str
   const workspace = Object.keys(t.workspace).length
     ? Object.entries(t.workspace).map(([k, v]) => `<div><span class="muted">${esc(k)}:</span> ${esc(String(v))}</div>`).join('')
     : '<span class="muted">未指定</span>';
-  const reviewSummary = t.reviewSummary && ['passed', 'rework', 'blocked', 'failed'].includes(t.reviewStatus)
+  const reviewSummary = t.reviewSummary && ['passed', 'rework', 'blocked', 'failed', 'environment_blocked', 'needs_evidence'].includes(t.reviewStatus)
     ? `<div class="field"><label>审核结论</label><div role="status">${esc(t.reviewSummary)}</div></div>`
     : '';
   const submitSummary = t.submitSummary
     ? `<div class="field"><label>Worker 提交摘要</label><div>${esc(t.submitSummary)}</div></div>`
     : '';
   const reviewState = t.reviewStatus !== 'none'
-    ? `<div class="field"><label>独立审核</label><div>${esc(({ pending: '排队中', reviewing: '审核中', passed: '已通过', rework: `退回重做 ${t.reviewReworks}/2`, blocked: '超过重做上限，等待人工仲裁', failed: '审核运行失败' } as Record<string, string>)[t.reviewStatus] ?? t.reviewStatus)}${t.reviewAttempts ? ` · 尝试 ${t.reviewAttempts}` : ''}</div></div>`
+    ? `<div class="field"><label>独立审核</label><div>${esc(({ pending: '排队中', reviewing: '审核中', passed: '已通过', rework: `退回重做 ${t.reviewReworks}/2`, blocked: '超过重做上限，等待人工仲裁', failed: '审核运行失败', environment_blocked: '执行环境受阻', needs_evidence: '等待补充验证材料' } as Record<string, string>)[t.reviewStatus] ?? t.reviewStatus)}${t.reviewAttempts ? ` · 尝试 ${t.reviewAttempts}` : ''}</div></div>`
     : '';
   const canInspectDiff = repoMode === 'managed' && (t.lane === 'Review' || t.lane === 'Done' || t.reviewStatus !== 'none');
   const diffPanel = canInspectDiff

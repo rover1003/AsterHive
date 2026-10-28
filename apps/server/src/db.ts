@@ -54,7 +54,7 @@ export function openDb(dataDir: string): DatabaseSync {
       reads            TEXT NOT NULL DEFAULT '[]',
       evidence         TEXT NOT NULL DEFAULT '[]',
       protected_paths  TEXT NOT NULL DEFAULT '[]',
-      review_status    TEXT NOT NULL DEFAULT 'none' CHECK (review_status IN ('none','pending','reviewing','passed','rework','blocked','failed')),
+      review_status    TEXT NOT NULL DEFAULT 'none' CHECK (review_status IN ('none','pending','reviewing','passed','rework','blocked','failed','environment_blocked','needs_evidence')),
       review_attempts  INTEGER NOT NULL DEFAULT 0,
       review_reworks   INTEGER NOT NULL DEFAULT 0,
       review_summary   TEXT NOT NULL DEFAULT '',
@@ -152,7 +152,7 @@ export function openDb(dataDir: string): DatabaseSync {
   }
   // 旧库升级：独立审核员 Profile 的任务审核状态与有限重做计数
   for (const [column, declaration] of [
-    ['review_status', "TEXT NOT NULL DEFAULT 'none' CHECK (review_status IN ('none','pending','reviewing','passed','rework','blocked','failed'))"],
+    ['review_status', "TEXT NOT NULL DEFAULT 'none' CHECK (review_status IN ('none','pending','reviewing','passed','rework','blocked','failed','environment_blocked','needs_evidence'))"],
     ['review_attempts', 'INTEGER NOT NULL DEFAULT 0'],
     ['review_reworks', 'INTEGER NOT NULL DEFAULT 0'],
     ['review_summary', "TEXT NOT NULL DEFAULT ''"],
@@ -171,6 +171,8 @@ export function openDb(dataDir: string): DatabaseSync {
       /* 列已存在 */
     }
   }
+  // 旧库升级：若 task 表包含旧的 review_status CHECK 约束，以安全事务重建表以放行 environment_blocked 与 needs_evidence
+  migrateTaskReviewStatusCheck(db);
   // 旧库升级：agent 档案（自报模型清单 JSON / 首选模型 / 备注）
   try {
     db.exec("ALTER TABLE agent ADD COLUMN models TEXT NOT NULL DEFAULT '[]'");
@@ -200,4 +202,57 @@ export function openDb(dataDir: string): DatabaseSync {
     /* 列已存在 */
   }
   return db;
+}
+
+export function migrateTaskReviewStatusCheck(db: DatabaseSync): void {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task'").get() as { sql?: string } | undefined;
+  if (!row?.sql || !row.sql.includes('review_status') || row.sql.includes('environment_blocked')) {
+    return;
+  }
+
+  const checkRegex = /CHECK\s*\(\s*review_status\s+IN\s*\(\s*'none'\s*,\s*'pending'\s*,\s*'reviewing'\s*,\s*'passed'\s*,\s*'rework'\s*,\s*'blocked'\s*,\s*'failed'\s*\)\s*\)/i;
+  if (!checkRegex.test(row.sql)) {
+    return;
+  }
+
+  // 获取所有关联的索引与触发器创建语句（排除 sqlite 内部自动生成的索引，如 sqlite_autoindex_*）
+  const relatedObjects = db
+    .prepare("SELECT name, type, sql FROM sqlite_master WHERE tbl_name = 'task' AND type IN ('index', 'trigger') AND sql IS NOT NULL")
+    .all() as { name: string; type: string; sql: string }[];
+
+  const newCheck = "CHECK (review_status IN ('none','pending','reviewing','passed','rework','blocked','failed','environment_blocked','needs_evidence'))";
+  let newSql = row.sql.replace(checkRegex, newCheck);
+  if (newSql === row.sql) {
+    throw new Error('failed to update review_status CHECK constraint in task table definition');
+  }
+
+  const tableCreateRegex = /^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"task"|`task`|\[task\]|task)\b/i;
+  if (!tableCreateRegex.test(newSql)) {
+    throw new Error(`cannot match CREATE TABLE statement for task in: ${row.sql}`);
+  }
+  newSql = newSql.replace(tableCreateRegex, 'CREATE TABLE task_migrating');
+
+  db.exec('PRAGMA foreign_keys = OFF;');
+  try {
+    db.exec('BEGIN IMMEDIATE;');
+    db.exec(newSql);
+    db.exec('INSERT INTO task_migrating SELECT * FROM task;');
+    db.exec('DROP TABLE task;');
+    db.exec('ALTER TABLE task_migrating RENAME TO task;');
+    for (const obj of relatedObjects) {
+      if (obj.sql) {
+        db.exec(obj.sql);
+      }
+    }
+    db.exec('COMMIT;');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK;');
+    } catch {
+      /* ignore rollback error */
+    }
+    throw new Error(`failed to migrate task table review_status check constraint: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON;');
+  }
 }

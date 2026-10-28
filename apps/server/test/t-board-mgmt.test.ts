@@ -258,24 +258,32 @@ test('参与限制: 空列表开放、列表外 worker 403、列表内正常、u
       body: JSON.stringify({ assignee: orch.agent.id, content: '@brain-a 主脑自留' }),
     });
     assert.equal(res.status, 201, 'orchestrator 被派不受参与限制');
+    // 新建 T4 留在 Ready，用于后续参与限制验证（避免 InProgress 锁优先拦截）
+    res = await app.request('/boards/b/tasks', {
+      method: 'POST',
+      headers: JSON_H,
+      body: JSON.stringify({ id: 'T4', title: '卡4', lane: 'Ready' }),
+    });
+    assert.equal(res.status, 201);
 
     // dispatch 给列表外 worker → 422
-    res = await app.request('/tasks/T1/dispatch', {
+    res = await app.request('/tasks/T4/dispatch', {
       method: 'POST',
       headers: H(orch.token),
-      body: JSON.stringify({ assignee: 'bee2', content: '@bee2 请领取 T1' }),
+      body: JSON.stringify({ assignee: 'bee2', content: '@bee2 请领取 T4' }),
     });
     assert.equal(res.status, 422, 'dispatch 给列表外 worker 被拒');
     err = (await res.json()) as { error: string };
     assert.match(err.error, /assignee not a participant/);
 
     // dispatch 给列表内 worker → 201
-    res = await app.request('/tasks/T1/dispatch', {
+    res = await app.request('/tasks/T4/dispatch', {
       method: 'POST',
       headers: H(orch.token),
-      body: JSON.stringify({ assignee: 'bee1', content: '@bee1 请领取 T1' }),
+      body: JSON.stringify({ assignee: 'bee1', content: '@bee1 请领取 T4' }),
     });
     assert.equal(res.status, 201, 'dispatch 给列表内 worker 放行');
+    // T4 已验证列表外 422、列表内 201；T1 InProgress 由 orchestrator 自留，不再验证 T1 参与限制
   } finally {
     rig.cleanup();
   }

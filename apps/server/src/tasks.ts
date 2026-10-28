@@ -1,6 +1,8 @@
 import type { Ctx } from './types.ts';
 import { HttpError, assertNoMojibake } from './types.ts';
 import type { SQLInputValue } from 'node:sqlite';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import { withWrite, logEvent } from './write.ts';
 import { messageInner } from './messages.ts';
 import { getAgent, type Agent } from './agents.ts';
@@ -75,7 +77,7 @@ export interface Task {
   evidence: { path: string; machine?: string; note?: string }[];
   protectedPaths: string[];
   requirements: TaskRequirements;
-  reviewStatus: 'none' | 'pending' | 'reviewing' | 'passed' | 'rework' | 'blocked' | 'failed';
+  reviewStatus: 'none' | 'pending' | 'reviewing' | 'passed' | 'rework' | 'blocked' | 'failed' | 'environment_blocked' | 'needs_evidence';
   reviewAttempts: number;
   reviewReworks: number;
   reviewSummary: string;
@@ -173,7 +175,7 @@ export function computeTaskProgress(
   let status: TaskProgress['status'];
   let errorNote: string | null = null;
 
-  if (lastActivityKind === 'error' || lastActivityKind === 'timeout') {
+  if (lastActivityKind === 'error' || lastActivityKind === 'timeout' || lastActivityKind === 'environment_blocked') {
     status = 'failed';
     if (ctx && r.id) {
       try {
@@ -760,8 +762,11 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
   if (laneChanges) {
     if (laneChanges.to === 'Done' && getBoard(ctx, row.board_id).repoMode === 'managed') {
       if (row.lane !== 'Review') throw new HttpError(409, '托管任务须从 Review 完成验收');
-      if (!options?.manualAcceptance && !options?.integratedManagedCode) {
-        throw new HttpError(409, '托管任务须经受控验收或代码合并；请使用人工验收接口');
+      let workspace: Record<string, unknown> = {};
+      try { workspace = JSON.parse(row.workspace) as Record<string, unknown>; } catch {}
+      const isNoCode = workspace.noCode === true;
+      if (!options?.integratedManagedCode && !(options?.manualAcceptance && isNoCode)) {
+        throw new HttpError(409, '托管代码任务须经受控代码合并；仅无代码任务允许免合并人工验收');
       }
     }
     // 启用独立审核时，失败或熔断的审核任务不能经普通 lane patch 绕过审核。
@@ -871,7 +876,9 @@ export async function returnTaskFromReview(
 
     return withWrite(ctx, 'task.reviewReturn', () => {
       const now = Date.now();
-      const nextReworks = (task.reviewReworks ?? 0) + 1;
+      const isEvidenceOrEnvWait = task.reviewStatus === 'needs_evidence' || task.reviewStatus === 'environment_blocked';
+      const nextReworks = isEvidenceOrEnvWait ? (task.reviewReworks ?? 0) : (task.reviewReworks ?? 0) + 1;
+      const activityKind = 'rework';
       const res = ctx.holder.db
         .prepare(
           `UPDATE task
@@ -883,12 +890,12 @@ export async function returnTaskFromReview(
                attempt = attempt + 1,
                last_activity_at = ?,
                last_real_activity_at = ?,
-               last_activity_kind = 'rework',
+               last_activity_kind = ?,
                last_progress_at = ?,
                updated_at = ?
            WHERE id = ? AND lane = 'Review' AND status = 'active'`,
         )
-        .run(nextReworks, cleanReason, targetAssignee, now, now, now, now, id);
+        .run(nextReworks, cleanReason, targetAssignee, now, now, activityKind, now, now, id);
 
       if (Number(res.changes) !== 1) {
         throw new HttpError(409, `task ${id} state changed concurrently`);
@@ -901,13 +908,17 @@ export async function returnTaskFromReview(
         assignee: targetAssignee,
         reason: cleanReason,
         reworks: nextReworks,
+        preservedBudget: isEvidenceOrEnvWait,
       });
       logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'InProgress', by: actor.id });
+      const returnKindText = isEvidenceOrEnvWait
+        ? (task.reviewStatus === 'needs_evidence' ? '退回补充验证材料（不计入代码重做次数）' : '环境恢复后重新执行（不计入代码重做次数）')
+        : '退回重做';
       messageInner(ctx, {
         boardId: task.boardId,
         author: actor.id,
         kind: 'intervention',
-        content: `@${targetAssignee} ${id} 已退回重做：\n\n${cleanReason}`,
+        content: `@${targetAssignee} ${id} ${returnKindText}：\n\n${cleanReason}`,
       });
       return getTask(ctx, id);
     });
@@ -935,8 +946,8 @@ export async function finalizeTaskReview(
   ctx: Ctx,
   actor: Agent,
   id: string,
-  result: { verdict: 'pass' | 'reject'; summary: string },
-  opts: { maxReworks?: number; integrated?: boolean } = {},
+  result: { verdict: 'pass' | 'reject' | 'environment_blocked' | 'needs_evidence'; summary: string },
+  opts: { maxReworks?: number; integrated?: boolean; attempt?: number; head?: string } = {},
 ): Promise<Task> {
   if (actor.role !== 'orchestrator' && actor.role !== 'user') {
     throw new HttpError(403, 'only orchestrator/user may finalize task review');
@@ -945,6 +956,9 @@ export async function finalizeTaskReview(
   if (task.status === 'cancelled') throw new HttpError(409, `task ${id} is cancelled`);
   if (task.lane !== 'Review' || task.reviewStatus !== 'reviewing') {
     throw new HttpError(409, `task ${id} is not being reviewed`);
+  }
+  if (opts.attempt !== undefined && (task.attempt ?? 1) !== opts.attempt) {
+    throw new HttpError(409, `task ${id} attempt changed concurrently: expected ${opts.attempt}, got ${task.attempt}`);
   }
   const maxReworks = opts.maxReworks ?? 2;
   if (result.verdict === 'pass' && !opts.integrated) {
@@ -958,6 +972,21 @@ export async function finalizeTaskReview(
     if (current.status === 'cancelled') throw new HttpError(409, `task ${id} is cancelled`);
     if (current.lane !== 'Review' || current.reviewStatus !== 'reviewing') {
       throw new HttpError(409, `task ${id} is not being reviewed`);
+    }
+    if (opts.attempt !== undefined && (current.attempt ?? 1) !== opts.attempt) {
+      throw new HttpError(409, `task ${id} attempt changed concurrently: expected ${opts.attempt}, got ${current.attempt}`);
+    }
+    if (opts.head !== undefined) {
+      const board = getBoard(ctx, current.boardId);
+      if (board.repoMode === 'managed') {
+        const repo = join(ctx.cfg.dataDir, 'repos', `${board.id}.git`);
+        const targetRef = `refs/asterhive/tasks/${id}`;
+        const headRes = spawnSync('git', ['rev-parse', targetRef], { cwd: repo, encoding: 'utf8' });
+        const currentHead = headRes.status === 0 ? (headRes.stdout ?? '').trim() : null;
+        if (currentHead && currentHead !== opts.head) {
+          throw new HttpError(409, `task ${id} head changed concurrently: expected ${opts.head}, got ${currentHead}`);
+        }
+      }
     }
     return withWrite(ctx, 'task.reviewFinalize', () => {
       const now = Date.now();
@@ -979,6 +1008,34 @@ export async function finalizeTaskReview(
           content: `@${userHandle} ${id} 独立审核通过，变更已合并并移入 Done。\n\n${summary}`,
         });
         unlockDependents(ctx, id);
+      } else if (result.verdict === 'environment_blocked') {
+        const res = ctx.holder.db
+          .prepare(
+            "UPDATE task SET review_status='environment_blocked', review_summary=?, last_activity_at=?, updated_at=? WHERE id=? AND lane='Review' AND status='active'",
+          )
+          .run(summary, now, now, id);
+        if (Number(res.changes) !== 1) throw new HttpError(409, `task ${id} state changed concurrently`);
+        logEvent(ctx, 'task.review_environment_blocked', { taskId: id, boardId: current.boardId, reworks: current.reviewReworks, summary });
+        messageInner(ctx, {
+          boardId: current.boardId,
+          author: actor.id,
+          kind: 'intervention',
+          content: `@${userHandle} @${current.assignee} ${id} 独立审核判定执行环境受阻，保留在 Review 泳道，不计入代码重做次数。\n\n${summary}`,
+        });
+      } else if (result.verdict === 'needs_evidence') {
+        const res = ctx.holder.db
+          .prepare(
+            "UPDATE task SET review_status='needs_evidence', review_summary=?, last_activity_at=?, updated_at=? WHERE id=? AND lane='Review' AND status='active'",
+          )
+          .run(summary, now, now, id);
+        if (Number(res.changes) !== 1) throw new HttpError(409, `task ${id} state changed concurrently`);
+        logEvent(ctx, 'task.review_needs_evidence', { taskId: id, boardId: current.boardId, reworks: current.reviewReworks, summary });
+        messageInner(ctx, {
+          boardId: current.boardId,
+          author: actor.id,
+          kind: 'intervention',
+          content: `@${userHandle} @${current.assignee} ${id} 独立审核判定缺少必要执行证据，保留在 Review 泳道，不计入代码重做次数。\n\n${summary}`,
+        });
       } else if (current.reviewReworks < maxReworks) {
         const nextReworks = current.reviewReworks + 1;
         const res = ctx.holder.db
@@ -1044,7 +1101,7 @@ export function retryTaskReview(ctx: Ctx, actor: Agent, taskId: string): Task {
   if (actor.role !== 'orchestrator' && actor.role !== 'user') throw new HttpError(403, 'only orchestrator/user may retry a review');
   const task = getTask(ctx, taskId);
   if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
-  if (task.lane !== 'Review' || task.reviewStatus !== 'failed') throw new HttpError(409, 'only failed Review tasks can be retried');
+  if (task.lane !== 'Review' || !['failed', 'environment_blocked', 'needs_evidence'].includes(task.reviewStatus)) throw new HttpError(409, 'only failed, environment_blocked, or needs_evidence Review tasks can be retried');
   const repoMode = getBoard(ctx, task.boardId).repoMode;
   const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
   let enabled = false;

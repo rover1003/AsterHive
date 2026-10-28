@@ -58,7 +58,13 @@ export interface PiRunResult {
 interface PiSessionLike {
   prompt(input: string): Promise<unknown>;
   abort(): Promise<unknown> | unknown;
+  dispose?: () => void;
   messages?: unknown[];
+  agent?: {
+    state?: {
+      errorMessage?: string;
+    };
+  };
 }
 
 // 测试注入：替换 Pi 模块加载（不触真实 SDK）
@@ -199,11 +205,14 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
     modelRuntime,
     thinkingLevel,
     resourceLoader: workerResourceLoader,
-    settingsManager: pi.SettingsManager.inMemory({}),
+    settingsManager: pi.SettingsManager.inMemory(
+      process.platform === 'win32' ? { defaultTools: ['-bash', '+powershell'] } : {},
+    ),
     sessionManager: pi.SessionManager.inMemory(cwd), // 一次性会话：随卡结束即弃
     // 注意：不传 noTools——工蜂保留 read/bash/edit/write 等全部执行面
     customTools: [checkpointTool],
   });
+  const sessionHandle = session as unknown as PiSessionLike;
 
   const seenToolStarts = new Set<string>();
   let unsubscribe: (() => void) | undefined;
@@ -289,7 +298,30 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
 
   try {
     // 真实 await 原始 prompt 直到真正 settled；绝不提前 fake-resolve 退出
-    await (session as PiSessionLike).prompt(prompt);
+    await sessionHandle.prompt(prompt);
+    const agentError = sessionHandle.agent?.state?.errorMessage;
+    if (agentError) {
+      return {
+        stdout: `[pi-executor] 模型端点错误: ${agentError}`,
+        code: 1,
+      };
+    }
+
+    const msgs = ((session as PiSessionLike).messages ?? []) as Array<Record<string, unknown>>;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const raw = msgs[i];
+      const msg = ((raw?.message ?? raw) || {}) as { role?: string; stopReason?: string; errorMessage?: string };
+      if (msg.role === 'assistant') {
+        if (msg.stopReason === 'error' || msg.errorMessage) {
+          const errDetail = msg.errorMessage || `stopReason: ${msg.stopReason}`;
+          return {
+            stdout: `[pi-executor] 模型执行异常: ${errDetail}`,
+            code: 1,
+          };
+        }
+        break;
+      }
+    }
 
     const text = lastAssistantText(session as PiSessionLike);
     if (aborted) {
@@ -313,5 +345,10 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
   } finally {
     unsubscribe?.();
     clearTimeout(timer);
+    try {
+      sessionHandle.dispose?.();
+    } catch {
+      /* ignore */
+    }
   }
 }

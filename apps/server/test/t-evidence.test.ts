@@ -7,6 +7,7 @@ import { mkRig } from './helpers.ts';
 import { createApp } from '../src/http.ts';
 import { registerAgent } from '../src/agents.ts';
 import { createBoard, createTask, setParticipants, getTask } from '../src/tasks.ts';
+import { claimTask } from '../src/verbs.ts';
 import { listEvents } from '../src/write.ts';
 import { EVIDENCE_INLINE_LIMIT, EVIDENCE_MAX_BYTES } from '../src/evidence.ts';
 
@@ -80,7 +81,8 @@ test('T15 证据上传: 大文件落数据卷磁盘、读回一致、删除清�
     createBoard(rig.ctx, { id: 'b-big', name: 'Big Evidence' });
     const { agent: worker, token: workerToken } = registerAgent(rig.ctx, { name: 'Bee', handle: 'bee-ev' });
     setParticipants(rig.ctx, 'b-big', [worker.id]);
-    createTask(rig.ctx, 'b-big', { id: 'BIG-2', title: '大文件任务', lane: 'Ready' });
+    createTask(rig.ctx, 'b-big', { id: 'BIG-2', title: '大文件任务', lane: 'Ready', assignee: worker.id });
+    claimTask(rig.ctx, worker, 'BIG-2');
 
     const app = createApp(rig.ctx);
     // 512KiB < size <= 50MiB → 磁盘
@@ -95,6 +97,7 @@ test('T15 证据上传: 大文件落数据卷磁盘、读回一致、删除清�
         'content-type': 'application/octet-stream',
         'x-filename': 'big.bin',
         'x-content-sha256': sha,
+        'x-task-attempt': '1',
       },
       body: big as unknown as BodyInit,
     });
