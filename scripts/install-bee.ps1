@@ -358,12 +358,13 @@ $startCmd = Join-Path $BeeHome 'start-worker.cmd'
 $nodeBinDir = Split-Path $NodeExe
 $extraDirs = @($nodeBinDir, $GitCmdDir) | Where-Object { $_ -and (Test-Path $_) }
 $pathPrefix = if ($extraDirs.Count -gt 0) { "set `"PATH=$($extraDirs -join ';');%PATH%`"`n" } else { "" }
-$cmdContent = @"
-@echo off
-$pathPrefix`cd /d "$AppDir"
-"$NodeExe" --experimental-strip-types "$workerMain" >> "$BeeHome\worker.log" 2>&1
-"@
-[System.IO.File]::WriteAllText($startCmd, $cmdContent, [System.Text.Encoding]::Default)
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$cmdContent = "@echo off`r`n" +
+  "chcp 65001 >nul`r`n" +
+  $pathPrefix +
+  "cd /d `"$AppDir`"`r`n" +
+  "`"$NodeExe`" --experimental-strip-types `"$workerMain`" >> `"$BeeHome\worker.log`" 2>&1`r`n"
+[System.IO.File]::WriteAllText($startCmd, $cmdContent, $utf8NoBom)
 
 # ---- 7. 常驻化：首选计划任务；权限受限时自动降级为当前用户启动项（零提权要求） ----
 $scheduledOk = $false
