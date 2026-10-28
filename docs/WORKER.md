@@ -253,7 +253,7 @@ Windows、Linux 和 macOS 的 `install-bee` 一键安装/升级脚本提供思�
 
 | 阶段 | 动作 |
 |---|---|
-| 领取 | 检查指派给自己的任务（退回重做或 Ready），调用 `claim` 认领并准备工作区：repo 看板 clone/pull --rebase + 切任务分支；无 repo 建一次性 `work/<任务号>` 目录 |
+| 领取 | 检查指派给自己的任务（退回重做或 Ready），调用 `claim` 认领并准备工作区：repo 看板 clone/pull --rebase + 切任务分支；无 repo 建一次性 `work/<任务号>` 目录。工作区准备失败时，携带当前执行轮次上报错误，保留任务和现场，不自动释放或重派 |
 | 开工 | checkpoint("开始执行")——**checkpoint 是双向同步点**：响应带回自上次以来 @ 本 worker 的消息，用户/主脑的干预直达 |
 | 执行与保活 | 运行执行内核。守护进程每分钟发送带有 `isKeepalive: true` 的保活心跳维持存活；模型通过 `hive_checkpoint` 主动汇报明确里程碑，真实推进 `lastActivityAt` 与 `lastProgressAt`（保活与真实进展分离） |
 | 异常/超时 | 超时或异常时保留工作区与现场，上报 `kind: 'error'` 或 `'timeout'` 的 checkpoint 明确记录可恢复现场，任务保持 InProgress 并由看板雷达预警，避免盲目重派与丢失现场 |

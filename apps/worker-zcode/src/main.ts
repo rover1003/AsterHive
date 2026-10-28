@@ -656,10 +656,9 @@ async function main(): Promise<void> {
         const reason = err instanceof Error ? err.message : String(err);
         log(`工作区准备失败：${reason}`);
         try {
-          await worker.checkpoint(task.id, `工作区准备失败：${reason}`);
-          await worker.release(task.id, `工作区准备失败：${reason}`);
+          await worker.checkpoint(task.id, { note: `工作区准备失败：${reason}`, kind: 'error', attempt: task.attempt });
         } catch (reportErr) {
-          log('失败上报/释放出错：', reportErr instanceof Error ? reportErr.message : reportErr);
+          log('失败上报出错：', reportErr instanceof Error ? reportErr.message : reportErr);
         }
         return;
       }
