@@ -270,15 +270,15 @@ export async function prepareWorkspace(opts: PrepareWorkspaceOptions): Promise<P
   return { dir, mode: 'repo', taskId: opts.taskId, attempt: opts.attempt, branch, baseCommit, cloned, pulled, push: opts.push, log };
 }
 
-/** Execution succeeded; code work additionally needs a stored commit before it may be submitted. */
+/** Execution succeeded; failure exits (exitCode !== 0) or git commit errors block submission; cleanly executed exploratory work without file changes can be submitted as noCode. */
 export function canSubmitExecution(input: {
   exitCode: number | null;
   commitHash?: string;
   commitFailed?: boolean;
-  noCode: boolean;
+  noCode?: boolean;
 }): boolean {
   if (input.exitCode !== 0 || input.commitFailed) return false;
-  return input.noCode || Boolean(input.commitHash);
+  return true;
 }
 
 /** 任务结束后提交成果（repo/managed 模式）：有变更才 commit，返回 hash；无变更返回 undefined。永不自动 push 除非 ws.push */
@@ -318,7 +318,6 @@ export async function commitWorkspace(ws: PreparedWorkspace, message: string): P
     ws.changedFiles = changed;
   }
 
-  ws.commitHash = hash;
   log(`已确认提交 ${hash.slice(0, 10)}（${ws.changedFiles?.length ?? 0} 个文件）到分支 ${branch}`);
 
   // managed 模式：打包当前任务分支并回传给服务器
@@ -333,6 +332,7 @@ export async function commitWorkspace(ws: PreparedWorkspace, message: string): P
       log(`正在上传任务 ${ws.taskId} 的结果 bundle（${buf.byteLength} 字节）...`);
       const res = await ws.worker.uploadTaskResult(ws.taskId, buf, sha256, ws.attempt);
       log(`任务结果已存入服务器仓库：${res.taskRef}@${res.headCommit.slice(0, 8)}`);
+      ws.commitHash = hash;
       return hash;
     } finally {
       rmSync(tempBundle, { force: true });
@@ -344,5 +344,6 @@ export async function commitWorkspace(ws: PreparedWorkspace, message: string): P
     if (p.code === 0) log(`已推送分支 ${branch} → origin`);
     else log(`push 失败（成果仍在本地工作区，可稍后手动推送）：${tail(p.stderr)}`);
   }
+  ws.commitHash = hash;
   return hash;
 }

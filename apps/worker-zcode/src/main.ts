@@ -739,7 +739,8 @@ async function main(): Promise<void> {
             evidence = (ws.changedFiles ?? []).map((p) => ({ path: p, machine: hostname() }));
             evidence.push({ path: `git:${ws.branch}@${commitHash}`, machine: hostname() });
           } else {
-            commitNote = '\n[workspace] 工作区无文件变更，未产生提交';
+            commitNote = '\n[workspace] 工作区无代码变更，作为探索/分析任务成果上交审核。';
+            log(`[${task.id}] 工作区未产生文件修改，作为探索/无代码任务交付成果进入 Review`);
           }
         } catch (err) {
           commitFailed = true;
@@ -749,22 +750,23 @@ async function main(): Promise<void> {
         }
       }
 
+      const effectiveNoCode = noCode || (!commitHash && !commitFailed);
       if ((ws.mode === 'repo' || ws.mode === 'managed') && !canSubmitExecution({
         exitCode: code,
         commitHash,
         commitFailed,
-        noCode,
+        noCode: effectiveNoCode,
       })) {
         const reason = commitFailed
           ? `代码提交失败，任务结果未上交；工作区 ${ws.dir} 已保留，现场可恢复。`
-          : `代码任务没有产生可回传的提交。若该卡确为无代码任务，请在建卡时设置 workspace.noCode=true；工作区 ${ws.dir} 已保留，现场可恢复。`;
+          : `任务执行异常中止（exitCode=${code}），工作区 ${ws.dir} 已保留，现场可恢复。`;
         await worker.checkpoint(task.id, { note: reason, kind: 'error', attempt: task.attempt });
         log(`${reason}；任务保持 InProgress 保留现场，等待干预`);
         return;
       }
 
       const summary = (stdout.trim().split('\n').slice(-6).join('\n') || '(无输出)') + commitNote;
-      await worker.submit(task.id, summary, evidence, { noCode, attempt: task.attempt });
+      await worker.submit(task.id, summary, evidence, { noCode: effectiveNoCode, attempt: task.attempt });
       log(`已上交 ${task.id}，证据 ${evidence.length} 项`);
 
       // managed 模式：成功交活后销毁本机临时目录

@@ -760,11 +760,8 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
   if (laneChanges) {
     if (laneChanges.to === 'Done' && getBoard(ctx, row.board_id).repoMode === 'managed') {
       if (row.lane !== 'Review') throw new HttpError(409, '托管任务须从 Review 完成验收');
-      if (getTask(ctx, id).workspace.noCode !== true && !options?.integratedManagedCode) {
-        throw new HttpError(409, '托管代码任务须先合并任务成果；请使用人工验收接口');
-      }
-      if (getTask(ctx, id).workspace.noCode === true && !options?.manualAcceptance) {
-        throw new HttpError(409, '托管无代码任务须经人工验收；请使用人工验收接口');
+      if (!options?.manualAcceptance && !options?.integratedManagedCode) {
+        throw new HttpError(409, '托管任务须经受控验收或代码合并；请使用人工验收接口');
       }
     }
     // 启用独立审核时，失败或熔断的审核任务不能经普通 lane patch 绕过审核。

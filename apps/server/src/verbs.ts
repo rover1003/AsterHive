@@ -308,11 +308,7 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   if (reviewCount.n >= reviewLimit) {
     throw new HttpError(409, `WIP limit reached for Review on board ${task.boardId} (limit ${reviewLimit})`);
   }
-  const noCodeAuthorized = task.workspace.noCode === true;
-  const noCode = noCodeAuthorized;
-  if (input.noCode === true && !noCodeAuthorized) {
-    throw new HttpError(409, 'no-code submission is not authorized by this task; set workspace.noCode=true when creating a no-code task');
-  }
+  const noCode = input.noCode === true || task.workspace.noCode === true;
   const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
   let reviewerEnabled = false;
   try {

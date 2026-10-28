@@ -150,13 +150,13 @@ test('Reviewer: managed no-code submission remains available for manual review w
     assert.equal(submitted.reviewStatus, 'none', 'no-code work must not be sent to the diff reviewer');
     assert.equal(submitted.submitSummary, '调查结论与来源已记录。');
     assert.ok(!listEvents(rig.ctx, { type: 'task.review_queued', limit: 10 }).some((e) => e.payload.taskId === 'REV-20'));
-    assert.equal(updateTask(rig.ctx, ensureBrainAgent(rig.ctx), 'REV-20', { lane: 'Done' }).lane, 'Done', 'manual review can explicitly accept no-code work');
+    assert.equal(updateTask(rig.ctx, ensureBrainAgent(rig.ctx), 'REV-20', { lane: 'Done' }, { manualAcceptance: true }).lane, 'Done', 'manual review can explicitly accept no-code work');
 
-    createTask(rig.ctx, 'research-review', { id: 'REV-22', title: 'Code task', lane: 'Ready', assignee: 'research-worker' });
+    createTask(rig.ctx, 'research-review', { id: 'REV-22', title: 'Exploratory task', lane: 'Ready', assignee: 'research-worker' });
     claimTask(rig.ctx, worker, 'REV-22');
-    assert.throws(() => submitTask(rig.ctx, worker, 'REV-22', { summary: 'not code', noCode: true }), /not authorized/);
-    assert.equal(getTask(rig.ctx, 'REV-22').lane, 'InProgress');
-
+    const submittedExploratory = submitTask(rig.ctx, worker, 'REV-22', { summary: '探索排查结论已完成输出', noCode: true });
+    assert.equal(submittedExploratory.lane, 'Review', '未提前设置 noCode 的探索任务以无代码提交时正常进入 Review');
+    assert.equal(submittedExploratory.reviewStatus, 'none');
   } finally { rig.cleanup(); }
 });
 

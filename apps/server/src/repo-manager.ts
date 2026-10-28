@@ -530,7 +530,13 @@ export class RepoManager {
       if (task.status !== 'active' || task.lane !== 'Review') throw new HttpError(409, '任务不在待验收状态');
       if (task.reviewStatus === 'reviewing') throw new HttpError(409, '独立审核正在进行，请等待审核结束');
       const board = getBoard(this.#ctx, task.boardId);
-      const mergedCommit = board.repoMode === 'managed' && task.workspace.noCode !== true
+      const repo = this.repoPath(board.id);
+      const targetRef = `refs/asterhive/tasks/${task.id}`;
+      const hasTaskRef = board.repoMode === 'managed' && existsSync(repo)
+        ? (await runGit(['rev-parse', '--verify', targetRef], repo)).code === 0
+        : false;
+      const shouldIntegrate = board.repoMode === 'managed' && task.workspace.noCode !== true && hasTaskRef;
+      const mergedCommit = shouldIntegrate
         ? (await this.#integrateTask(task.boardId, task.id)).mergedCommit
         : null;
       const done = updateTask(this.#ctx, actor, task.id, { lane: 'Done' }, { integratedManagedCode: mergedCommit !== null, manualAcceptance: true });
