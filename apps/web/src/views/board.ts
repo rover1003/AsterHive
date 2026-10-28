@@ -45,9 +45,9 @@ function requestRecoveryCredential(): Promise<string | null> {
     dialog.className = 'recovery-dialog';
     dialog.setAttribute('aria-labelledby', 'recovery-dialog-title');
     dialog.innerHTML = `<form method="dialog">
-      <h3 id="recovery-dialog-title">管理员凭据</h3>
-      <p class="muted">仅用于本次受控解除占用，不会保存在浏览器中。</p>
-      <div class="field"><label for="recovery-token">管理员恢复凭据</label><input id="recovery-token" type="password" autocomplete="off" required /></div>
+      <h3 id="recovery-dialog-title">受控恢复密码</h3>
+      <p class="muted">在「设置」页配置的受控恢复密码。仅用于本次解除占用，不会保存在浏览器中。</p>
+      <div class="field"><label for="recovery-token">受控恢复密码</label><input id="recovery-token" type="password" autocomplete="off" placeholder="在设置页设置的恢复密码" required /></div>
       <div class="recovery-dialog-actions"><button type="button" data-recovery-cancel>取消</button><button class="primary" value="confirm">确认</button></div>
     </form>`;
     document.body.append(dialog);

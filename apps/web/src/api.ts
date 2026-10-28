@@ -27,6 +27,11 @@ export interface TaskProgress {
   workerLastSeenAt: number | null;
   status: TaskProgressStatus;
 }
+export interface AdminRecoverySettings {
+  configured: boolean;
+  updatedAt: number | null;
+}
+
 
 export interface Task {
   id: string;

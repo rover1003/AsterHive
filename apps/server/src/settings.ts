@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { withWrite, logEvent } from './write.ts';
@@ -748,4 +748,72 @@ export async function testOrchestratorModel(
       error: (err instanceof Error ? err.message : String(err)).slice(0, 200),
     };
   }
+}
+
+interface StoredAdminRecovery {
+  salt: string;
+  hash: string;
+  updatedAt: number;
+}
+
+export function getAdminRecoverySettings(ctx: Ctx): { configured: boolean; updatedAt: number | null } {
+  const row = ctx.holder.db.prepare("SELECT value FROM settings WHERE key = 'admin_recovery'").get() as { value?: string } | undefined;
+  if (!row?.value) {
+    const hasEnv = Boolean(ctx.cfg.adminRecoveryToken && ctx.cfg.adminRecoveryToken.length >= 32);
+    return { configured: hasEnv, updatedAt: null };
+  }
+  try {
+    const data = JSON.parse(row.value) as StoredAdminRecovery;
+    return { configured: Boolean(data.hash && data.salt), updatedAt: data.updatedAt ?? null };
+  } catch {
+    return { configured: false, updatedAt: null };
+  }
+}
+
+export function setAdminRecoveryPassword(ctx: Ctx, password: unknown): { configured: boolean; updatedAt: number } {
+  if (typeof password !== 'string' || !password.trim()) {
+    throw new HttpError(422, 'password 必须是非空字符串');
+  }
+  const clean = password.trim();
+  const salt = randomBytes(16).toString('hex');
+  const hash = scryptSync(clean, salt, 32).toString('hex');
+  const now = Date.now();
+  const stored: StoredAdminRecovery = { salt, hash, updatedAt: now };
+
+  withWrite(ctx, 'settings.admin_recovery_updated', () => {
+    ctx.holder.db
+      .prepare("INSERT INTO settings (key, value, updated_at) VALUES ('admin_recovery', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+      .run(JSON.stringify(stored), now);
+    logEvent(ctx, 'settings.admin_recovery_updated', { updatedAt: now });
+  });
+
+  return { configured: true, updatedAt: now };
+}
+
+export function verifyAdminRecoveryCredential(ctx: Ctx, credential: string): { ok: boolean; configured: boolean } {
+  if (!credential || typeof credential !== 'string') return { ok: false, configured: false };
+  const clean = credential.trim();
+  const row = ctx.holder.db.prepare("SELECT value FROM settings WHERE key = 'admin_recovery'").get() as { value?: string } | undefined;
+  if (row?.value) {
+    try {
+      const data = JSON.parse(row.value) as StoredAdminRecovery;
+      if (data.hash && data.salt) {
+        const computed = scryptSync(clean, data.salt, 32).toString('hex');
+        const isMatch = timingSafeEqual(Buffer.from(computed, 'utf8'), Buffer.from(data.hash, 'utf8'));
+        return { ok: isMatch, configured: true };
+      }
+    } catch {
+      /* ignore parse error */
+    }
+  }
+
+  const envToken = ctx.cfg.adminRecoveryToken?.trim();
+  if (envToken && envToken.length >= 32) {
+    const suppliedDigest = createHash('sha256').update(clean, 'utf8').digest();
+    const expectedDigest = createHash('sha256').update(envToken, 'utf8').digest();
+    const isMatch = timingSafeEqual(suppliedDigest, expectedDigest);
+    return { ok: isMatch, configured: true };
+  }
+
+  return { ok: false, configured: false };
 }

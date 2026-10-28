@@ -61,6 +61,9 @@ import {
   testOrchestratorModel,
   getThinkingProbeTarget,
   getCachedOrchestratorModelMetadata,
+  getAdminRecoverySettings,
+  setAdminRecoveryPassword,
+  verifyAdminRecoveryCredential,
 } from './settings.ts';
 import { discoverThinkingTiers } from '../../../packages/sdk/src/thinking-discovery.ts';
 import { getUserStatus, renameUser, ensureUserAgent } from './user.ts';
@@ -113,11 +116,9 @@ function requireTokenActor(ctx: Ctx, c: Context): Agent {
 function requireVerifiedUser(ctx: Ctx, c: Context): Agent {
   const token = bearerToken(c);
   if (!token) throw new HttpError(401, 'administrator recovery credential required');
-  const configured = ctx.cfg.adminRecoveryToken;
-  if (!configured || configured.length < 32) throw new HttpError(503, 'administrator recovery credential is not configured');
-  const suppliedDigest = createHash('sha256').update(token, 'utf8').digest();
-  const expectedDigest = createHash('sha256').update(configured, 'utf8').digest();
-  if (!timingSafeEqual(suppliedDigest, expectedDigest)) throw new HttpError(403, 'invalid administrator recovery credential');
+  const verification = verifyAdminRecoveryCredential(ctx, token);
+  if (!verification.configured) throw new HttpError(503, 'administrator recovery credential is not configured');
+  if (!verification.ok) throw new HttpError(403, 'invalid administrator recovery credential');
   return ensureUserAgent(ctx);
 }
 // 提权写闸门：worker 角色的 token 不放行（信任分层仍对 agent 生效）；匿名即 user，自然通过。
@@ -948,6 +949,14 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
         reviewerEnabled: body.reviewerEnabled === undefined ? undefined : Boolean(body.reviewerEnabled),
       }),
     );
+  });
+
+  app.get('/settings/admin-recovery', (c) => c.json(getAdminRecoverySettings(ctx)));
+
+  app.put('/settings/admin-recovery', async (c) => {
+    requireElevated(ctx, c);
+    const body = (await c.req.json().catch(() => ({}))) as { password?: unknown };
+    return c.json(setAdminRecoveryPassword(ctx, body.password));
   });
 
   // 上游 /models 清单（60s 缓存，缓存键=baseURL）——设置页模型下拉的数据源；

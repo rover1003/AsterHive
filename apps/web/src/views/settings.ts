@@ -8,6 +8,7 @@
 // 弃旧会话重建，见 brain.ts）。全局面板只管 enabled 开关；组数据走组接口（CRUD/active/models/test）。
 import {
   api,
+  type AdminRecoverySettings,
   setCachedUserName,
   type OrchestratorModelsResult,
   type OrchestratorSettings,
@@ -48,6 +49,16 @@ export async function render(el: HTMLElement): Promise<void> {
         <button class="primary" id="user-save">保存</button>
       </div>
       <div id="user-result"></div>
+    </div>
+    <div class="panel">
+      <h3>受控恢复密码（管理员凭据）</h3>
+      <p class="muted">当工蜂卡死或异常断网时，用于在核实设备现场后安全解除任务占用。直接保存在数据库中，无需修改服务器配置文件。</p>
+      <div id="recovery-status-line" class="muted small" style="margin-bottom:8px">正在查询状态…</div>
+      <div class="inline-form">
+        <input id="recovery-pwd-input" type="password" placeholder="输入新的受控恢复密码" style="min-width:260px" autocomplete="new-password" />
+        <button class="primary" id="recovery-pwd-save">保存恢复密码</button>
+      </div>
+      <div id="recovery-pwd-result" class="muted small" style="margin-top:6px"></div>
     </div>
     <div class="panel">
       <h3>蜂后设置（内置蜂后，模式 B）</h3>
@@ -794,6 +805,46 @@ export async function render(el: HTMLElement): Promise<void> {
   });
 
   (el.querySelector('#skill-refresh') as HTMLElement).addEventListener('click', refreshSkills);
+
+  // ---- 受控恢复密码管理 ----
+  const recStatus = el.querySelector('#recovery-status-line') as HTMLElement;
+  const recInput = el.querySelector('#recovery-pwd-input') as HTMLInputElement;
+  const recSave = el.querySelector('#recovery-pwd-save') as HTMLButtonElement;
+  const recResult = el.querySelector('#recovery-pwd-result') as HTMLElement;
+
+  async function loadRecoveryStatus(): Promise<void> {
+    try {
+      const res = await api.get<AdminRecoverySettings>('/settings/admin-recovery');
+      if (res.configured) {
+        recStatus.innerHTML = `<span style="color:var(--accent,#4ade80);font-weight:600">● 已设置恢复密码</span>` + (res.updatedAt ? `<span class="muted" style="margin-left:8px">上次更新：${fmtTime(res.updatedAt)}</span>` : '');
+      } else {
+        recStatus.innerHTML = `<span style="color:var(--warning,#fbbf24)">○ 未设置恢复密码</span> <span class="muted">（建议设置，以便在工蜂卡死时由您受控解除占用）</span>`;
+      }
+    } catch (err) {
+      recStatus.textContent = `加载恢复密码状态失败：${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+  void loadRecoveryStatus();
+
+  recSave.addEventListener('click', async () => {
+    const val = recInput.value.trim();
+    if (!val) {
+      recResult.innerHTML = '<span class="warn">请输入非空密码</span>';
+      return;
+    }
+    recSave.disabled = true;
+    recResult.textContent = '正在保存…';
+    try {
+      await api.put('/settings/admin-recovery', { password: val });
+      recInput.value = '';
+      recResult.textContent = '已成功保存受控恢复密码';
+      await loadRecoveryStatus();
+    } catch (err) {
+      recResult.innerHTML = `<span class="warn">保存失败：${esc(err instanceof Error ? err.message : String(err))}</span>`;
+    } finally {
+      recSave.disabled = false;
+    }
+  });
   refreshExtensions();
   refreshSkills();
 }
