@@ -6,10 +6,12 @@ interface MockTask {
   id: string;
   title: string;
   assignee?: string | null;
+  reviewStatus?: string;
+  lastActivityKind?: string | null;
 }
 
 test('pollNextDirectedTask: 优先认领退回重做的 InProgress 任务（无需重复 claim）', async () => {
-  const reworkTask: MockTask = { id: 'T-rework', title: '修复反馈', assignee: 'worker-1' };
+  const reworkTask: MockTask = { id: 'T-rework', title: '修复反馈', assignee: 'worker-1', reviewStatus: 'rework' };
   const readyTask: MockTask = { id: 'T-ready', title: '新任务', assignee: 'worker-1' };
 
   let claimCalled = false;
@@ -30,6 +32,18 @@ test('pollNextDirectedTask: 优先认领退回重做的 InProgress 任务（无�
   assert.equal(result.channel, 'rework');
   assert.equal(result.task.id, 'T-rework');
   assert.equal(claimCalled, false, '重做任务无需重复 claim');
+});
+
+test('pollNextDirectedTask: 已失败或超时的重做不自动重复执行', async () => {
+  for (const kind of ['error', 'timeout']) {
+    const result = await pollNextDirectedTask(['b1'], {
+      listMine: async (_board, lane) => lane === 'InProgress'
+        ? [{ id: 'T-failed', title: '失败现场', reviewStatus: 'rework', lastActivityKind: kind }]
+        : [],
+      claim: async (id) => ({ id, title: 'claimed' }),
+    });
+    assert.equal(result, null);
+  }
 });
 
 test('pollNextDirectedTask: 无重做时原子 claim 定向指派给本工蜂的 Ready 任务', async () => {

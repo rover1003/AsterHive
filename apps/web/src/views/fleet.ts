@@ -8,7 +8,7 @@ import { esc, fmtDuration, fmtTime } from '../ui.ts';
 import { icon } from '../icons.ts';
 
 const STATUS_LABEL: Record<AgentOverview['status'], string> = {
-  working: '工作中',
+  working: '任务占用',
   idle: '在线·空闲',
   stale: '心跳过期/疑似离线',
   disabled: '停用',
@@ -169,7 +169,7 @@ export function renderFleetInto(
         const node = telemetry?.nodes.find((item) => item.agentId === agent.id);
         return agentCardHtml(agent, node);
       }).join('');
-      container.innerHTML = `<div class="agg-bar"><span class="agg working">工作中 <b>${counts.working}</b></span><span class="agg idle">在线·空闲 <b>${counts.idle}</b></span><span class="agg stale">心跳过期 <b>${counts.stale}</b></span><span class="agg disabled">停用 <b>${counts.disabled}</b></span><span class="sep"></span>${lanes}</div>
+      container.innerHTML = `<div class="agg-bar"><span class="agg working">任务占用 <b>${counts.working}</b></span><span class="agg idle">在线·空闲 <b>${counts.idle}</b></span><span class="agg stale">心跳过期 <b>${counts.stale}</b></span><span class="agg disabled">停用 <b>${counts.disabled}</b></span><span class="sep"></span>${lanes}</div>
         ${radarHtml}
         <div class="telemetry-summary" aria-label="资源遥测概览"><b>节点资源遥测</b><span>${telemetry ? `${telemetry.reportingNodes}/${telemetry.totalNodes} 个节点上报` : '遥测数据暂不可用'}</span><span>更新时间 ${telemetry?.timestamp ? fmtTime(telemetry.timestamp) : '未知'}</span></div>
         <div class="fleet">${cards || '<div class="empty">尚无工蜂注册——到「Agent 管理」注册第一只工蜂</div>'}</div>`;

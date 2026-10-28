@@ -5,7 +5,7 @@ import { withWrite, logEvent } from './write.ts';
 import type { Agent } from './agents.ts';
 import { getTask, getBoard, requireParticipant, type Task } from './tasks.ts';
 import { messageInner } from './messages.ts';
-
+import { withTaskIntegrationLock } from './task-integration-lock.ts';
 function requireExecutingRole(actor: Agent): void {
   // 主脑绝不执行任务（§8.2）——结构性约束，不是 prompt 自觉
   if (actor.role === 'orchestrator') {
@@ -179,6 +179,10 @@ export function checkpointTask(
   const now = Date.now();
   const inputKind = typeof input === 'object' && input !== null ? input.kind : undefined;
   const activityKind = isKeepalive ? 'keepalive' : (inputKind || 'milestone');
+  if ((task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout')
+      && !isKeepalive && activityKind !== 'error' && activityKind !== 'timeout') {
+    throw new HttpError(409, 'task execution failed; 确认工蜂停止后受控恢复');
+  }
 
   withWrite(ctx, isKeepalive ? 'task.keepalive' : 'task.checkpoint', () => {
     if (isKeepalive) {
@@ -190,7 +194,7 @@ export function checkpointTask(
       ctx.holder.db
         .prepare('UPDATE task SET last_activity_at = ?, last_real_activity_at = ?, last_activity_kind = ?, last_progress_at = ?, updated_at = ? WHERE id = ?')
         .run(now, now, activityKind, now, now, taskId);
-      logEvent(ctx, 'task.checkpoint', { taskId, by: actor.id, note, kind: activityKind });
+      logEvent(ctx, 'task.checkpoint', { taskId, by: actor.id, note, kind: activityKind, attempt: taskAttempt });
     }
   });
 
@@ -249,25 +253,16 @@ function deliverPending(ctx: Ctx, agent: Agent): PendingMessage[] {
   return out;
 }
 
-export function releaseTask(ctx: Ctx, actor: Agent, taskId: string, reason?: string): Task {
-  const task = requireTaskRow(ctx, taskId);
-  if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
-  if (task.lane !== 'InProgress') throw new HttpError(409, `task ${task.id} not InProgress (lane: ${task.lane})`);
-  if (task.assignee !== actor.id && task.assignee !== actor.handle && !isElevated(actor)) {
-    throw new HttpError(403, 'only assignee or orchestrator/user may release');
-  }
-  const depsOk = task.dependsOn.every((d) => {
-    const dep = ctx.holder.db.prepare("SELECT lane FROM task WHERE id = ? AND status='active'").get(d) as { lane: string } | undefined;
-    return dep?.lane === 'Done';
-  });
-  return withWrite(ctx, 'task.release', () => {
-    ctx.holder.db
-      .prepare(
-        `UPDATE task SET assignee = 'unassigned', lane = ?, attempt = attempt + 1, claimed_at = NULL, updated_at = ? WHERE id = ?`,
-      )
-      .run(depsOk ? 'Ready' : 'Backlog', Date.now(), taskId);
-    logEvent(ctx, 'task.released', { taskId, by: actor.id, reason: reason ?? '' });
-    return getTask(ctx, taskId);
+export async function releaseTask(ctx: Ctx, actor: Agent, taskId: string, reason?: string): Promise<Task> {
+  return withTaskIntegrationLock(taskId, async () => {
+    // Fail closed: 物理停止确认门禁（§4.3.6）
+    // 无论是蜂后、用户还是工蜂本身，网络直调均无法证明设备上的物理执行/模型子进程已真正 settled。
+    // 允许执行中自愿解绑会导致外部写冲突与脑裂；任务解绑与恢复必须由已认证用户在确认物理停止后，
+    // 通过 /agents/:id/control/release-task 显式提供 confirmedStopped: true 安全执行。
+    throw new HttpError(
+      403,
+      'voluntary task release is disabled to prevent mid-execution split-brain; task recovery requires explicit user physical-stop confirmation via /agents/:id/control/release-task with confirmedStopped: true',
+    );
   });
 }
 
@@ -300,6 +295,9 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
     }
   } else if (input.attempt !== undefined && input.attempt !== taskAttempt) {
     throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${input.attempt}`);
+  }
+  if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout') {
+    throw new HttpError(409, 'task execution failed; 确认工蜂停止后受控恢复');
   }
   // Review 泳道同样受 WIP 约束
   const board = getBoard(ctx, task.boardId);

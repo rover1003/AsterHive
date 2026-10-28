@@ -5,6 +5,7 @@ import { createApp } from '../src/http.ts';
 import { registerAgent, type Agent } from '../src/agents.ts';
 import { listEvents } from '../src/write.ts';
 import { releaseStuckTask } from '../src/worker-control.ts';
+import { getTask } from '../src/tasks.ts';
 interface Rig {
   rig: TestRig;
   app: ReturnType<typeof createApp>;
@@ -163,7 +164,7 @@ test('T4: checkpoint 权限——非本任务 worker 拒绝，主脑可干预；
   }
 });
 
-test('T4: release 释放回 Ready；TTL 超时自动释放可被他人接管', async () => {
+test('T4: 失联任务不自动释放；物理停止确认后受控解绑可被他人接管', async () => {
   const r = mkBoardRig(0.0005); // ~30ms TTL
   try {
     await setupBoard(r, [{ id: 'T1', lane: 'Ready', assignee: 'bee1' }]);
@@ -171,28 +172,26 @@ test('T4: release 释放回 Ready；TTL 超时自动释放可被他人接管', a
     let res = await r.app.request('/tasks/T1/claim', { method: 'POST', headers: H(r.bee1.token), body: '{}' });
     assert.equal(res.status, 200);
 
+    // 验证自愿 release 已被禁用以防物理执行未终止时的写冲突（必须走物理停止确认门禁）
     res = await r.app.request('/tasks/T1/release', {
       method: 'POST',
       headers: H(r.bee1.token),
       body: JSON.stringify({ reason: '暂时让出' }),
     });
-    let body = (await res.json()) as { task: { lane: string; assignee: string } };
-    assert.equal(body.task.lane, 'Ready');
-    assert.equal(body.task.assignee, 'unassigned');
+    assert.equal(res.status, 403, '自愿 release 必须报 403 阻断');
 
-    // 重新定向分派给 bee1 并认领后等 TTL 过期
-    await r.app.request('/tasks/T1/dispatch', {
-      method: 'POST',
-      headers: H(r.orch.token),
-      body: JSON.stringify({ assignee: 'bee1', content: '@bee1 重试' }),
-    });
-    await r.app.request('/tasks/T1/claim', { method: 'POST', headers: H(r.bee1.token), body: '{}' });
+    // 任务依然保留在 InProgress 且归属 bee1，绝不自动释放
+    const taskStillInProgress = getTask(r.rig.ctx, 'T1');
+    assert.equal(taskStillInProgress.lane, 'InProgress');
+    assert.equal(taskStillInProgress.assignee, 'bee1');
+
+    // 等待 TTL 过期
     const { promise: p1, resolve: r1 } = Promise.withResolvers<void>();
     setTimeout(r1, 120);
     await p1;
     // bee2 调用 next 触发扫掠，失联任务安全保留 InProgress 与所有权，不被盲抢
     res = await r.app.request('/boards/b/next', { method: 'POST', headers: H(r.bee2.token) });
-    body = (await res.json()) as { task: { id: string; assignee: string } | null; swept: string[] };
+    let body = (await res.json()) as { task: { id: string; assignee: string } | null; swept: string[] };
     assert.deepEqual(body.swept, [], '失联任务不自动释放，保留 InProgress 与所有权');
     assert.equal(body.task, null, '未释放的任务不得被盲领');
     assert.ok(

@@ -182,11 +182,8 @@ test('Phase 6 工蜂受控干预: releaseStuckTask 强制解绑卡死任务并�
       handle: 'queen-orch',
       role: 'orchestrator',
     });
-    const { agent: user, token: userToken } = registerAgent(rig.ctx, {
-      name: 'Boss',
-      handle: 'boss',
-      role: 'user',
-    });
+    const adminToken = 'A'.repeat(48);
+    rig.ctx.cfg.adminRecoveryToken = adminToken;
     createTask(rig.ctx, 'b-release', {
       id: 'HANG-1',
       title: '被挂起的测试任务',
@@ -210,7 +207,7 @@ test('Phase 6 工蜂受控干预: releaseStuckTask 强制解绑卡死任务并�
     // 2. 用户解绑未传 confirmedStopped: true 时，报 409 拒绝（网络断连不等于物理停止）
     const unconfirmedRes = await app.request(`/agents/${workerA.id}/control/release-task`, {
       method: 'POST',
-      headers: H(userToken),
+      headers: H(adminToken),
       body: JSON.stringify({ taskId: 'HANG-1', reason: '未确认停止' }),
     });
     assert.equal(unconfirmedRes.status, 409, '未经用户明确确认物理停止必须报 409 拒绝');
@@ -218,7 +215,7 @@ test('Phase 6 工蜂受控干预: releaseStuckTask 强制解绑卡死任务并�
     // 3. 用户明确提供 confirmedStopped: true 后受控解绑成功
     const res = await app.request(`/agents/${workerA.id}/control/release-task`, {
       method: 'POST',
-      headers: H(userToken),
+      headers: H(adminToken),
       body: JSON.stringify({ taskId: 'HANG-1', reason: '用户核实已物理停机', confirmedStopped: true }),
     });
     assert.equal(res.status, 200);

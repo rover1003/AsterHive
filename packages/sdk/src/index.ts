@@ -490,17 +490,20 @@ export class Worker {
     return r.task;
   }
 
-  async downloadTaskSnapshot(taskId: string): Promise<{ buffer: ArrayBuffer; baseCommit: string }> {
+  async downloadTaskSnapshot(taskId: string, attempt?: number): Promise<{ buffer: ArrayBuffer; baseCommit: string; reworkCommit?: string; reworkBranch?: string }> {
     const headers: Record<string, string> = {};
     if (this.#token) headers.authorization = `Bearer ${this.#token}`;
+    if (attempt !== undefined) headers['x-task-attempt'] = String(attempt);
     const res = await fetch(`${this.#baseUrl}/tasks/${taskId}/repo-snapshot`, { headers });
     if (!res.ok) {
       const err = await res.text().catch(() => '');
       throw new SdkError(res.status, err || `HTTP ${res.status}`);
     }
     const baseCommit = res.headers.get('x-base-commit') ?? '';
+    const reworkCommit = res.headers.get('x-rework-commit') ?? undefined;
+    const reworkBranch = res.headers.get('x-rework-branch') ?? undefined;
     const buffer = await res.arrayBuffer();
-    return { buffer, baseCommit };
+    return { buffer, baseCommit, reworkCommit, reworkBranch };
   }
 
   async uploadTaskResult(taskId: string, bundleBuffer: Uint8Array, sha256: string, attempt?: number): Promise<{ taskRef: string; headCommit: string }> {

@@ -1,7 +1,7 @@
 // 项目工作台：聊天主舞台（左，主操作面）+ 看板横向条带监视栏（右，状态面）
 // 看板不再是五列竖排：五条水平 lane-strip 纵向堆叠，每条内卡片横向滚动；
 // 详情抽屉（任务消息子流 / 泳道迁移 / 建卡）+ 看板管理抽屉（元数据 / 参与者 / 删除）
-import { api, type Agent, type Board, type Task, type Message, type RepoTaskDiff } from '../api.ts';
+import { api, postAdminRecovery, type Agent, type Board, type Task, type Message, type RepoTaskDiff } from '../api.ts';
 import { subscribe } from '../sse.ts';
 import { esc, fmtTime, LANE_LABELS, PRIORITY_CLASS, toast } from '../ui.ts';
 import { icon } from '../icons.ts';
@@ -39,6 +39,30 @@ document.addEventListener('click', async (event) => {
   }
 });
 
+function requestRecoveryCredential(): Promise<string | null> {
+  return new Promise((resolve) => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'recovery-dialog';
+    dialog.setAttribute('aria-labelledby', 'recovery-dialog-title');
+    dialog.innerHTML = `<form method="dialog">
+      <h3 id="recovery-dialog-title">管理员凭据</h3>
+      <p class="muted">仅用于本次受控解除占用，不会保存在浏览器中。</p>
+      <div class="field"><label for="recovery-token">管理员恢复凭据</label><input id="recovery-token" type="password" autocomplete="off" required /></div>
+      <div class="recovery-dialog-actions"><button type="button" data-recovery-cancel>取消</button><button class="primary" value="confirm">确认</button></div>
+    </form>`;
+    document.body.append(dialog);
+    dialog.querySelector('[data-recovery-cancel]')!.addEventListener('click', () => dialog.close('cancel'));
+    dialog.addEventListener('close', () => {
+      const input = dialog.querySelector<HTMLInputElement>('#recovery-token')!;
+      const token = dialog.returnValue === 'confirm' ? input.value.trim() : null;
+      input.value = '';
+      dialog.remove();
+      resolve(token);
+    }, { once: true });
+    dialog.showModal();
+  });
+}
+
 // 仓库地址补全协议头：填了裸域名（github.com/org/repo）也能直接点开
 function repoHref(repo: string): string {
   return /^https?:\/\//.test(repo) ? repo : `https://${repo}`;
@@ -61,10 +85,11 @@ function repoBadge(board: Board): string {
 }
 
 interface NormalizedTaskProgress {
-  status: 'active' | 'no_recent_activity' | 'offline' | 'unknown';
+  status: 'active' | 'failed' | 'no_recent_activity' | 'offline' | 'unknown';
   workerLastSeenAt: number | null;
   lastActivityAt: number | null;
   lastActivityKind: string | null;
+  errorNote: string | null;
   lastProgressAt: number | null;
 }
 
@@ -75,13 +100,14 @@ function normalizeProgress(progress?: unknown): NormalizedTaskProgress {
       workerLastSeenAt: null,
       lastActivityAt: null,
       lastActivityKind: null,
+      errorNote: null,
       lastProgressAt: null,
     };
   }
   const p = progress as Record<string, unknown>;
   const rawStatus = typeof p.status === 'string' ? p.status : '';
   const status: NormalizedTaskProgress['status'] =
-    rawStatus === 'active' || rawStatus === 'no_recent_activity' || rawStatus === 'offline' || rawStatus === 'unknown'
+    rawStatus === 'active' || rawStatus === 'failed' || rawStatus === 'no_recent_activity' || rawStatus === 'offline' || rawStatus === 'unknown'
       ? rawStatus
       : 'unknown';
 
@@ -95,6 +121,7 @@ function normalizeProgress(progress?: unknown): NormalizedTaskProgress {
     workerLastSeenAt: parseEpoch(p.workerLastSeenAt),
     lastActivityAt: parseEpoch(p.lastActivityAt),
     lastActivityKind: parseKind(p.lastActivityKind),
+    errorNote: parseKind(p.errorNote),
     lastProgressAt: parseEpoch(p.lastProgressAt),
   };
 }
@@ -122,6 +149,14 @@ const PROGRESS_STATUS_META: Record<
     desc: '最近有可观察活动',
     calloutClass: 'alert-active',
     calloutText: '最近有可观察活动。',
+  },
+  failed: {
+    label: '执行失败，等待处理',
+    short: '执行失败',
+    badgeClass: 'prog-offline',
+    desc: '工蜂已上报执行错误',
+    calloutClass: 'alert-danger',
+    calloutText: '请确认工蜂实际停止后再执行受控恢复；不要仅凭网络失联判断。',
   },
   no_recent_activity: {
     label: '等待 / 疑似无活动',
@@ -179,6 +214,7 @@ function renderDrawerProgress(t: Task): string {
         <div class="progress-alert ${meta.calloutClass}">
           ${esc(meta.calloutText)}
         </div>
+        ${p.status === 'failed' && p.errorNote ? `<div class="progress-alert alert-danger"><b>失败原因：</b>${esc(p.errorNote)}</div>` : ''}
         <div class="progress-grid">
           <div class="progress-row">
             <div class="progress-row-header">
@@ -227,12 +263,10 @@ function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): str
   if (t.status !== 'cancelled') actions.push(`<button data-cancel-task="${esc(t.id)}" class="danger">删除任务卡（取消并保留历史）…</button>`);
   if (t.lane === 'Backlog') actions.push(`<button data-move="Ready">解锁进 Ready</button>`);
   if (t.lane === 'Ready') {
-    actions.push(`<button data-move="InProgress">手动开工</button>`);
     actions.push(`<button data-dispatch="1">派活…</button>`);
   }
   if (t.lane === 'InProgress') {
-    actions.push(`<button data-dispatch="1">改派…</button>`);
-    actions.push(`<button data-release="1">释放</button>`);
+    if (t.assignee && t.assignee !== 'unassigned') actions.push(`<button data-release="1">确认停止后解除占用…</button>`);
   }
   if (t.lane === 'Review') {
     if (t.reviewStatus === 'none') {
@@ -516,8 +550,19 @@ export async function render(el: HTMLElement): Promise<void> {
       btn.addEventListener('click', async () => {
             const to = (btn as HTMLElement).dataset.move!;
         try {
-          await api.patch(`/tasks/${id}`, { lane: to });
-          toast(`已移至 ${LANE_LABELS[to]}`);
+          if (t.lane === 'Review' && to === 'InProgress') {
+            const reason = prompt('退回原因（工蜂将基于上一轮成果重做）', '请根据审核反馈修正');
+            if (reason === null) return;
+            await api.post(`/tasks/${encodeURIComponent(id)}/review/return`, { reason });
+            toast('已退回工蜂重做');
+          } else if (t.lane === 'Review' && to === 'Done') {
+            if (!confirm(`确认人工验收任务 ${id}？托管代码任务会先合并成果，合并失败则保持 Review。`)) return;
+            await api.post(`/tasks/${encodeURIComponent(id)}/review/accept`, {});
+            toast('已完成人工验收');
+          } else {
+            await api.patch(`/tasks/${encodeURIComponent(id)}`, { lane: to });
+            toast(`已移至 ${LANE_LABELS[to]}`);
+          }
           tasks = await load();
           drawerHost.innerHTML = '';
         } catch (err) {
@@ -545,13 +590,26 @@ export async function render(el: HTMLElement): Promise<void> {
     const releaseBtn = drawerHost.querySelector('[data-release]');
     if (releaseBtn) {
       releaseBtn.addEventListener('click', async () => {
-            try {
-          await api.post(`/tasks/${id}/release`, { reason: '用户界面释放' });
-          toast('已释放');
+        const stopped = window.confirm(`解除任务 ${id} 被工蜂 ${t.assignee} 的占用？\n\n请先在该设备确认旧工蜂的此任务进程已实际停止，并保留工作区。网络失联或无心跳不代表进程停止。\n\n点击“确定”表示您已确认其实际停止。`);
+        if (!stopped) return;
+        if (!window.isSecureContext) {
+          toast('提示：当前连接未启用 HTTPS，建议在生产环境通过安全隧道或 HTTPS 访问。');
+        }
+        const credential = await requestRecoveryCredential();
+        if (!credential) return;
+        (releaseBtn as HTMLButtonElement).disabled = true;
+        try {
+          await postAdminRecovery(`/agents/${encodeURIComponent(t.assignee)}/control/release-task`, {
+            taskId: id,
+            reason: '用户确认旧任务执行已实际停止',
+            confirmedStopped: true,
+          }, credential);
+          toast('已解除占用；任务不会自动重新派发');
           tasks = await load();
           drawerHost.innerHTML = '';
         } catch (err) {
-          toast(`释放失败：${err instanceof Error ? err.message : ''}`, true);
+          toast(`解除占用失败：${err instanceof Error ? err.message : ''}`, true);
+          (releaseBtn as HTMLButtonElement).disabled = false;
         }
       });
     }

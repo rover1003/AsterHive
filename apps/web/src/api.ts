@@ -17,11 +17,12 @@ export interface Board {
   wip: Record<string, number>;
   createdAt: number;
 }
-export type TaskProgressStatus = 'active' | 'no_recent_activity' | 'offline' | 'unknown';
+export type TaskProgressStatus = 'active' | 'failed' | 'no_recent_activity' | 'offline' | 'unknown';
 
 export interface TaskProgress {
   lastActivityAt: number | null;
   lastActivityKind: string | null;
+  errorNote?: string | null;
   lastProgressAt: number | null;
   workerLastSeenAt: number | null;
   status: TaskProgressStatus;
@@ -278,6 +279,17 @@ async function req<T>(
   if (!res.ok) {
     throw new ApiError(res.status, String(json.error ?? res.statusText));
   }
+  return json as T;
+}
+
+export async function postAdminRecovery<T>(path: string, body: unknown, token: string): Promise<T> {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok) throw new ApiError(res.status, String(json.error ?? res.statusText));
   return json as T;
 }
 

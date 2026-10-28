@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
-import { getAgent, type Agent } from './agents.ts';
+import { getAgent, findAgent, type Agent } from './agents.ts';
 import { getTask, updateTask, type Task } from './tasks.ts';
 import { getOverview, type AgentOverview } from './overview.ts';
 import { withWrite, logEvent } from './write.ts';
@@ -250,7 +250,9 @@ export async function releaseStuckTask(
     );
   }
   const task = getTask(ctx, taskId);
-  if (task.assignee !== agentId) {
+  const targetAgent = findAgent(ctx, agentId);
+  const matchesAssignee = (assigned: string) => assigned === agentId || (targetAgent !== null && targetAgent !== undefined && (assigned === targetAgent.id || assigned === targetAgent.handle));
+  if (!matchesAssignee(task.assignee)) {
     throw new HttpError(400, `task ${taskId} is currently assigned to ${task.assignee}, not ${agentId}`);
   }
 
@@ -266,19 +268,54 @@ export async function releaseStuckTask(
 
   const cleanReason = (reason ?? '').trim() || '用户明确确认物理停止后受控解除挂起占用';
   return withTaskIntegrationLock(taskId, async () => {
-    const updated = updateTask(ctx, actor, taskId, {
-      assignee: 'unassigned',
-      lane: 'Ready',
+    const current = getTask(ctx, taskId);
+    if (current.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+    if (current.lane !== 'InProgress') throw new HttpError(409, `task ${taskId} not InProgress (lane: ${current.lane})`);
+    if (!matchesAssignee(current.assignee)) {
+      throw new HttpError(400, `task ${taskId} is currently assigned to ${current.assignee}, not ${agentId}`);
+    }
+
+    const depsOk = current.dependsOn.every((d) => {
+      const dep = ctx.holder.db.prepare("SELECT lane FROM task WHERE id = ? AND status='active'").get(d) as { lane: string } | undefined;
+      return dep?.lane === 'Done';
     });
-    ctx.holder.db.prepare('UPDATE task SET attempt = attempt + 1 WHERE id = ?').run(taskId);
-    logEvent(ctx, 'task.force_released', {
-      taskId,
-      agentId,
-      by: actor.id,
-      reason: cleanReason,
-      userConfirmedStopped: true,
-      fencedAttempt: task.attempt + 1,
+    const targetLane = depsOk ? 'Ready' : 'Backlog';
+    const now = Date.now();
+
+    return withWrite(ctx, 'task.force_released', () => {
+      const res = ctx.holder.db
+        .prepare(
+          `UPDATE task
+           SET assignee = 'unassigned',
+               lane = ?,
+               attempt = attempt + 1,
+               claimed_at = NULL,
+               review_status = 'none',
+               review_summary = '',
+               review_attempts = 0,
+               last_activity_at = ?,
+               last_real_activity_at = NULL,
+               last_activity_kind = NULL,
+               last_progress_at = NULL,
+               updated_at = ?
+           WHERE id = ? AND status = 'active' AND lane = 'InProgress'`,
+        )
+        .run(targetLane, now, now, taskId);
+
+      if (Number(res.changes) !== 1) {
+        throw new HttpError(409, `task ${taskId} state changed concurrently`);
+      }
+
+      logEvent(ctx, 'task.force_released', {
+        taskId,
+        agentId,
+        by: actor.id,
+        reason: cleanReason,
+        userConfirmedStopped: true,
+        fencedAttempt: current.attempt + 1,
+      });
+      logEvent(ctx, 'task.lane_changed', { taskId, from: current.lane, to: targetLane, by: actor.id });
+      return getTask(ctx, taskId);
     });
-    return getTask(ctx, taskId);
   });
 }

@@ -15,6 +15,7 @@ const ctx = makeCtx(db, {
   dataDir,
   ttlMinutes: Number(process.env.ASTERHIVE_TTL_MINUTES ?? 240),
   keepSnapshots: Number(process.env.ASTERHIVE_KEEP_SNAPSHOTS ?? 3),
+  adminRecoveryToken: process.env.ASTERHIVE_ADMIN_RECOVERY_TOKEN?.trim(),
 });
 const repoManager = new RepoManager(ctx);
 repoManager.recoverQueuedJobs();

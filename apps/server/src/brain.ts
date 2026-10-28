@@ -804,9 +804,9 @@ export class Brain {
       if (!currentSettings.enabled || !currentSettings.reviewerEnabled) return;
       if (result.verdict === 'pass') {
         await new RepoManager(this.#ctx).integrateTask(task.boardId, taskId);
-        finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { integrated: true, maxReworks: 2 });
+        await finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { integrated: true, maxReworks: 2 });
       } else {
-        finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { maxReworks: 2 });
+        await finalizeTaskReview(this.#ctx, ensureBrainAgent(this.#ctx), taskId, result, { maxReworks: 2 });
       }
     } catch (err) {
       failTaskReview(this.#ctx, taskId, err instanceof Error ? err.message : String(err));

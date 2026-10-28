@@ -53,7 +53,8 @@ export interface TaskProgress {
   lastActivityKind: string | null;
   lastProgressAt: number | null;
   workerLastSeenAt: number | null;
-  status: 'active' | 'no_recent_activity' | 'offline' | 'unknown';
+  status: 'active' | 'no_recent_activity' | 'offline' | 'unknown' | 'failed';
+  errorNote: string | null;
 }
 
 export interface Task {
@@ -87,6 +88,7 @@ export interface Task {
   lastActivityKind: string | null;
   progress: TaskProgress | null;
   autoUnblockedAt: number | null;
+  createdAt: number;
   updatedAt: number;
 }
 
@@ -125,7 +127,19 @@ type TaskRow = {
 };
 
 export function computeTaskProgress(
-  r: Pick<TaskRow, 'lane' | 'assignee' | 'claimed_at' | 'last_activity_at' | 'last_real_activity_at' | 'last_progress_at' | 'last_activity_kind' | 'status'>,
+  r: Pick<
+    TaskRow,
+    | 'id'
+    | 'attempt'
+    | 'lane'
+    | 'assignee'
+    | 'claimed_at'
+    | 'last_activity_at'
+    | 'last_real_activity_at'
+    | 'last_progress_at'
+    | 'last_activity_kind'
+    | 'status'
+  >,
   ctx?: Ctx,
   now: number = Date.now(),
 ): TaskProgress | null {
@@ -157,7 +171,41 @@ export function computeTaskProgress(
   const NO_RECENT_ACTIVITY_THRESHOLD_MS = 180_000;
 
   let status: TaskProgress['status'];
-  if (!workerEnabled || workerLastSeenAt === null || now - workerLastSeenAt > OFFLINE_THRESHOLD_MS) {
+  let errorNote: string | null = null;
+
+  if (lastActivityKind === 'error' || lastActivityKind === 'timeout') {
+    status = 'failed';
+    if (ctx && r.id) {
+      try {
+        const events = ctx.holder.db
+          .prepare(
+            `SELECT payload, time_created FROM event WHERE type = 'task.checkpoint' AND json_extract(payload, '$.taskId') = ? ORDER BY id DESC LIMIT 10`,
+          )
+          .all(r.id) as { payload: string; time_created: number }[];
+        const currentAttempt = r.attempt ?? 1;
+        for (const ev of events) {
+          try {
+            const p = JSON.parse(ev.payload) as { kind?: string; note?: string; attempt?: number; taskId?: string };
+            if (p.kind === lastActivityKind) {
+              const checkpointAttempt = p.attempt ?? 1;
+              if (checkpointAttempt !== currentAttempt) continue;
+              if (r.claimed_at !== null && ev.time_created < r.claimed_at) {
+                continue;
+              }
+              if (typeof p.note === 'string' && p.note.trim()) {
+                errorNote = p.note.trim().slice(0, 2000);
+                break;
+              }
+            }
+          } catch {
+            /* ignore parse errors */
+          }
+        }
+      } catch {
+        /* ignore db errors */
+      }
+    }
+  } else if (!workerEnabled || workerLastSeenAt === null || now - workerLastSeenAt > OFFLINE_THRESHOLD_MS) {
     status = 'offline';
   } else if (lastRealActivityAt !== null) {
     if (now - lastRealActivityAt <= NO_RECENT_ACTIVITY_THRESHOLD_MS) {
@@ -180,6 +228,7 @@ export function computeTaskProgress(
     lastProgressAt,
     workerLastSeenAt,
     status,
+    errorNote,
   };
 }
 
@@ -592,7 +641,7 @@ function assertWip(ctx: Ctx, boardId: string, lane: Lane, excludeTaskId: string)
 
 export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): Task {
   guardTaskInput(input as unknown as Record<string, unknown>);
-  getBoard(ctx, boardId);
+  const board = getBoard(ctx, boardId);
   const id = input.id?.trim() ?? '';
   if (!TASK_ID_RE.test(id)) {
     throw new HttpError(422, `invalid task id (expect T42 / BUG-17 style): ${id}`);
@@ -600,6 +649,9 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
   if (!input.title?.trim()) throw new HttpError(422, 'title required');
   const lane = input.lane ?? 'Backlog';
   if (!LANES.includes(lane)) throw new HttpError(422, `invalid lane: ${lane}`);
+  if (lane === 'Done' && board.repoMode === 'managed') {
+    throw new HttpError(409, '托管任务不能直接创建为 Done；须提交并完成验收');
+  }
   const dependsOn = input.dependsOn ?? [];
   for (const dep of dependsOn) {
     requireTaskRow(ctx, dep); // 404 if missing
@@ -673,14 +725,48 @@ export interface PatchTaskInput {
   requirements?: TaskRequirements;
 }
 
-export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskInput): Task {
+export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskInput, options?: { integratedManagedCode?: boolean; manualAcceptance?: boolean }): Task {
   guardTaskInput(patch as unknown as Record<string, unknown>);
   const row = requireTaskRow(ctx, id);
   if (row.status === 'cancelled') throw new HttpError(409, `task ${id} is cancelled`);
   const laneChanges: { from: Lane; to: Lane } | null =
     patch.lane && patch.lane !== row.lane ? { from: row.lane, to: patch.lane } : null;
+  // 1. 运行中任务 (InProgress) 保护：严禁通用 PATCH 挪动泳道或篡改指派人
+  // 必须通过受控专用接口（submitTask、release-task 物理确认门禁、cancelTask）进行生命周期流转
+  if (row.lane === 'InProgress') {
+    if (laneChanges) {
+      throw new HttpError(
+        403,
+        'cannot move task out of InProgress via generic update; use submit, release-task with confirmedStopped, or cancel',
+      );
+    }
+    if (patch.assignee !== undefined && patch.assignee !== row.assignee) {
+      throw new HttpError(
+        403,
+        'cannot change assignee of InProgress task via generic update; release task with confirmedStopped first',
+      );
+    }
+  }
+
+  // 2. 审核中任务 (Review) 保护：严禁通用 PATCH 挪回 InProgress
+  // 退回重做必须独占经由具备锁与代次自增的专用 review-return / review-reject API
+  if (row.lane === 'Review' && laneChanges?.to === 'InProgress') {
+    throw new HttpError(
+      403,
+      'Review tasks cannot be moved to InProgress via generic update; use /tasks/:id/review/return or review/reject',
+    );
+  }
 
   if (laneChanges) {
+    if (laneChanges.to === 'Done' && getBoard(ctx, row.board_id).repoMode === 'managed') {
+      if (row.lane !== 'Review') throw new HttpError(409, '托管任务须从 Review 完成验收');
+      if (getTask(ctx, id).workspace.noCode !== true && !options?.integratedManagedCode) {
+        throw new HttpError(409, '托管代码任务须先合并任务成果；请使用人工验收接口');
+      }
+      if (getTask(ctx, id).workspace.noCode === true && !options?.manualAcceptance) {
+        throw new HttpError(409, '托管无代码任务须经人工验收；请使用人工验收接口');
+      }
+    }
     // 启用独立审核时，失败或熔断的审核任务不能经普通 lane patch 绕过审核。
     if (actor.role === 'orchestrator' && laneChanges.to === 'Done' && ['failed', 'blocked'].includes(row.review_status)) {
       throw new HttpError(403, 'failed/blocked reviewer tasks require explicit user arbitration');
@@ -730,13 +816,10 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
     if (laneChanges) {
       push('lane', laneChanges.to);
       push('last_activity_at', Date.now());
-      if (row.lane === 'Review' && laneChanges.to === 'InProgress') {
-        const nextReworks = (row.review_reworks ?? 0) + 1;
-        push('review_status', 'rework');
-        push('review_reworks', nextReworks);
-        push('last_activity_kind', 'rework');
-        push('last_progress_at', Date.now());
-      }
+    }
+    if (options?.manualAcceptance) {
+      push('review_status', 'none');
+      push('review_summary', '用户人工验收通过');
     }
     push('updated_at', Date.now());
     ctx.holder.db
@@ -747,6 +830,7 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
       by: actor.id,
       fields: Object.keys(patch),
     });
+    if (options?.manualAcceptance) logEvent(ctx, 'task.manual_accepted', { taskId: id, by: actor.id });
     if (laneChanges) {
       logEvent(ctx, 'task.lane_changed', {
         taskId: id,
@@ -755,14 +839,6 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
         by: actor.id,
       });
       if (laneChanges.to === 'Done') unlockDependents(ctx, id);
-      if (row.lane === 'Review' && laneChanges.to === 'InProgress') {
-        logEvent(ctx, 'task.review_rejected', {
-          taskId: id,
-          boardId: row.board_id,
-          reworks: (row.review_reworks ?? 0) + 1,
-          summary: patch.detail ?? 'Moved to InProgress',
-        });
-      }
     }
   });
   return getTask(ctx, id);
@@ -858,13 +934,13 @@ export async function cancelTask(ctx: Ctx, actor: Agent, id: string, reason: str
     });
   });
 }
-export function finalizeTaskReview(
+export async function finalizeTaskReview(
   ctx: Ctx,
   actor: Agent,
   id: string,
   result: { verdict: 'pass' | 'reject'; summary: string },
   opts: { maxReworks?: number; integrated?: boolean } = {},
-): Task {
+): Promise<Task> {
   if (actor.role !== 'orchestrator' && actor.role !== 'user') {
     throw new HttpError(403, 'only orchestrator/user may finalize task review');
   }
@@ -879,33 +955,80 @@ export function finalizeTaskReview(
   }
   const summary = result.summary.trim().slice(0, 6000);
   if (!summary) throw new HttpError(422, 'review summary required');
-  return withWrite(ctx, 'task.reviewFinalize', () => {
-    const now = Date.now();
-    const user = ctx.holder.db.prepare("SELECT handle FROM agent WHERE id='user'").get() as { handle?: string } | undefined;
-    const userHandle = user?.handle || '用户';
-    if (result.verdict === 'pass') {
-      ctx.holder.db.prepare("UPDATE task SET lane='Done', review_status='passed', review_summary=?, last_activity_at=?, updated_at=? WHERE id=?")
-        .run(summary, now, now, id);
-      logEvent(ctx, 'task.review_passed', { taskId: id, boardId: task.boardId, summary });
-      logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'Done', by: actor.id });
-      messageInner(ctx, { boardId: task.boardId, author: actor.id, kind: 'report', content: `@${userHandle} ${id} 独立审核通过，变更已合并并移入 Done。\n\n${summary}` });
-      unlockDependents(ctx, id);
-    } else if (task.reviewReworks < maxReworks) {
-      const nextReworks = task.reviewReworks + 1;
-      ctx.holder.db.prepare("UPDATE task SET lane='InProgress', review_status='rework', review_reworks=?, review_summary=?, last_activity_at=?, updated_at=? WHERE id=?")
-        .run(nextReworks, summary, now, now, id);
-      logEvent(ctx, 'task.review_rejected', { taskId: id, boardId: task.boardId, reworks: nextReworks, summary });
-      messageInner(ctx, { boardId: task.boardId, author: actor.id, kind: 'intervention', content: `@${task.assignee} @老板 ${id} 独立审核未通过（重做 ${nextReworks}/${maxReworks}）。请按以下问题修正后重新提交：\n\n${summary}` });
-      logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'InProgress', by: actor.id });
-    } else {
-      ctx.holder.db.prepare("UPDATE task SET review_status='blocked', review_summary=?, last_activity_at=?, updated_at=? WHERE id=?")
-        .run(summary, now, now, id);
-      logEvent(ctx, 'task.review_blocked', { taskId: id, boardId: task.boardId, reworks: task.reviewReworks, summary });
-      messageInner(ctx, { boardId: task.boardId, author: actor.id, kind: 'system', content: `⚠ ${id} 独立审核连续未通过，已达到 ${maxReworks} 次重做上限并挂起，请 @${userHandle} 人工仲裁。\n\n${summary}` });
+
+  return withTaskIntegrationLock(id, async () => {
+    const current = getTask(ctx, id);
+    if (current.status === 'cancelled') throw new HttpError(409, `task ${id} is cancelled`);
+    if (current.lane !== 'Review' || current.reviewStatus !== 'reviewing') {
+      throw new HttpError(409, `task ${id} is not being reviewed`);
     }
-    return getTask(ctx, id);
+    return withWrite(ctx, 'task.reviewFinalize', () => {
+      const now = Date.now();
+      const user = ctx.holder.db.prepare("SELECT handle FROM agent WHERE id='user'").get() as { handle?: string } | undefined;
+      const userHandle = user?.handle || '用户';
+      if (result.verdict === 'pass') {
+        const res = ctx.holder.db
+          .prepare(
+            "UPDATE task SET lane='Done', review_status='passed', review_summary=?, last_activity_at=?, updated_at=? WHERE id=? AND lane='Review' AND status='active'",
+          )
+          .run(summary, now, now, id);
+        if (Number(res.changes) !== 1) throw new HttpError(409, `task ${id} state changed concurrently`);
+        logEvent(ctx, 'task.review_passed', { taskId: id, boardId: current.boardId, summary });
+        logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'Done', by: actor.id });
+        messageInner(ctx, {
+          boardId: current.boardId,
+          author: actor.id,
+          kind: 'report',
+          content: `@${userHandle} ${id} 独立审核通过，变更已合并并移入 Done。\n\n${summary}`,
+        });
+        unlockDependents(ctx, id);
+      } else if (current.reviewReworks < maxReworks) {
+        const nextReworks = current.reviewReworks + 1;
+        const res = ctx.holder.db
+          .prepare(
+            `UPDATE task
+             SET lane='InProgress',
+                 review_status='rework',
+                 review_reworks=?,
+                 review_summary=?,
+                 attempt=attempt + 1,
+                 last_activity_at=?,
+                 last_real_activity_at=?,
+                 last_activity_kind='rework',
+                 last_progress_at=?,
+                 updated_at=?
+             WHERE id=? AND lane='Review' AND status='active'`,
+          )
+          .run(nextReworks, summary, now, now, now, now, id);
+        if (Number(res.changes) !== 1) throw new HttpError(409, `task ${id} state changed concurrently`);
+        logEvent(ctx, 'task.review_rejected', { taskId: id, boardId: current.boardId, reworks: nextReworks, summary });
+        messageInner(ctx, {
+          boardId: current.boardId,
+          author: actor.id,
+          kind: 'intervention',
+          content: `@${current.assignee} @老板 ${id} 独立审核未通过（重做 ${nextReworks}/${maxReworks}）。请按以下问题修正后重新提交：\n\n${summary}`,
+        });
+        logEvent(ctx, 'task.lane_changed', { taskId: id, from: 'Review', to: 'InProgress', by: actor.id });
+      } else {
+        const res = ctx.holder.db
+          .prepare(
+            "UPDATE task SET review_status='blocked', review_summary=?, last_activity_at=?, updated_at=? WHERE id=? AND lane='Review' AND status='active'",
+          )
+          .run(summary, now, now, id);
+        if (Number(res.changes) !== 1) throw new HttpError(409, `task ${id} state changed concurrently`);
+        logEvent(ctx, 'task.review_blocked', { taskId: id, boardId: current.boardId, reworks: current.reviewReworks, summary });
+        messageInner(ctx, {
+          boardId: current.boardId,
+          author: actor.id,
+          kind: 'system',
+          content: `⚠ ${id} 独立审核连续未通过，已达到 ${maxReworks} 次重做上限并挂起，请 @${userHandle} 人工仲裁。\n\n${summary}`,
+        });
+      }
+      return getTask(ctx, id);
+    });
   });
 }
+
 
 export function recoverReviewerClaims(ctx: Ctx): number {
   const rows = ctx.holder.db.prepare("SELECT id, board_id FROM task WHERE status='active' AND lane='Review' AND review_status='reviewing'").all() as { id: string; board_id: string }[];
@@ -971,22 +1094,41 @@ export function failTaskReview(ctx: Ctx, taskId: string, summary: string): void 
 
 // 上游进 Done：依赖它的任务若全部依赖已完成，记 autoUnblockedAt（§5.1）
 function unlockDependents(ctx: Ctx, doneId: string): void {
-  const rows = ctx.holder.db.prepare('SELECT id, depends_on FROM task').all() as {
+  const rows = ctx.holder.db.prepare("SELECT id, lane, status, depends_on FROM task WHERE status = 'active'").all() as {
     id: string;
+    lane: Lane;
+    status: string;
     depends_on: string;
   }[];
+  const now = Date.now();
   for (const r of rows) {
     if (r.id === doneId) continue;
-    const deps = JSON.parse(r.depends_on) as string[];
+    let deps: string[];
+    try {
+      deps = JSON.parse(r.depends_on) as string[];
+    } catch {
+      continue;
+    }
     if (!deps.includes(doneId)) continue;
     if (depsDone(ctx, deps)) {
-      ctx.holder.db
-        .prepare('UPDATE task SET auto_unblocked_at = ?, updated_at = ? WHERE id = ?')
-        .run(Date.now(), Date.now(), r.id);
-      logEvent(ctx, 'task.auto_unlocked', { taskId: r.id, unlockedBy: doneId });
+      if (r.lane === 'Backlog' && r.status === 'active') {
+        const res = ctx.holder.db
+          .prepare("UPDATE task SET lane = 'Ready', auto_unblocked_at = ?, updated_at = ? WHERE id = ? AND status = 'active' AND lane = 'Backlog'")
+          .run(now, now, r.id);
+        if (Number(res.changes) === 1) {
+          logEvent(ctx, 'task.lane_changed', { taskId: r.id, from: 'Backlog', to: 'Ready', by: 'system' });
+          logEvent(ctx, 'task.auto_unlocked', { taskId: r.id, unlockedBy: doneId });
+        }
+      } else if (r.status === 'active') {
+        ctx.holder.db
+          .prepare("UPDATE task SET auto_unblocked_at = COALESCE(auto_unblocked_at, ?), updated_at = ? WHERE id = ? AND status = 'active'")
+          .run(now, now, r.id);
+        logEvent(ctx, 'task.auto_unlocked', { taskId: r.id, unlockedBy: doneId });
+      }
     }
   }
 }
+
 
 export function addDependencies(ctx: Ctx, actor: Agent, id: string, on: string[]): Task {
   if (!Array.isArray(on) || on.length === 0) throw new HttpError(422, 'on[] required');

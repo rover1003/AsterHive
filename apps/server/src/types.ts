@@ -4,6 +4,7 @@ export interface Config {
   dataDir: string;
   ttlMinutes: number;
   keepSnapshots: number;
+  adminRecoveryToken?: string;
 }
 
 export interface Holder {

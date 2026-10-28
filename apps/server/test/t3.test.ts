@@ -117,6 +117,8 @@ test('T3: 依赖链——上游 Done 自动解锁下游；Ready 门槛', async (
   const { rig, app } = makeRigWithApp();
   try {
     const { token } = registerAgent(rig.ctx, { name: '主脑A', handle: 'brain-a', role: 'orchestrator' });
+    const worker = registerAgent(rig.ctx, { name: '工蜂', handle: 'dep-bee' });
+    const WH = { 'content-type': 'application/json', ...authedInit(worker.token).headers };
     const H = { 'content-type': 'application/json', ...authedInit(token).headers };
     await app.request('/boards', {
       method: 'POST',
@@ -126,7 +128,7 @@ test('T3: 依赖链——上游 Done 自动解锁下游；Ready 门槛', async (
     await app.request('/boards/demo/tasks', {
       method: 'POST',
       headers: H,
-      body: JSON.stringify({ id: 'T1', title: '上游' }),
+      body: JSON.stringify({ id: 'T1', title: '上游', assignee: worker.agent.id }),
     });
     await app.request('/boards/demo/tasks', {
       method: 'POST',
@@ -142,26 +144,18 @@ test('T3: 依赖链——上游 Done 自动解锁下游；Ready 门槛', async (
     });
     assert.equal(res.status, 422);
 
-    // T1 → Ready → InProgress → Review → Done（主脑角色可移动 Done）
-    for (const lane of ['Ready', 'InProgress', 'Review', 'Done']) {
-      res = await app.request('/tasks/T1', {
-        method: 'PATCH',
-        headers: H,
-        body: JSON.stringify({ lane }),
-      });
-      assert.equal(res.status, 200, `T1 → ${lane}`);
-    }
+    res = await app.request('/tasks/T1', { method: 'PATCH', headers: H, body: JSON.stringify({ lane: 'Ready' }) });
+    assert.equal(res.status, 200);
+    res = await app.request('/tasks/T1/claim', { method: 'POST', headers: WH, body: '{}' });
+    assert.equal(res.status, 200);
+    res = await app.request('/tasks/T1/submit', { method: 'POST', headers: WH, body: JSON.stringify({ summary: '完成上游' }) });
+    assert.equal(res.status, 200);
+    res = await app.request('/tasks/T1', { method: 'PATCH', headers: H, body: JSON.stringify({ lane: 'Done' }) });
+    assert.equal(res.status, 200);
     res = await app.request('/tasks/T2', { headers: H });
     const t2 = ((await res.json()) as { task: { autoUnblockedAt: number | null; lane: string } }).task;
     assert.ok(t2.autoUnblockedAt, 'T1 Done 后 T2 记录 autoUnblockedAt');
-
-    // 解锁后 T2 可进 Ready
-    res = await app.request('/tasks/T2', {
-      method: 'PATCH',
-      headers: H,
-      body: JSON.stringify({ lane: 'Ready' }),
-    });
-    assert.equal(res.status, 200);
+    assert.equal(t2.lane, 'Ready', '依赖满足后自动进入 Ready');
   } finally {
     rig.cleanup();
   }

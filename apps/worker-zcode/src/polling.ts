@@ -76,17 +76,20 @@ export async function pollNextDirectedTask<T extends { id: string }>(
   for (const boardId of boardIds) {
     try {
       const inProgress = await channels.listMine(boardId, 'InProgress');
-      const reworks = inProgress.filter((t) => {
-        if (channels.isRework) return channels.isRework(t);
-        const task = t as { reviewStatus?: string };
-        return task.reviewStatus === undefined || task.reviewStatus === 'rework';
-      });
-      if (channels.checkGate) {
-        const gate = await channels.checkGate(boardId, reworks);
-        if (gate === 'stop') continue;
-      }
-      if (reworks.length > 0) {
-        return { task: reworks[0], channel: 'rework', boardId };
+      if (inProgress.length > 0) {
+        const reworks = inProgress.filter((t) => {
+          const task = t as { reviewStatus?: string; lastActivityKind?: string | null };
+          if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout') return false;
+          return channels.isRework ? channels.isRework(t) : task.reviewStatus === 'rework';
+        });
+        if (channels.checkGate) {
+          const gate = await channels.checkGate(boardId, reworks);
+          if (gate === 'stop') continue;
+        }
+        if (reworks.length > 0) {
+          return { task: reworks[0], channel: 'rework', boardId };
+        }
+        continue;
       }
       const mine = await channels.listMine(boardId, 'Ready');
       if (mine.length > 0) {

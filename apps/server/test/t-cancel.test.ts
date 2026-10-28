@@ -41,7 +41,7 @@ test('cancelled reviewer completion cannot finalize or release dependencies', as
     assert.equal(submitted.reviewStatus, 'pending');
     assert.ok(claimTaskForReview(rig.ctx, 'CAN-2'));
     await cancelTask(rig.ctx, user, 'CAN-2', '停止审核');
-    assert.throws(() => finalizeTaskReview(rig.ctx, user, 'CAN-2', { verdict: 'pass', summary: 'ok' }, { integrated: true }), /cancelled/i);
+    await assert.rejects(async () => await finalizeTaskReview(rig.ctx, user, 'CAN-2', { verdict: 'pass', summary: 'ok' }, { integrated: true }), /cancelled/i);
     assert.equal(getTask(rig.ctx, 'CAN-2').lane, 'Review');
     assert.equal(getTask(rig.ctx, 'CAN-3').lane, 'Backlog');
     assert.equal(dep.autoUnblockedAt, null);

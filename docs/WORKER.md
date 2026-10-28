@@ -259,6 +259,15 @@ Windows、Linux 和 macOS 的 `install-bee` 一键安装/升级脚本提供思�
 | 异常/超时 | 超时或异常时保留工作区与现场，上报 `kind: 'error'` 或 `'timeout'` 的 checkpoint 明确记录可恢复现场，任务保持 InProgress 并由看板雷达预警，避免盲目重派与丢失现场 |
 | 上交 | submit：summary（执行输出末 6 行，repo 模式附本地提交信息）+ 证据——repo 模式为本任务变更文件 + `git:<分支>@<hash>`；scratch 模式递归收集工作目录全部文件（跳过 `.git`/`node_modules`），记录相对路径与本机机器名 |
 | 被退回 | 用户或主脑可通过受控指令（`/tasks/:id/review/return`）将 Review 状态任务原子退回指定工蜂，转为 `InProgress`（`reviewStatus: 'rework'`），由工蜂在下轮轮询重新领取断点续做 |
+
+工蜂准备 Git 工作区时优先使用设备或仓库已有的提交身份；缺少名称或邮箱时，仅在该工作区的本地 Git 配置中补充 `AsterHive Worker <worker@asterhive.invalid>` 中缺失的字段，不修改全局配置、不覆盖已有值。该地址是不可投递的占位地址；任务来源和执行工蜂仍以 Hive 的任务记录为准。
+
+托管代码任务的人工验收先合并任务引用，再进入 Done；缺少任务结果或合并失败时保留 Review，不解锁下游。审核正在运行时须等待结束；明确标记为无代码的任务由用户人工验收，不要求代码引用。
+
+任务报错后保留 `InProgress` 和现场，页面显示失败原因，不自动重派。受控解除占用前，必须在设备上确认旧任务执行已实际停止；断网或心跳过期不构成停止确认。之后在任务详情选择“确认停止后解除占用”，经用户确认和管理员凭据验证后，系统递增执行轮次并解除指派；需由蜂后重新派发。
+
+管理员恢复凭据由部署者在服务器的 Compose `.env` 中设置 `ASTERHIVE_ADMIN_RECOVERY_TOKEN`：使用密码管理器生成至少 32 字符、随机且独立的高强度秘密，设置文件权限并重新部署服务。不要将凭据提交仓库、贴入聊天或放进日志。网页仅在 HTTPS 或本机 `localhost` 安全上下文中请求凭据，凭据仅用于本次操作；生产环境应配置 HTTPS 或使用受信任的加密隧道。未配置时受控解除占用不可用，不会降级为匿名操作。
+
 ## 交互会话型 worker（桌面版 agent）
 
 worker 的合同只是「能发 HTTP」，不要求常驻守护进程。任何交互式桌面 agent 会话（如 ZCode Desktop）都可以当 worker：注册拿到 token 后，由人打开会话说「领活」，会话内 agent 用 Bash+curl（或 `@asterhive/sdk`）完成领活→执行→上交全流程；聊天室 @派活 会进它的收件箱（`GET /agents/me/inbox`）。

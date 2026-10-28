@@ -168,6 +168,9 @@ export function dispatchTask(
   }
   const task = getTask(ctx, taskId);
   if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+  if (task.lane === 'InProgress') {
+    throw new HttpError(409, `task ${taskId} is InProgress; cannot reassign active execution. Release task after confirming worker stopped.`);
+  }
   const assignee = input.assignee?.trim() || task.assignee;
   // 参与限制：被派者是 worker 且该板参与者列表非空时，必须在列表内（user/orchestrator 豁免）
   const assigneeAgent = findAgent(ctx, assignee);

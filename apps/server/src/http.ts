@@ -1,5 +1,6 @@
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { Context } from 'hono';
@@ -111,13 +112,13 @@ function requireTokenActor(ctx: Ctx, c: Context): Agent {
 
 function requireVerifiedUser(ctx: Ctx, c: Context): Agent {
   const token = bearerToken(c);
-  if (!token) throw new HttpError(401, 'unauthorized: verified user bearer token required for high-risk task release');
-  const agent = authByToken(ctx, token);
-  if (!agent) throw new HttpError(401, 'invalid or revoked bearer token');
-  if (agent.role !== 'user') {
-    throw new HttpError(403, 'only user role may confirm worker stopped and force release tasks');
-  }
-  return agent;
+  if (!token) throw new HttpError(401, 'administrator recovery credential required');
+  const configured = ctx.cfg.adminRecoveryToken;
+  if (!configured || configured.length < 32) throw new HttpError(503, 'administrator recovery credential is not configured');
+  const suppliedDigest = createHash('sha256').update(token, 'utf8').digest();
+  const expectedDigest = createHash('sha256').update(configured, 'utf8').digest();
+  if (!timingSafeEqual(suppliedDigest, expectedDigest)) throw new HttpError(403, 'invalid administrator recovery credential');
+  return ensureUserAgent(ctx);
 }
 // 提权写闸门：worker 角色的 token 不放行（信任分层仍对 agent 生效）；匿名即 user，自然通过。
 function requireElevated(ctx: Ctx, c: Context): Agent {
@@ -601,24 +602,27 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.post('/tasks/:id/release', async (c) => {
     const actor = requireActor(ctx, c);
     const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-    const task = releaseTask(ctx, actor, c.req.param('id'), body.reason);
+    const task = await releaseTask(ctx, actor, c.req.param('id'), body.reason);
     return c.json({ task, by: actor.id });
   });
 
   app.post('/tasks/:id/submit', async (c) => {
     const actor = requireActor(ctx, c);
+    const taskId = c.req.param('id');
     const body = (await c.req.json().catch(() => ({}))) as {
       summary?: string;
       evidence?: { path: string; machine?: string; note?: string }[];
       noCode?: boolean;
       attempt?: number;
     };
-    const task = submitTask(ctx, actor, c.req.param('id'), {
-      summary: body.summary ?? '',
-      evidence: body.evidence,
-      noCode: body.noCode,
-      attempt: body.attempt,
-    });
+    const task = await withTaskIntegrationLock(taskId, async () =>
+      submitTask(ctx, actor, taskId, {
+        summary: body.summary ?? '',
+        evidence: body.evidence,
+        noCode: body.noCode,
+        attempt: body.attempt,
+      }),
+    );
     return c.json({ task, by: actor.id });
   });
 
@@ -626,6 +630,11 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     const actor = requireElevated(ctx, c);
     const task = retryTaskReview(ctx, actor, c.req.param('id'));
     return c.json({ task });
+  });
+
+  app.post('/tasks/:id/review/accept', async (c) => {
+    const actor = requireElevated(ctx, c);
+    return c.json(await repoManager.acceptManualTask(c.req.param('id'), actor));
   });
 
   app.post('/tasks/:id/review/return', async (c) => {
@@ -652,23 +661,57 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.get('/tasks/:id/repo-snapshot', async (c) => {
     const actor = requireActor(ctx, c);
     const taskId = c.req.param('id');
-    const task = getTask(ctx, taskId);
-    if (actor.role === 'worker') {
-      requireParticipant(ctx, task.boardId, actor);
-    }
-    const snap = await repoManager.exportTaskSnapshot(task.boardId, taskId);
-    try {
-      const stat = statSync(snap.bundlePath);
-      c.header('content-type', 'application/vnd.git.bundle');
-      c.header('content-length', String(stat.size));
-      c.header('x-base-commit', snap.baseCommit);
-      const stream = createReadStream(snap.bundlePath);
-      stream.on('close', snap.cleanup);
-      return c.body(stream as unknown as ReadableStream);
-    } catch (err) {
-      snap.cleanup();
-      throw err;
-    }
+    const rawAttempt = c.req.header('x-task-attempt');
+    const expectedAttempt = rawAttempt !== undefined ? Number(rawAttempt) : undefined;
+
+    return withTaskIntegrationLock(taskId, async () => {
+      const task = getTask(ctx, taskId);
+      if (actor.role === 'worker') {
+        requireParticipant(ctx, task.boardId, actor);
+        if (task.assignee !== actor.id && task.assignee !== actor.handle) {
+          throw new HttpError(403, `only assigned worker (${task.assignee}) may download repo snapshot`);
+        }
+      }
+      if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+      if (task.lane !== 'InProgress') throw new HttpError(409, `task ${taskId} not InProgress (lane: ${task.lane})`);
+
+      const taskAttempt = task.attempt ?? 1;
+      if (actor.role === 'worker') {
+        if (taskAttempt > 1) {
+          if (expectedAttempt === undefined) {
+            throw new HttpError(
+              409,
+              `stale or unversioned execution attempt: task ${taskId} has been re-dispatched (attempt ${taskAttempt}); x-task-attempt header required`,
+            );
+          }
+          if (expectedAttempt !== taskAttempt) {
+            throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${expectedAttempt}`);
+          }
+        } else if (expectedAttempt !== undefined && expectedAttempt !== taskAttempt) {
+          throw new HttpError(409, `stale execution attempt: expected ${taskAttempt}, got ${expectedAttempt}`);
+        }
+      }
+
+      const snap = await repoManager.exportTaskSnapshot(task.boardId, taskId);
+      try {
+        const stat = statSync(snap.bundlePath);
+        c.header('content-type', 'application/vnd.git.bundle');
+        c.header('content-length', String(stat.size));
+        c.header('x-base-commit', snap.baseCommit);
+        if (snap.reworkCommit) {
+          c.header('x-rework-commit', snap.reworkCommit);
+        }
+        if (snap.reworkBranch) {
+          c.header('x-rework-branch', snap.reworkBranch);
+        }
+        const stream = createReadStream(snap.bundlePath);
+        stream.on('close', snap.cleanup);
+        return c.body(stream as unknown as ReadableStream);
+      } catch (err) {
+        snap.cleanup();
+        throw err;
+      }
+    });
   });
 
   // managed 模式：Worker 回传任务结果 Git Bundle
@@ -694,6 +737,9 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
       }
       if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
       if (task.lane !== 'InProgress') throw new HttpError(409, `task ${taskId} not InProgress (lane: ${task.lane})`);
+      if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout') {
+        throw new HttpError(409, 'task execution failed; 确认工蜂停止后受控恢复');
+      }
 
       const taskAttempt = task.attempt ?? 1;
       if (taskAttempt > 1) {
@@ -772,7 +818,7 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.get('/tasks/:id/evidence/:fileId', (c) => {
     requireActor(ctx, c);
     const { file, content } = readEvidenceContent(ctx, c.req.param('id'), Number(c.req.param('fileId')));
-    return new Response(content as unknown as BodyInit, {
+    return new Response(content as ConstructorParameters<typeof Response>[0], {
       headers: {
         'content-type': 'application/octet-stream',
         'content-length': String(content.byteLength),

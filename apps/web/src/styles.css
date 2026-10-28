@@ -776,6 +776,18 @@ time { font-size: 11px; color: var(--subtle-foreground); }
   }
 }
 
+.recovery-dialog {
+  width: min(440px, calc(100vw - 32px));
+  padding: 24px;
+  color: var(--foreground);
+  background: var(--popover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+.recovery-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+.recovery-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
 /* ---------- 抽屉：popover 底 + 左边框 + shadow-lg ---------- */
 .drawer-mask { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); backdrop-filter: blur(2px); z-index: 40; }
 .drawer {

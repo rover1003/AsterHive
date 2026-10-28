@@ -212,7 +212,7 @@ test('Reviewer: managed submit queues automatically; legacy submit preserves man
   } finally { rig.cleanup(); }
 });
 
-test('Reviewer: rejection allows two reworks, third rejection blocks, manual pass requires integration', () => {
+test('Reviewer: rejection allows two reworks, third rejection blocks, manual pass requires integration', async () => {
   const rig = mkRig();
   try {
     const worker = registerAgent(rig.ctx, { name: 'Worker', handle: 'review-worker-3' }).agent;
@@ -228,19 +228,19 @@ test('Reviewer: rejection allows two reworks, third rejection blocks, manual pas
     assert.ok(claimed);
     assert.equal(claimed.reviewStatus, 'reviewing');
     assert.equal(claimed.reviewAttempts, 1);
-    assert.throws(() => finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'pass', summary: 'Pass' }), /integrated/);
-    assert.equal(finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'reject', summary: 'Fix issue A' }).reviewReworks, 1);
+    await assert.rejects(async () => await finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'pass', summary: 'Pass' }), /integrated/);
+    assert.equal((await finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'reject', summary: 'Fix issue A' })).reviewReworks, 1);
 
-    submitTask(rig.ctx, worker, 'REV-3', { summary: 'Updated once' });
+    submitTask(rig.ctx, worker, 'REV-3', { summary: 'Updated once', attempt: 2 });
     claimed = claimTaskForReview(rig.ctx, 'REV-3');
     assert.ok(claimed);
-    let task = finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'reject', summary: 'Fix issue B' });
+    let task = await finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'reject', summary: 'Fix issue B' });
     assert.equal(task.reviewReworks, 2);
 
-    submitTask(rig.ctx, worker, 'REV-3', { summary: 'Updated twice' });
+    submitTask(rig.ctx, worker, 'REV-3', { summary: 'Updated twice', attempt: 3 });
     claimed = claimTaskForReview(rig.ctx, 'REV-3');
     assert.ok(claimed);
-    task = finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'reject', summary: 'Still broken' });
+    task = await finalizeTaskReview(rig.ctx, reviewer, 'REV-3', { verdict: 'reject', summary: 'Still broken' });
     assert.equal(task.reviewStatus, 'blocked');
     assert.equal(task.lane, 'Review');
     assert.ok(listMessages(rig.ctx, 'review-board').some((m) => m.content.includes('达到 2 次重做上限')));
@@ -402,7 +402,7 @@ test('审核后 Diff 固定到任务基线：已合并任务仍保留原始代�
       const result = await manager.inspectTask('diff-after-merge', task.id);
       assert.equal(result.base, baseCommit);
       assert.match(result.diffText, /diffSurvivesMerge/);
-      finalizeTaskReview(rig.ctx, reviewer, task.id, { verdict: 'pass', summary: 'The committed diff is present.' }, { integrated: true });
+      await finalizeTaskReview(rig.ctx, reviewer, task.id, { verdict: 'pass', summary: 'The committed diff is present.' }, { integrated: true });
     } finally {
       rmSync(root, { recursive: true, force: true, maxRetries: 4, retryDelay: 50 });
     }

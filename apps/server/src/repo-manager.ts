@@ -7,7 +7,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
-import { getBoard, getTask, setBoardRepoState, type Board } from './tasks.ts';
+import { getBoard, getTask, setBoardRepoState, updateTask, type Board, type Task } from './tasks.ts';
+import type { Agent } from './agents.ts';
 import { withWrite, logEvent } from './write.ts';
 import { withTaskIntegrationLock } from './task-integration-lock.ts';
 
@@ -356,32 +357,65 @@ export class RepoManager {
     }
   }
 
-  async exportTaskSnapshot(boardId: string, taskId: string): Promise<{ bundlePath: string; baseCommit: string; cleanup: () => void }> {
+  async exportTaskSnapshot(
+    boardId: string,
+    taskId: string,
+  ): Promise<{ bundlePath: string; baseCommit: string; reworkCommit?: string; reworkBranch?: string; cleanup: () => void }> {
     const board = getBoard(this.#ctx, boardId);
     if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
     if (board.repoStatus !== 'ready') throw new HttpError(409, `server repository is not ready (${board.repoStatus})`);
     const repo = this.repoPath(boardId);
     if (!existsSync(repo)) throw new HttpError(409, 'server repository does not exist');
-    const rev = await runGit(['rev-parse', 'HEAD'], repo);
-    if (rev.code !== 0 || !rev.stdout.trim()) throw new HttpError(422, 'server repository has no resolvable HEAD');
-    const baseCommit = rev.stdout.trim();
+
+    // 1. 保留任务原始 baseCommit：若已存在则直接沿用，绝不可用当前最新 HEAD 覆盖旧 base
+    const baseRef = `refs/asterhive/task-bases/${taskId}`;
+    let baseCommit = '';
+    const storedBase = await runGit(['rev-parse', '--verify', baseRef], repo);
+    if (storedBase.code === 0 && storedBase.stdout.trim()) {
+      baseCommit = storedBase.stdout.trim();
+    } else {
+      const rev = await runGit(['rev-parse', 'HEAD'], repo);
+      if (rev.code !== 0 || !rev.stdout.trim()) throw new HttpError(422, 'server repository has no resolvable HEAD');
+      baseCommit = rev.stdout.trim();
+      const saveBase = await runGit(['update-ref', baseRef, baseCommit], repo);
+      if (saveBase.code !== 0) {
+        throw new HttpError(500, `failed to record task snapshot base: ${safeError(saveBase.stderr)}`);
+      }
+    }
+
+    // 2. 检查是否存在上一轮执行提交的 task ref (refs/asterhive/tasks/${taskId})
+    const taskRef = `refs/asterhive/tasks/${taskId}`;
+    let reworkCommit: string | undefined;
+    let reworkBranch: string | undefined;
+    const taskRefCheck = await runGit(['rev-parse', '--verify', taskRef], repo);
+    if (taskRefCheck.code === 0 && taskRefCheck.stdout.trim()) {
+      reworkCommit = taskRefCheck.stdout.trim();
+      reworkBranch = `asterhive/${taskId}`;
+      // 同时在裸仓保留/更新 refs/heads/asterhive/${taskId}，使得 git clone 时工蜂可直接检出分支
+      const updated = await runGit(['update-ref', `refs/heads/asterhive/${taskId}`, reworkCommit], repo);
+      if (updated.code !== 0) throw new HttpError(500, `failed to prepare rework branch: ${safeError(updated.stderr)}`);
+    }
+
     const tempDir = join(this.root, `.snap-${boardId}-${taskId}-${randomUUID()}`);
     mkdirSync(tempDir, { recursive: true, mode: 0o700 });
     const bundle = join(tempDir, 'snapshot.bundle');
-    const created = await runGit(['bundle', 'create', bundle, 'HEAD'], repo);
+
+    // 3. 构建 bundle：包含 HEAD 以及上一代 task ref / branch
+    const bundleArgs = ['bundle', 'create', bundle, 'HEAD', baseRef];
+    if (reworkCommit) {
+      bundleArgs.push(taskRef, `refs/heads/asterhive/${taskId}`);
+    }
+    const created = await runGit(bundleArgs, repo);
     if (created.code !== 0) {
       rmSync(tempDir, { recursive: true, force: true });
       throw new HttpError(500, `failed to generate task snapshot bundle: ${safeError(created.stderr)}`);
     }
-    const baseRef = `refs/asterhive/task-bases/${taskId}`;
-    const storedBase = await runGit(['update-ref', baseRef, baseCommit], repo);
-    if (storedBase.code !== 0) {
-      rmSync(tempDir, { recursive: true, force: true });
-      throw new HttpError(500, `failed to record task snapshot base: ${safeError(storedBase.stderr)}`);
-    }
+
     return {
       bundlePath: bundle,
       baseCommit,
+      reworkCommit,
+      reworkBranch,
       cleanup: () => rmSync(tempDir, { recursive: true, force: true }),
     };
   }
@@ -489,9 +523,26 @@ export class RepoManager {
     return withTaskIntegrationLock(taskId, () => this.#integrateTask(boardId, taskId));
   }
 
+  async acceptManualTask(taskId: string, actor: Agent): Promise<{ task: Task; mergedCommit: string | null }> {
+    if (actor.role !== 'user') throw new HttpError(403, '人工验收仅允许用户操作');
+    return withTaskIntegrationLock(taskId, async () => {
+      const task = getTask(this.#ctx, taskId);
+      if (task.status !== 'active' || task.lane !== 'Review') throw new HttpError(409, '任务不在待验收状态');
+      if (task.reviewStatus === 'reviewing') throw new HttpError(409, '独立审核正在进行，请等待审核结束');
+      const board = getBoard(this.#ctx, task.boardId);
+      const mergedCommit = board.repoMode === 'managed' && task.workspace.noCode !== true
+        ? (await this.#integrateTask(task.boardId, task.id)).mergedCommit
+        : null;
+      const done = updateTask(this.#ctx, actor, task.id, { lane: 'Done' }, { integratedManagedCode: mergedCommit !== null, manualAcceptance: true });
+      return { task: done, mergedCommit };
+    });
+  }
+
   async #integrateTask(boardId: string, taskId: string): Promise<{ mergedCommit: string }> {
     const board = getBoard(this.#ctx, boardId);
-    if (getTask(this.#ctx, taskId).status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+    const task = getTask(this.#ctx, taskId);
+    if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+    if (task.lane !== 'Review') throw new HttpError(409, `task ${taskId} is not in Review`);
     if (board.repoMode !== 'managed') throw new HttpError(409, 'board is not in managed repository mode');
     const repo = this.repoPath(boardId);
     const targetRef = `refs/asterhive/tasks/${taskId}`;

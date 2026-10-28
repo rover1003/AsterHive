@@ -17,8 +17,10 @@ import {
   claimTaskForReview,
   finalizeTaskReview,
   returnTaskFromReview,
+  setBoardRepoState,
+  type Task,
 } from '../src/tasks.ts';
-import { claimTask, submitTask, checkpointTask, nextTask } from '../src/verbs.ts';
+import { claimTask, submitTask, checkpointTask, nextTask, releaseTask } from '../src/verbs.ts';
 import { createApp } from '../src/http.ts';
 import { listEvents } from '../src/write.ts';
 import { listMessages } from '../src/messages.ts';
@@ -625,6 +627,8 @@ test('失联与挂起任务栅栏安全: releaseStuckTask 与 sweepStale 建立�
     );
 
     // 4. HTTP API 端点权限与确认门禁校验
+    const adminToken = 'A'.repeat(48);
+    rig.ctx.cfg.adminRecoveryToken = adminToken;
     const app = createApp(rig.ctx);
     const queenHttpRes = await app.request('/agents/w-stuck1/control/release-task', {
       method: 'POST',
@@ -635,7 +639,7 @@ test('失联与挂起任务栅栏安全: releaseStuckTask 与 sweepStale 建立�
 
     const userUnconfirmedHttpRes = await app.request('/agents/w-stuck1/control/release-task', {
       method: 'POST',
-      headers: H(userReg.token),
+      headers: H(adminToken),
       body: JSON.stringify({ taskId: 'STK-1', confirmedStopped: false }),
     });
     assert.equal(userUnconfirmedHttpRes.status, 409, 'HTTP 端点未经用户明确确认必须报 409');
@@ -672,3 +676,420 @@ test('失联与挂起任务栅栏安全: releaseStuckTask 与 sweepStale 建立�
     rig.cleanup();
   }
 });
+
+test('审核退回重做: 原子自增 attempt 并建立代次栅栏，快照 Bundle 包含上一代变更与原始 baseCommit', async () => {
+  const rig = mkRig();
+  try {
+    const userReg = registerAgent(rig.ctx, { id: 'u-rwk', name: 'User', handle: 'u-rwk', role: 'user' });
+    const reviewerReg = registerAgent(rig.ctx, { id: 'rev-rwk', name: 'Reviewer', handle: 'rev-rwk', role: 'orchestrator' });
+    const workerReg = registerAgent(rig.ctx, { id: 'w-rwk', name: 'Worker', handle: 'w-rwk', role: 'worker' });
+    const board = createBoard(rig.ctx, { id: 'b-rework-snap', name: 'Rework Snapshot Board', repoMode: 'managed', repoStatus: 'ready' });
+
+    createOrchestratorGroup(rig.ctx, { name: 'review', baseURL: 'https://review.invalid/v1', apiKey: 'test-key', model: 'review-model' });
+    putOrchestratorSettings(rig.ctx, { reviewerEnabled: true });
+
+    const mgr = new RepoManager(rig.ctx);
+    await mgr.initialize(board.id, 'empty');
+    await mgr.waitForJob(board.id);
+    const bareRepo = mgr.repoPath(board.id);
+
+    const seedDir = join(rig.ctx.cfg.dataDir, 'rework-seed');
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'AsterHive Test',
+      GIT_AUTHOR_EMAIL: 'test@asterhive.internal',
+      GIT_COMMITTER_NAME: 'AsterHive Test',
+      GIT_COMMITTER_EMAIL: 'test@asterhive.internal',
+    };
+    mkdirSync(seedDir, { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: seedDir, env: gitEnv });
+    writeFileSync(join(seedDir, 'README.md'), 'initial version\n');
+    execFileSync('git', ['add', '-A'], { cwd: seedDir, env: gitEnv });
+    execFileSync('git', ['commit', '-q', '-m', 'initial commit'], { cwd: seedDir, env: gitEnv });
+    execFileSync('git', ['push', '-q', bareRepo, 'main'], { cwd: seedDir, env: gitEnv });
+    execFileSync('git', ['symbolic-ref', 'HEAD', 'refs/heads/main'], { cwd: bareRepo, env: gitEnv });
+    const initialBase = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: seedDir, env: gitEnv }).toString().trim();
+    setBoardRepoState(rig.ctx, board.id, { status: 'ready', head: initialBase });
+
+    // 1. 创建任务并首次认领（attempt = 1）
+    createTask(rig.ctx, board.id, { id: 'RWK-1', title: 'Task with rework', lane: 'Ready', assignee: 'w-rwk' });
+    const initialClaim = claimTask(rig.ctx, workerReg.agent, 'RWK-1');
+    assert.equal(initialClaim.attempt, 1);
+
+    // 首次导出快照，确立 baseRef
+    const firstSnap = await mgr.exportTaskSnapshot(board.id, 'RWK-1');
+    assert.equal(firstSnap.baseCommit, initialBase);
+    firstSnap.cleanup();
+
+    // 工蜂在本地工作区提交第 1 代代码并打包上传
+    execFileSync('git', ['checkout', '-q', '-b', 'asterhive/RWK-1'], { cwd: seedDir, env: gitEnv });
+    writeFileSync(join(seedDir, 'feature.ts'), 'export const attemptOne = true;\n');
+    execFileSync('git', ['add', '-A'], { cwd: seedDir, env: gitEnv });
+    execFileSync('git', ['commit', '-q', '-m', 'attempt 1 commit'], { cwd: seedDir, env: gitEnv });
+    const attempt1Commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: seedDir, env: gitEnv }).toString().trim();
+
+    const bundleFile = join(rig.ctx.cfg.dataDir, 'rwk-result-1.bundle');
+    execFileSync('git', ['bundle', 'create', bundleFile, 'asterhive/RWK-1'], { cwd: seedDir, env: gitEnv });
+    const bundleBuf = readFileSync(bundleFile);
+    const bundleSha = createHash('sha256').update(bundleBuf).digest('hex');
+
+    await mgr.importTaskResult(board.id, 'RWK-1', [bundleBuf], bundleBuf.length, bundleSha);
+
+    // 提交任务进入 Review
+    submitTask(rig.ctx, workerReg.agent, 'RWK-1', { summary: 'Attempt 1 done', attempt: 1 });
+    assert.equal(getTask(rig.ctx, 'RWK-1').lane, 'Review');
+
+    // 2. 审核领取并驳回（finalizeTaskReview verdict: reject）
+    assert.ok(claimTaskForReview(rig.ctx, 'RWK-1'));
+    const rejectedTask = await finalizeTaskReview(rig.ctx, reviewerReg.agent, 'RWK-1', { verdict: 'reject', summary: 'Need fixes for attempt 1' });
+
+    // 验证：原子转为 InProgress / rework，且 attempt 自增到 2
+    assert.equal(rejectedTask.lane, 'InProgress');
+    assert.equal(rejectedTask.reviewStatus, 'rework');
+    assert.equal(rejectedTask.reviewReworks, 1);
+    assert.equal(rejectedTask.attempt, 2, 'finalizeTaskReview 必须原子递增 attempt 到 2 建立代次栅栏');
+    assert.equal(rejectedTask.lastActivityKind, 'rework');
+
+    // 3. 旧代次阻断校验：旧工蜂持有 attempt=1 发送 checkpoint、submit 或上传 bundle 均报 409
+    assert.throws(
+      () => checkpointTask(rig.ctx, workerReg.agent, 'RWK-1', { note: '旧代次保活', attempt: 1 }),
+      /stale execution attempt/i,
+      '旧代次 checkpoint 必须被 409 拒绝',
+    );
+    assert.throws(
+      () => submitTask(rig.ctx, workerReg.agent, 'RWK-1', { summary: '旧代次提交', attempt: 1 }),
+      /stale execution attempt/i,
+      '旧代次 submit 必须被 409 拒绝',
+    );
+
+    const app = createApp(rig.ctx);
+    const staleUploadRes = await app.request('/tasks/RWK-1/repo-result', {
+      method: 'POST',
+      headers: {
+        ...H(workerReg.token),
+        'content-length': String(bundleBuf.length),
+        'x-content-sha256': bundleSha,
+        'x-task-attempt': '1',
+      },
+      body: bundleBuf,
+    });
+    assert.equal(staleUploadRes.status, 409, '旧代次 repo-result 上传必须报 409');
+
+    // 4. 快照端点安全门禁与代次校验：GET /tasks/:id/repo-snapshot
+    // 4.1 非指派工蜂请求：报 403 阻断
+    const otherWorker = registerAgent(rig.ctx, { id: 'w-other', name: 'Other Worker', handle: 'w-other', role: 'worker' });
+    const crossWorkerRes = await app.request('/tasks/RWK-1/repo-snapshot', {
+      method: 'GET',
+      headers: { ...H(otherWorker.token), 'x-task-attempt': '2' },
+    });
+    assert.equal(crossWorkerRes.status, 403, '非本任务指派工蜂下载快照必须报 403');
+
+    // 4.2 本任务工蜂但未带 x-task-attempt（attempt > 1）：报 409 阻断
+    const unversionedSnapRes = await app.request('/tasks/RWK-1/repo-snapshot', {
+      method: 'GET',
+      headers: H(workerReg.token),
+    });
+    assert.equal(unversionedSnapRes.status, 409, 'attempt > 1 未带 x-task-attempt 必须报 409');
+
+    // 4.3 本任务工蜂但持有旧代次（x-task-attempt: 1）：报 409 阻断
+    const staleSnapRes = await app.request('/tasks/RWK-1/repo-snapshot', {
+      method: 'GET',
+      headers: { ...H(workerReg.token), 'x-task-attempt': '1' },
+    });
+    assert.equal(staleSnapRes.status, 409, '旧代次工蜂下载快照必须报 409');
+
+    // 4.4 合法提权角色（user/orchestrator）允许调用
+    const userSnapRes = await app.request('/tasks/RWK-1/repo-snapshot', {
+      method: 'GET',
+      headers: H(userReg.token),
+    });
+    assert.equal(userSnapRes.status, 200, '合法用户角色允许读取任务快照');
+
+    // 4.5 并发请求受 taskIntegrationLock 保护，串行生成无竞争
+    const [snap1, snap2] = await Promise.all([
+      app.request('/tasks/RWK-1/repo-snapshot', {
+        method: 'GET',
+        headers: { ...H(workerReg.token), 'x-task-attempt': '2' },
+      }),
+      app.request('/tasks/RWK-1/repo-snapshot', {
+        method: 'GET',
+        headers: { ...H(workerReg.token), 'x-task-attempt': '2' },
+      }),
+    ]);
+    assert.equal(snap1.status, 200);
+    assert.equal(snap2.status, 200);
+
+    // 4.6 当前指派工蜂携带匹配代次 x-task-attempt: 2：返回 200 且包含重做快照
+    const snapRes = snap1;
+    assert.equal(snapRes.headers.get('x-base-commit'), initialBase, '快照必须保留最初的 baseCommit，绝不可被最新 HEAD 覆盖');
+    assert.equal(snapRes.headers.get('x-rework-commit'), attempt1Commit, '快照响应头必须包含上一代的 reworkCommit');
+    assert.equal(snapRes.headers.get('x-rework-branch'), 'asterhive/RWK-1');
+    // 验证返回的 bundle 确实包含上一代的变更
+    const snapBundleBuf = Buffer.from(await snapRes.arrayBuffer());
+    const downloadedSnapFile = join(rig.ctx.cfg.dataDir, 'downloaded-snap.bundle');
+    writeFileSync(downloadedSnapFile, snapBundleBuf);
+
+    const verifyOut = execFileSync('git', ['bundle', 'verify', downloadedSnapFile], { cwd: seedDir, env: gitEnv }).toString();
+    assert.match(verifyOut, /The bundle records/i);
+
+    const headsOut = execFileSync('git', ['bundle', 'list-heads', downloadedSnapFile], { cwd: seedDir, env: gitEnv }).toString();
+    assert.ok(headsOut.includes(attempt1Commit), '快照 bundle 必须包含上一代工蜂提交的 commit');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('依赖解锁: 前置任务全部 Done 时 eligible active Backlog 原子转移至 Ready；cancelled 任务绝不移动', async () => {
+  const rig = mkRig();
+  try {
+    const userReg = registerAgent(rig.ctx, { id: 'u-dep', name: 'User', handle: 'u-dep', role: 'user' });
+    const board = createBoard(rig.ctx, { id: 'b-deps', name: 'Dependencies Board' });
+
+    // 前置任务 P1 和 P2
+    createTask(rig.ctx, board.id, { id: 'DEP-1', title: 'Prereq 1', lane: 'Ready' });
+    createTask(rig.ctx, board.id, { id: 'DEP-2', title: 'Prereq 2', lane: 'Ready' });
+
+    // 子任务：
+    // DEP-3: 正常活跃 Backlog，依赖 DEP-1 和 DEP-2
+    createTask(rig.ctx, board.id, { id: 'DEP-3', title: 'Active Backlog Child', lane: 'Backlog', dependsOn: ['DEP-1', 'DEP-2'] });
+    // DEP-4: 已取消任务，依赖 DEP-1 和 DEP-2
+    createTask(rig.ctx, board.id, { id: 'DEP-4', title: 'Cancelled Child', lane: 'Backlog', dependsOn: ['DEP-1', 'DEP-2'] });
+    await cancelTask(rig.ctx, userReg.agent, 'DEP-4', '用户取消该需求');
+    assert.equal(getTask(rig.ctx, 'DEP-4').status, 'cancelled');
+
+    // DEP-5: 处于 InProgress 的任务，依赖 DEP-1
+    const worker = registerAgent(rig.ctx, { id: 'w-dep', name: 'Worker', handle: 'w-dep', role: 'worker' }).agent;
+    createTask(rig.ctx, board.id, { id: 'DEP-5', title: 'InProgress Child', lane: 'Ready', assignee: 'w-dep' });
+    claimTask(rig.ctx, worker, 'DEP-5');
+    // 构造历史不一致状态，验证解锁逻辑不会重置已领取任务。
+    rig.ctx.holder.db.prepare('UPDATE task SET depends_on = ? WHERE id = ?').run(JSON.stringify(['DEP-1']), 'DEP-5');
+    assert.equal(getTask(rig.ctx, 'DEP-5').lane, 'InProgress');
+
+    // 1. 将 DEP-1 移入 Done (使用 updateTask 将 Ready 移至 Done)
+    updateTask(rig.ctx, userReg.agent, 'DEP-1', { lane: 'Done' });
+
+    // 此时 DEP-2 尚未完成，DEP-3 应仍在 Backlog
+    assert.equal(getTask(rig.ctx, 'DEP-3').lane, 'Backlog');
+    assert.equal(getTask(rig.ctx, 'DEP-3').autoUnblockedAt, null);
+
+    // 2. 将 DEP-2 移入 Done -> 所有依赖已全部就绪
+    updateTask(rig.ctx, userReg.agent, 'DEP-2', { lane: 'Done' });
+
+    // 验证：DEP-3 必须原子自动转移到 Ready，并记录 autoUnblockedAt
+    const b1 = getTask(rig.ctx, 'DEP-3');
+    assert.equal(b1.lane, 'Ready', '依赖全部完成时，活跃 Backlog 任务必须原子转为 Ready');
+    assert.ok(b1.autoUnblockedAt !== null, 'autoUnblockedAt 必须记录时间戳');
+
+    // 验证审计事件
+    const events = listEvents(rig.ctx);
+    const laneChangedEvent = events.find((e) => e.type === 'task.lane_changed' && e.payload.taskId === 'DEP-3' && e.payload.to === 'Ready');
+    assert.ok(laneChangedEvent, '必须记录 task.lane_changed 事件');
+    assert.equal(laneChangedEvent.payload.from, 'Backlog');
+    assert.equal(laneChangedEvent.payload.to, 'Ready');
+
+    const unlockedEvent = events.find((e) => e.type === 'task.auto_unlocked' && e.payload.taskId === 'DEP-3');
+    assert.ok(unlockedEvent, '必须记录 task.auto_unlocked 事件');
+
+    // 验证：已取消任务 DEP-4 绝不可移动，仍为 Backlog，且不记录 autoUnblockedAt
+    const b2 = getTask(rig.ctx, 'DEP-4');
+    assert.equal(b2.lane, 'Backlog', '已取消任务绝不可转移到 Ready');
+    assert.equal(b2.status, 'cancelled');
+    assert.equal(b2.autoUnblockedAt, null);
+
+    // 验证：已经在 InProgress 的任务 DEP-5 绝不可被重置回 Ready
+    const b3 = getTask(rig.ctx, 'DEP-5');
+    assert.equal(b3.lane, 'InProgress', '非 Backlog 泳道任务绝不可被 unlockDependents 重置');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('错误状态投影: error/timeout 保持失败直到受控恢复，展示原因并拒绝迟到活动', async () => {
+  const rig = mkRig();
+  try {
+    const board = createBoard(rig.ctx, { id: 'b-err-proj', name: 'Error Projection Board' });
+    const workerReg = registerAgent(rig.ctx, { id: 'w-err', name: 'Worker Err', handle: 'w-err', role: 'worker' });
+    rig.ctx.holder.db.prepare("UPDATE agent SET last_seen_at = ? WHERE id = 'w-err'").run(Date.now());
+
+    createTask(rig.ctx, board.id, { id: 'ERR-1', title: 'Task with failure checkpoint', lane: 'Ready', assignee: 'w-err' });
+    const claimed = claimTask(rig.ctx, workerReg.agent, 'ERR-1');
+    assert.equal(claimed.lane, 'InProgress');
+    assert.equal(claimed.attempt, 1);
+    assert.equal(claimed.progress?.status, 'unknown');
+    assert.equal(claimed.progress?.errorNote, null);
+
+    // 1. 发送 kind: 'error' 的 checkpoint 上报执行失败
+    const errCheckpoint = checkpointTask(rig.ctx, workerReg.agent, 'ERR-1', {
+      kind: 'error',
+      note: 'Fatal: TypeScript build failed with TS2304: Cannot find name "Foo"',
+      attempt: 1,
+    });
+
+    const taskWithError = errCheckpoint.task;
+    assert.equal(taskWithError.lane, 'InProgress', '报错后任务依然停留在 InProgress，不可自动释放或重跑');
+    assert.equal(taskWithError.attempt, 1, '报错后 attempt 保持不变');
+    assert.equal(taskWithError.lastActivityKind, 'error');
+    assert.equal(taskWithError.progress?.status, 'failed', 'progress.status 必须明确投影为 failed');
+    assert.equal(taskWithError.progress?.errorNote, 'Fatal: TypeScript build failed with TS2304: Cannot find name "Foo"');
+
+    // 2. 即使工蜂心跳超时离线，status=failed 依然保持最高优先级（不被 offline 覆盖）
+    rig.ctx.holder.db.prepare("UPDATE agent SET last_seen_at = ? WHERE id = 'w-err'").run(Date.now() - 300_000);
+    const refreshed = getTask(rig.ctx, 'ERR-1');
+    assert.equal(refreshed.progress?.status, 'failed', 'failed 状态必须优先于 offline 阈值判定');
+    assert.equal(refreshed.progress?.errorNote, 'Fatal: TypeScript build failed with TS2304: Cannot find name "Foo"');
+    checkpointTask(rig.ctx, workerReg.agent, 'ERR-1', {
+      kind: 'timeout',
+      note: '执行器超时，工作区已保留',
+      attempt: 1,
+    });
+    const timedOut = getTask(rig.ctx, 'ERR-1');
+    assert.equal(timedOut.progress?.status, 'failed');
+    assert.equal(timedOut.progress?.errorNote, '执行器超时，工作区已保留');
+
+    // 3. 同一代次的迟到活动不能清除失败状态或触发自动重试。
+    assert.throws(() => checkpointTask(rig.ctx, workerReg.agent, 'ERR-1', {
+      kind: 'milestone', note: 'late event', attempt: 1,
+    }), /failed|恢复/i);
+    assert.throws(() => submitTask(rig.ctx, workerReg.agent, 'ERR-1', { summary: 'late submit', attempt: 1 }), /failed|恢复/i);
+    assert.equal(getTask(rig.ctx, 'ERR-1').progress?.status, 'failed');
+
+    // 4. 回归验证：通过真实 HTTP 端点 POST /tasks/:id/checkpoint 发送 kind: error
+    const app = createApp(rig.ctx);
+    const httpCpRes = await app.request('/tasks/ERR-1/checkpoint', {
+      method: 'POST',
+      headers: H(workerReg.token),
+      body: JSON.stringify({
+        kind: 'error',
+        note: 'Regression note: exit code 1 from sandbox runner',
+        attempt: 1,
+      }),
+    });
+    assert.equal(httpCpRes.status, 200);
+
+    const httpGetTaskRes = await app.request('/tasks/ERR-1', {
+      method: 'GET',
+      headers: H(workerReg.token),
+    });
+    assert.equal(httpGetTaskRes.status, 200);
+    const getTaskJson = (await httpGetTaskRes.json()) as { task: Task };
+    assert.equal(getTaskJson.task.progress?.status, 'failed');
+    assert.equal(getTaskJson.task.progress?.errorNote, 'Regression note: exit code 1 from sandbox runner');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('任务释放安全门禁: /tasks/:id/release 阻断 elevated 越权绕过，受控解绑 releaseStuckTask 在锁内单事务原子完成', async () => {
+  const rig = mkRig();
+  try {
+    const userReg = registerAgent(rig.ctx, { id: 'u-sec', name: 'User Sec', handle: 'u-sec', role: 'user' });
+    const queenReg = registerAgent(rig.ctx, { id: 'q-sec', name: 'Queen', handle: 'q-sec', role: 'orchestrator' });
+    const workerReg = registerAgent(rig.ctx, { id: 'w-sec', name: 'Worker Sec', handle: 'w-sec', role: 'worker' });
+    const board = createBoard(rig.ctx, { id: 'b-sec', name: 'Security Board' });
+
+    createTask(rig.ctx, board.id, { id: 'SEC-1', title: 'Task security check', lane: 'Ready', assignee: 'w-sec' });
+    claimTask(rig.ctx, workerReg.agent, 'SEC-1');
+
+    // 1. 禁止通过 /tasks/:id/release 自愿释放运行中任务（Fail closed: 防止执行未 settled 时脑裂并发写）
+    await assert.rejects(
+      async () => releaseTask(rig.ctx, queenReg.agent, 'SEC-1', '主脑尝试释放'),
+      /voluntary task release is disabled/i,
+      '主脑调用 releaseTask 必须报 403 阻断',
+    );
+    await assert.rejects(
+      async () => releaseTask(rig.ctx, userReg.agent, 'SEC-1', '用户尝试直接释放'),
+      /voluntary task release is disabled/i,
+      '用户调用 releaseTask 必须报 403 阻断',
+    );
+    await assert.rejects(
+      async () => releaseTask(rig.ctx, workerReg.agent, 'SEC-1', '工蜂自愿交还'),
+      /voluntary task release is disabled/i,
+      '工蜂自愿交还 releaseTask 必须报 403 阻断以防执行未 settled 脑裂',
+    );
+
+    const app = createApp(rig.ctx);
+    const userReleaseHttp = await app.request('/tasks/SEC-1/release', {
+      method: 'POST',
+      headers: H(userReg.token),
+      body: JSON.stringify({ reason: 'HTTP release bypass attempt' }),
+    });
+    assert.equal(userReleaseHttp.status, 403, 'HTTP /tasks/:id/release 必须报 403 阻断自愿释放');
+
+    // 2. 模拟运行中发生错误：error checkpoint 设置 status=failed
+    checkpointTask(rig.ctx, workerReg.agent, 'SEC-1', { kind: 'error', note: 'Error state' });
+    assert.equal(getTask(rig.ctx, 'SEC-1').progress?.status, 'failed');
+
+    // 3. 只有经过认证的用户角色并明确提供 confirmedStopped: true，才能通过 releaseStuckTask 安全受控解绑
+    await assert.rejects(
+      async () => releaseStuckTask(rig.ctx, userReg.agent, 'w-sec', 'SEC-1', '未确认停机', { confirmedStopped: false }),
+      /confirmedStopped/i,
+    );
+
+    const forceReleased = await releaseStuckTask(rig.ctx, userReg.agent, 'w-sec', 'SEC-1', '用户确认物理停止', { confirmedStopped: true });
+    assert.equal(forceReleased.assignee, 'unassigned');
+    assert.equal(forceReleased.lane, 'Ready');
+    assert.equal(forceReleased.attempt, 2, '受控解绑建立代次栅栏');
+    assert.equal(forceReleased.lastActivityKind, null, '受控解绑必须单事务原子清除 error 状态');
+    assert.equal(forceReleased.progress, null, '解绑回 Ready 后 progress 归 null');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('updateTask 状态机安全门禁: 严禁通过通用 PATCH 绕过物理停止确认或绕过审核退回代次锁', async () => {
+  const rig = mkRig();
+  try {
+    const userReg = registerAgent(rig.ctx, { id: 'u-patch', name: 'User Patch', handle: 'u-patch', role: 'user' });
+    const workerReg = registerAgent(rig.ctx, { id: 'w-patch1', name: 'Worker 1', handle: 'w-patch1', role: 'worker' });
+    registerAgent(rig.ctx, { id: 'w-patch2', name: 'Worker 2', handle: 'w-patch2', role: 'worker' });
+    const board = createBoard(rig.ctx, { id: 'b-patch-gate', name: 'Patch Gate Board' });
+
+    createTask(rig.ctx, board.id, { id: 'GAT-1', title: 'InProgress task', lane: 'Ready', assignee: 'w-patch1' });
+    claimTask(rig.ctx, workerReg.agent, 'GAT-1');
+    assert.equal(getTask(rig.ctx, 'GAT-1').lane, 'InProgress');
+
+    // 1. InProgress 任务禁止通过 updateTask 挪动泳道（如 InProgress -> Ready 或 Backlog）
+    assert.throws(
+      () => updateTask(rig.ctx, userReg.agent, 'GAT-1', { lane: 'Ready' }),
+      /cannot move task out of InProgress via generic update/i,
+      'updateTask 严禁将 InProgress 移出泳道',
+    );
+    assert.throws(
+      () => updateTask(rig.ctx, userReg.agent, 'GAT-1', { lane: 'Backlog' }),
+      /cannot move task out of InProgress via generic update/i,
+    );
+
+    // 2. InProgress 任务禁止通过 updateTask 篡改指派人
+    assert.throws(
+      () => updateTask(rig.ctx, userReg.agent, 'GAT-1', { assignee: 'w-patch2' }),
+      /cannot change assignee of InProgress task via generic update/i,
+      'updateTask 严禁篡改 InProgress 任务的指派人',
+    );
+
+    // 3. InProgress 任务允许正常编辑元数据（title, detail, acceptance 等）
+    const metaUpdated = updateTask(rig.ctx, userReg.agent, 'GAT-1', {
+      title: 'Updated title safely',
+      detail: 'Updated detail safely',
+      acceptance: 'New acceptance',
+    });
+    assert.equal(metaUpdated.title, 'Updated title safely');
+    assert.equal(metaUpdated.detail, 'Updated detail safely');
+    assert.equal(metaUpdated.lane, 'InProgress', '编辑元数据不改变泳道');
+    assert.equal(metaUpdated.assignee, 'w-patch1', '编辑元数据不改变指派人');
+
+    // 4. Review 任务禁止通过 updateTask 直接移入 InProgress（退回重做必须走具备代次自增与锁的专用 API）
+    createTask(rig.ctx, board.id, { id: 'GAT-2', title: 'Review task', lane: 'Ready', assignee: 'w-patch1' });
+    claimTask(rig.ctx, workerReg.agent, 'GAT-2');
+    submitTask(rig.ctx, workerReg.agent, 'GAT-2', { summary: 'Submitting GAT-2' });
+    assert.equal(getTask(rig.ctx, 'GAT-2').lane, 'Review');
+
+    assert.throws(
+      () => updateTask(rig.ctx, userReg.agent, 'GAT-2', { lane: 'InProgress' }),
+      /Review tasks cannot be moved to InProgress via generic update/i,
+      'Review 任务退回重做严禁通过通用 PATCH 绕过',
+    );
+  } finally {
+    rig.cleanup();
+  }
+});
+

@@ -32,6 +32,7 @@ import { fileURLToPath } from 'node:url';
 import { canSubmitExecution, commitWorkspace, prepareWorkspace, type PreparedWorkspace } from './workspace.ts';
 import { firstSkip, nextBoardsToPoll, pollNextDirectedTask } from './polling.ts';
 import { TelemetryReporter } from './telemetry-reporter.ts';
+import { runCliExecutor } from './cli-runner.ts';
 import { runPiPrompt, type PiThinkingLevel } from './pi-executor.ts';
 import {
   OmpRpcSession,
@@ -231,27 +232,11 @@ function runExecutor(prompt: string, cwd: string, model: string | undefined): Pr
           ...(model ? ['--model', model] : []),
         ]
       : ['--mode', 'yolo'];
-  return new Promise((resolveRun) => {
-    const child = spawn(ex.cmd, [...ex.args, ...flagArgs, promptArg], {
-      cwd,
-      shell: process.platform === 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ASTERHIVE_WORKER: '1' },
-    });
-    let stdout = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-    }, CFG.taskTimeoutMs);
-    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolveRun({ stdout, code });
-    });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      resolveRun({ stdout: stdout + String(err), code: -1 });
-    });
+  return runCliExecutor({
+    cmd: ex.cmd,
+    args: [...ex.args, ...flagArgs, promptArg],
+    cwd,
+    timeoutMs: CFG.taskTimeoutMs,
   });
 }
 
@@ -541,6 +526,7 @@ async function main(): Promise<void> {
   const poll = async () => {
     if (busy) return;
     busy = true;
+    let task: Task | undefined;
     try {
       // 每轮取活前采样并上报实时硬件遥测指标
       await telemetryReporter.reportOnce();
@@ -593,7 +579,6 @@ async function main(): Promise<void> {
       // 某板 403（非参与者）→ 该板本轮跳过，只 log 一次（Set 防刷屏）；下轮自然再试，
       // 参与者在页面里被勾上后无需任何处理即自动恢复。
       let reworkNotes: string[] = [];
-      let task: Task | undefined;
       let rpcStopBoard: string | null = null;
       const pollResult = await pollNextDirectedTask(decision.poll, {
         listMine,
@@ -606,7 +591,11 @@ async function main(): Promise<void> {
               rpcStopBoard = boardId;
               if (reworks.length > 0) {
                 const blocked = reworks[0]!;
-                await worker.checkpoint(blocked.id, `RPC 上下文达到 STOP ${CFG.ctxThresholds.stop}%：任务暂缓，未启动新执行；请等待当前 worker 会话整理或联系设备所有者。`);
+                await worker.checkpoint(blocked.id, {
+                  note: `RPC 上下文达到 STOP ${CFG.ctxThresholds.stop}%：任务暂缓，未启动新执行；请等待当前 worker 会话整理或联系设备所有者。`,
+                  kind: 'error',
+                  attempt: blocked.attempt,
+                });
                 log(`RPC STOP：重做任务 ${blocked.id} 保持 InProgress 并已 checkpoint，未重新执行`);
               }
               return 'stop';
@@ -632,6 +621,7 @@ async function main(): Promise<void> {
         return;
       }
       log(`领取任务 ${task.id}：${task.title}`);
+      const currentTask = task;
       telemetryReporter.setTaskInProgress(task.id);
 
       // 工作区准备（T15 / §9.4 / managed 模式）：
@@ -646,6 +636,8 @@ async function main(): Promise<void> {
           boardId: task.boardId,
           taskId: task.id,
           attempt: task.attempt,
+          isRework: pollResult?.channel === 'rework' || task.reviewStatus === 'rework',
+          noCode: task.workspace.noCode === true,
           repo: meta.repo,
           repoMode: meta.repoMode,
           worker,
@@ -675,11 +667,11 @@ async function main(): Promise<void> {
       const keepAliveIntervalMs = 60000;
       const keepAliveTimer = setInterval(() => {
         const mins = Math.max(1, Math.round((Date.now() - startTime) / 60000));
-        void worker.checkpoint(task.id, {
+        void worker.checkpoint(currentTask.id, {
           note: `进行中：任务持续执行（已耗时约 ${mins} 分钟）`,
           kind: 'keepalive',
           isKeepalive: true,
-          attempt: task.attempt,
+          attempt: currentTask.attempt,
         }).then((cp) => {
           logPending(cp.pendingMessages);
         }).catch((err) => {
@@ -692,16 +684,16 @@ async function main(): Promise<void> {
       try {
         execRes = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model, {
           taskId: task.id,
-          checkpoint: (note) => worker.checkpoint(task.id, { note, kind: 'milestone', attempt: task.attempt }),
+          checkpoint: (note) => worker.checkpoint(currentTask.id, { note, kind: 'milestone', attempt: currentTask.attempt }),
           onActivity: (activity) => {
             if (activity.phase === 'start') {
               const note = activity.kind === 'tool'
                 ? `正在执行工具 ${activity.toolName || 'tool'}`
                 : '正在进行模型推理思考';
-              void worker.checkpoint(task.id, {
+              void worker.checkpoint(currentTask.id, {
                 note,
                 kind: activity.kind,
-                attempt: task.attempt,
+                attempt: currentTask.attempt,
               }).catch((err) => {
                 log('活动事件上报异常（非致命）：', err instanceof Error ? err.message : err);
               });
@@ -785,7 +777,19 @@ async function main(): Promise<void> {
         }
       }
     } catch (err) {
-      log('轮询/执行出错：', err instanceof Error ? err.message : err);
+      const reason = err instanceof Error ? err.message : String(err);
+      log('轮询/执行出错：', reason);
+      if (task) {
+        try {
+          await worker.checkpoint(task.id, {
+            note: `任务异常：${reason}；现场已保留，未自动释放或重做。`,
+            kind: 'error',
+            attempt: task.attempt,
+          });
+        } catch (reportErr) {
+          log('异常上报失败：', reportErr instanceof Error ? reportErr.message : reportErr);
+        }
+      }
     } finally {
       telemetryReporter.setTaskInProgress(null);
       busy = false;
