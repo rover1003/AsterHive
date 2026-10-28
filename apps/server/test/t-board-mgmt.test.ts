@@ -251,20 +251,20 @@ test('参与限制: 空列表开放、列表外 worker 403、列表内正常、u
     assert.equal(res.status, 200, 'user 角色豁免参与限制');
     body = (await res.json()) as typeof body;
     assert.equal(body.task?.id, 'T3');
-    // orchestrator 豁免：作为被派者（非 worker）不受列表约束
-    res = await app.request('/tasks/T1/dispatch', {
-      method: 'POST',
-      headers: H(orch.token),
-      body: JSON.stringify({ assignee: orch.agent.id, content: '@brain-a 主脑自留' }),
-    });
-    assert.equal(res.status, 201, 'orchestrator 被派不受参与限制');
-    // 新建 T4 留在 Ready，用于后续参与限制验证（避免 InProgress 锁优先拦截）
+    // 新建 T4 留在 Ready，用于后续参与限制与角色豁免验证（活跃 InProgress 卡一律不可改派，不能拿 T1 验证豁免）
     res = await app.request('/boards/b/tasks', {
       method: 'POST',
       headers: JSON_H,
       body: JSON.stringify({ id: 'T4', title: '卡4', lane: 'Ready' }),
     });
     assert.equal(res.status, 201);
+    // orchestrator 豁免：作为被派者（非 worker）不受列表约束
+    res = await app.request('/tasks/T4/dispatch', {
+      method: 'POST',
+      headers: H(orch.token),
+      body: JSON.stringify({ assignee: orch.agent.id, content: '@brain-a 主脑自留' }),
+    });
+    assert.equal(res.status, 201, 'orchestrator 被派不受参与限制');
 
     // dispatch 给列表外 worker → 422
     res = await app.request('/tasks/T4/dispatch', {
@@ -283,7 +283,74 @@ test('参与限制: 空列表开放、列表外 worker 403、列表内正常、u
       body: JSON.stringify({ assignee: 'bee1', content: '@bee1 请领取 T4' }),
     });
     assert.equal(res.status, 201, 'dispatch 给列表内 worker 放行');
-    // T4 已验证列表外 422、列表内 201；T1 InProgress 由 orchestrator 自留，不再验证 T1 参与限制
+    // T4 已验证 orchestrator 豁免、列表外 422、列表内 201；T1 保持 InProgress 由活跃锁保护，不再改派
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('活跃执行不可改派: InProgress 卡对任何被派者（worker/orchestrator/user/未知）一律 409，指派/代次/消息不变', async () => {
+  const r = mkBoardRig();
+  const { rig, app, orch, bee1, bee2 } = r;
+  try {
+    await setupBoardWithTasks(r, 1);
+    // 两个工蜂都入参与者列表，确保 409 只可能来自 InProgress 活跃锁而非参与限制
+    let res = await app.request('/boards/b/participants', {
+      method: 'PUT',
+      headers: JSON_H,
+      body: JSON.stringify({ agentIds: [bee1.agent.id, bee2.agent.id] }),
+    });
+    assert.equal(res.status, 200);
+
+    // 派给 bee1 并认领 → InProgress（attempt 1）
+    res = await app.request('/tasks/T1/dispatch', {
+      method: 'POST',
+      headers: H(orch.token),
+      body: JSON.stringify({ assignee: bee1.agent.id, content: '@bee1 请处理 T1' }),
+    });
+    assert.equal(res.status, 201);
+    res = await app.request('/tasks/T1/claim', { method: 'POST', headers: H(bee1.token), body: '{}' });
+    assert.equal(res.status, 200);
+    const claimBody = (await res.json()) as { task: { lane: string; assignee: string; attempt: number } };
+    const task = claimBody.task;
+    assert.equal(task.lane, 'InProgress');
+    assert.equal(task.assignee, bee1.agent.id);
+    assert.equal(task.attempt, 1);
+
+    const dispatchMessages = async (): Promise<number> => {
+      const response = await app.request('/boards/b/messages');
+      const msgBody = (await response.json()) as {
+        messages: { kind: string; taskRef: string | null }[];
+      };
+      return msgBody.messages.filter((msg) => msg.kind === 'dispatch' && msg.taskRef === 'T1').length;
+    };
+    const before = await dispatchMessages();
+    assert.equal(before, 1, '认领前那次预指派产生 1 条 dispatch 消息');
+
+    // 四种被派者变体全部必须 409，且不得改变指派/代次、不得新增 dispatch 消息
+    const variants: { label: string; assignee: string }[] = [
+      { label: 'worker', assignee: bee2.agent.id },
+      { label: 'orchestrator', assignee: orch.agent.id },
+      { label: 'user', assignee: 'user' },
+      { label: 'unknown', assignee: 'ghost' },
+    ];
+    for (const v of variants) {
+      res = await app.request('/tasks/T1/dispatch', {
+        method: 'POST',
+        headers: H(orch.token),
+        body: JSON.stringify({ assignee: v.assignee, content: `@${v.assignee} 接管 T1` }),
+      });
+      assert.equal(res.status, 409, `InProgress 卡改派给 ${v.label} 必须 409`);
+      const taskResponse = await app.request('/tasks/T1');
+      const tBody = (await taskResponse.json()) as {
+        task: { lane: string; assignee: string; attempt: number };
+      };
+      const t = tBody.task;
+      assert.equal(t.lane, 'InProgress', `${v.label} 改派后 lane 不变`);
+      assert.equal(t.assignee, bee1.agent.id, `${v.label} 改派后 assignee 不变`);
+      assert.equal(t.attempt, 1, `${v.label} 改派后 attempt 不变`);
+      assert.equal(await dispatchMessages(), before, `${v.label} 改派不产生 dispatch 消息`);
+    }
   } finally {
     rig.cleanup();
   }

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPiPrompt, setPiModuleForTest, type PiModelConfig } from '../src/pi-executor.ts';
@@ -26,6 +26,59 @@ function tmpCwd(): { dir: string; agentDir: string; skillsDir: string; cleanup: 
   mkdirSync(agentDir, { recursive: true });
   mkdirSync(skillsDir, { recursive: true });
   return { dir, agentDir, skillsDir, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+/**
+ * 构造确定性离线本地 file 依赖夹具：local-dep 带 postinstall 创建 marker.txt，
+ * package-lock.json 为手写 lockfileVersion 3（与真实 npm 生成格式一致）。
+ */
+function writeLocalFileDepFixture(dir: string): void {
+  mkdirSync(join(dir, 'local-dep'), { recursive: true });
+  writeFileSync(
+    join(dir, 'local-dep', 'package.json'),
+    JSON.stringify(
+      {
+        name: 'local-dep',
+        version: '1.0.0',
+        scripts: { postinstall: "node -e \"require('fs').writeFileSync('marker.txt','created')\"" },
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  );
+  writeFileSync(
+    join(dir, 'package.json'),
+    JSON.stringify(
+      { name: 'file-dep-fixture', version: '1.0.0', dependencies: { 'local-dep': 'file:./local-dep' } },
+      null,
+      2,
+    ),
+    'utf8',
+  );
+  writeFileSync(
+    join(dir, 'package-lock.json'),
+    JSON.stringify(
+      {
+        name: 'file-dep-fixture',
+        version: '1.0.0',
+        lockfileVersion: 3,
+        requires: true,
+        packages: {
+          '': {
+            name: 'file-dep-fixture',
+            version: '1.0.0',
+            dependencies: { 'local-dep': 'file:./local-dep' },
+          },
+          'local-dep': { version: '1.0.0', hasInstallScript: true },
+          'node_modules/local-dep': { resolved: 'local-dep', link: true },
+        },
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  );
 }
 
 const CONFIG: PiModelConfig = {
@@ -373,6 +426,129 @@ test('Workspace: 不支持的 lockfile（如 yarn.lock / pnpm-lock.yaml）明确
     const check = await runWorkspaceDependencyPreflight(rig.dir);
     assert.equal(check.ok, false, '遇到未支持的 lockfile 必须报告环境受阻');
     assert.ok(check.error?.includes('yarn.lock'), '错误信息必须指出具体的前置依赖文件');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('Workspace: 继承的 npm_config_allow_scripts 环境变量不得触发 EALLOWSCRIPTS，且离线 file 依赖安装成功', async () => {
+  const rig = tmpCwd();
+  try {
+    writeLocalFileDepFixture(rig.dir);
+
+    // 模拟 npm test 等父进程通过 set-envs.js 导出的 npm_config_allow_scripts
+    // （npm 11+ 将 allow-scripts 视为 CLI/env 层配置，项目级 npm ci 一旦
+    // 该层有值即抛 EALLOWSCRIPTS，见 lib/utils/resolve-allow-scripts.js）
+    const prev = process.env.npm_config_allow_scripts;
+    process.env.npm_config_allow_scripts = 'local-dep';
+    try {
+      const check = await runWorkspaceDependencyPreflight(rig.dir);
+      assert.equal(check.ok, true, '继承的 npm_config_allow_scripts 不得导致 EALLOWSCRIPTS 阻断');
+      assert.ok(existsSync(join(rig.dir, 'node_modules')), 'npm ci 必须真实创建 node_modules');
+      assert.ok(
+        existsSync(join(rig.dir, 'node_modules', 'local-dep')),
+        '离线 file 依赖必须真实安装到 node_modules',
+      );
+    } finally {
+      if (prev === undefined) {
+        delete process.env.npm_config_allow_scripts;
+      } else {
+        process.env.npm_config_allow_scripts = prev;
+      }
+    }
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('Workspace: --ignore-scripts 安装不得执行 postinstall（marker 绝不创建），且不写入 .npmrc/.npm-cache', async () => {
+  const rig = tmpCwd();
+  try {
+    writeLocalFileDepFixture(rig.dir);
+
+    const check = await runWorkspaceDependencyPreflight(rig.dir);
+    assert.equal(check.ok, true, '离线 file 依赖必须安装成功');
+    assert.ok(
+      !existsSync(join(rig.dir, 'local-dep', 'marker.txt')),
+      '--ignore-scripts 安装绝不允许执行 postinstall 创建 marker',
+    );
+    assert.ok(
+      !existsSync(join(rig.dir, '.npmrc')),
+      '预检绝不允许写入工作区 .npmrc',
+    );
+    assert.ok(
+      !existsSync(join(rig.dir, '.npm-cache')),
+      '预检绝不允许在工作区创建 .npm-cache',
+    );
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('Workspace: 预检不得改写工作区既有 .npmrc 字节内容', async () => {
+  const rig = tmpCwd();
+  try {
+    writeLocalFileDepFixture(rig.dir);
+    // 既有工作区 .npmrc：自定义 registry + fund=false，字节必须原样保留
+    const npmrcContent = 'registry=https://registry.example.com/\nfund=false\n';
+    writeFileSync(join(rig.dir, '.npmrc'), npmrcContent, 'utf8');
+
+    const check = await runWorkspaceDependencyPreflight(rig.dir);
+    assert.equal(check.ok, true, '既有 .npmrc 的工作区必须正常安装');
+    assert.equal(
+      readFileSync(join(rig.dir, '.npmrc'), 'utf8'),
+      npmrcContent,
+      '预检不得改写工作区既有 .npmrc 字节内容',
+    );
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('Workspace: package.json 与 lockfile 失配（含仅根条目 lockfile）必须确定性失败', async () => {
+  const rig = tmpCwd();
+  try {
+    // package.json 声明依赖，但 lockfile 仅有根 "" 条目（旧零依赖绕过路径
+    // 会误判为“零依赖”直接伪造 node_modules 放行；修复后必须走真实 npm ci
+    // 并由 npm 的 validateLockfile 报 EUSAGE 失败）
+    writeFileSync(
+      join(rig.dir, 'package.json'),
+      JSON.stringify(
+        {
+          name: 'mismatch-pkg',
+          version: '1.0.0',
+          dependencies: { 'missing-local-dep': 'file:./non-existent-local-package-12345' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+    writeFileSync(
+      join(rig.dir, 'package-lock.json'),
+      JSON.stringify(
+        {
+          name: 'mismatch-pkg',
+          version: '1.0.0',
+          lockfileVersion: 3,
+          requires: true,
+          packages: {
+            '': {
+              name: 'mismatch-pkg',
+              version: '1.0.0',
+              dependencies: { 'missing-local-dep': 'file:./non-existent-local-package-12345' },
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    const check = await runWorkspaceDependencyPreflight(rig.dir);
+    assert.equal(check.ok, false, 'package.json 与 lockfile 失配必须确定性报告失败');
+    assert.ok(check.error?.length, '必须包含 npm ci 失败详情');
   } finally {
     rig.cleanup();
   }

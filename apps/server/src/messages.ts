@@ -1,7 +1,7 @@
 import type { Ctx } from './types.ts';
 import { HttpError, assertNoMojibake } from './types.ts';
 import { withWrite, logEvent } from './write.ts';
-import { getTask, getParticipants } from './tasks.ts';
+import { getTask, getParticipants, type Task } from './tasks.ts';
 import { findAgent, type Agent } from './agents.ts';
 
 export type MessageKind =
@@ -162,18 +162,19 @@ export function dispatchTask(
   actor: Agent,
   taskId: string,
   input: { content: string; assignee?: string },
-): { task: ReturnType<typeof getTask>; message: Message } {
+): { task: Task; message: Message } {
   if (actor.role !== 'orchestrator' && actor.role !== 'user') {
     throw new HttpError(403, 'only orchestrator/user dispatch');
   }
   const task = getTask(ctx, taskId);
   if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
+  // 活跃执行不可改派：InProgress 任务无论派给谁（worker/user/orchestrator/未知句柄）一律拒绝，
+  // 防止绕过物理停止确认直接重派；解绑必须走受控恢复（release-task + confirmedStopped）。
+  if (task.lane === 'InProgress') {
+    throw new HttpError(409, `task ${taskId} is InProgress; cannot reassign active execution. Release task after confirming worker stopped.`);
+  }
   const assignee = input.assignee?.trim() || task.assignee;
   const assigneeAgent = findAgent(ctx, assignee);
-  // orchestrator/user 可以自派或重派 InProgress 任务；仅阻止将活跃任务改派给 worker（避免抢活）
-  if (task.lane === 'InProgress' && assigneeAgent?.role === 'worker') {
-    throw new HttpError(409, `task ${taskId} is InProgress; cannot reassign active execution to worker. Release task after confirming worker stopped.`);
-  }
   // 参与限制：被派者是 worker 且该板参与者列表非空时，必须在列表内（user/orchestrator 豁免）
   if (assigneeAgent?.role === 'worker') {
     const list = getParticipants(ctx, task.boardId);

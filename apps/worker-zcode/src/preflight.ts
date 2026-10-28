@@ -5,7 +5,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { ExecutionPreflightCheck } from './sdk.ts';
 
@@ -274,24 +274,6 @@ export async function runWorkspaceDependencyPreflight(
   }
   const { cmd, argsPrefix } = resolveNpmCommand();
 
-  // 零依赖 lockfile 优化：packages 仅有根 "" 条目时无须 npm ci，
-  // 直接创建空 node_modules（npm 11+ 用户级 allow-scripts 白名单会阻断
-  // 项目级 npm ci，即使零依赖；跳过安装是唯一可靠路径）。
-  try {
-    const lockRaw = readFileSync(lockPath, 'utf8');
-    const lockParsed = JSON.parse(lockRaw) as { packages?: Record<string, unknown> };
-    const packageKeys = Object.keys(lockParsed.packages ?? {});
-    if (packageKeys.length === 1 && packageKeys[0] === '') {
-      mkdirSync(nodeModulesPath, { recursive: true });
-      return {
-        ok: true,
-        check: { name: 'dependencies', ok: true, detail: '零依赖 lockfile，跳过 npm ci，已创建空 node_modules' },
-      };
-    }
-  } catch {
-    // lockfile 解析失败不阻断，继续走 npm ci 路径由 npm 报具体错误
-  }
-
   // 1. 若 node_modules 已存在，不可仅因目录存在便假设依赖完好（例如失败的 npm ci 常残留半截 node_modules）
   // 运行受限 npm ls --depth=0 验证依赖树一致性
   let needsInstall = !existsSync(nodeModulesPath);
@@ -307,24 +289,24 @@ export async function runWorkspaceDependencyPreflight(
     }
   }
 
-  // 2. 若依赖缺失或树校验不通过，在工作区内执行受限 npm ci
-  //    使用工作区本地 cache 目录（--cache）避免并发环境下的共享 cache 竞争。
-  //    写入工作区 .npmrc 覆盖用户级 allow-scripts 限制（npm 11+ 在用户 .npmrc 设置了
-  //    allow-scripts 白名单时，项目级安装必须显式声明允许的脚本，否则报 EALLOWSCRIPTS）。
+  // 2. 若依赖缺失或树校验不通过，在工作区内执行受限 npm ci。
+  //    仅剥离父进程继承的 npm_config_allow_scripts 环境变量：npm 11+ 将
+  //    --allow-scripts 视为 CLI/env 层配置，项目级安装（npm ci/install）中
+  //    一旦该层有值即抛 EALLOWSCRIPTS（lib/utils/resolve-allow-scripts.js），
+  //    而 npm test 等父进程会通过 set-envs.js 把非默认配置导出为
+  //    npm_config_allow_scripts 传给子进程。该值只影响 allow-scripts 策略，
+  //    剥离后其余 npm_config_*（registry/auth/proxy 等）原样保留。
+  //    其余项目/用户 .npmrc、registry、auth、proxy 等设置一律不动。
   if (needsInstall) {
-    // 写入工作区级 .npmrc 并通过 NPM_CONFIG_USERCONFIG 指向它，
-    // 绕过用户级 ~/.npmrc 的 allow-scripts 白名单（npm 11+ 在用户级设置了
-    // allow-scripts 时，项目级安装会报 EALLOWSCRIPTS；将工作区 .npmrc 提升为
-    // userconfig 是官方支持的覆盖方式，不会触发 project-scope 限制）。
-    const localNpmrc = join(workspaceDir, '.npmrc');
-    writeFileSync(localNpmrc, 'allow-scripts=true\n', 'utf8');
-    const localCacheDir = join(workspaceDir, '.npm-cache');
+    // 空字符串会被 @npmcli/config loadEnv 跳过（envVal === '' 即忽略），
+    // 等效于未设置该环境变量。
+    const ciEnv = { ...process.env, npm_config_allow_scripts: '' };
     const ciRes = await runCommand(
       cmd,
-      [...argsPrefix, 'ci', '--no-audit', '--no-fund', '--cache', localCacheDir],
+      [...argsPrefix, 'ci', '--ignore-scripts', '--no-audit', '--no-fund'],
       workspaceDir,
       180_000, // 3 分钟超时
-      { NPM_CONFIG_USERCONFIG: localNpmrc },
+      ciEnv,
     );
 
     if (ciRes.code !== 0) {
