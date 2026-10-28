@@ -11,7 +11,7 @@ import type { Hono, Context } from 'hono';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { authByToken, type Agent } from './agents.ts';
-import { TOOL_DEFS, runWithToolContext } from './orchestrator-tools.ts';
+import { TOOL_DEFS } from './orchestrator-tools.ts';
 
 // ---- 鉴权设计（关键）----
 // token 绝不出现在工具参数里（避免进对话/日志）：HTTP 层读 Authorization: Bearer <token>，

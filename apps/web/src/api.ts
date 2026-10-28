@@ -60,14 +60,6 @@ export interface Task {
   updatedAt: number;
   progress?: TaskProgress | null;
 }
-export interface RepoTaskDiff {
-  base: string;
-  head: string;
-  diffStat: string;
-  changedFiles: string[];
-  diffText: string;
-  diffTruncated: boolean;
-}
 
 export interface Message {
   id: number;

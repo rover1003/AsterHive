@@ -1,6 +1,5 @@
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { Context } from 'hono';
@@ -8,7 +7,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { withWrite, listEvents, logEvent } from './write.ts';
-import { listSnapshots, snapshotNow, restoreSnapshot, readAudit } from './backup.ts';
+import { listSnapshots, restoreSnapshot, readAudit } from './backup.ts';
 import {
   registerAgent,
   listAgents,
@@ -30,7 +29,6 @@ import {
   createBoard,
   getBoard,
   updateBoard,
-  setBoardRepoState,
   deleteBoard,
   getParticipants,
   requireParticipant,

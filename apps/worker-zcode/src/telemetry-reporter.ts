@@ -31,14 +31,6 @@ export class TelemetryReporter {
     this.#taskInProgress = taskId;
   }
 
-  getTaskInProgress(): string | null | undefined {
-    return this.#taskInProgress;
-  }
-
-  setSpecs(specs: AgentSpecs): void {
-    this.#specs = specs;
-  }
-
   async reportOnce(): Promise<DeviceTelemetry | null> {
     if (this.#reporting) return null;
     this.#reporting = true;

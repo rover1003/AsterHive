@@ -269,10 +269,9 @@ export function deleteEvidenceFile(ctx: Ctx, actor: Agent, taskId: string, fileI
   ensureEvidenceTable(ctx);
   const task: Task = getTask(ctx, taskId);
   if (task.status === 'cancelled') throw new HttpError(409, `task ${taskId} is cancelled`);
-  const file = getEvidenceFile(ctx, taskId, fileId);
+  const row = fetchEvidenceRow(ctx, taskId, fileId);
   withWrite(ctx, 'task.evidence_deleted', () => {
     // 磁盘行先取回实际路径再删行
-    const row = fetchEvidenceRow(ctx, taskId, fileId);
     ctx.holder.db.prepare('DELETE FROM evidence_file WHERE id = ?').run(fileId);
     if (row.storage === 'disk' && row.disk_path) {
       const abs = resolve(row.disk_path);

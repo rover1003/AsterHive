@@ -1,7 +1,7 @@
 // 项目工作台：聊天主舞台（左，主操作面）+ 看板横向条带监视栏（右，状态面）
 // 看板不再是五列竖排：五条水平 lane-strip 纵向堆叠，每条内卡片横向滚动；
 // 详情抽屉（任务消息子流 / 泳道迁移 / 建卡）+ 看板管理抽屉（元数据 / 参与者 / 删除）
-import { api, postAdminRecovery, type Agent, type Board, type Task, type Message, type RepoTaskDiff } from '../api.ts';
+import { api, postAdminRecovery, type Agent, type Board, type Task, type Message } from '../api.ts';
 import { subscribe } from '../sse.ts';
 import { esc, fmtTime, LANE_LABELS, PRIORITY_CLASS, toast } from '../ui.ts';
 import { icon } from '../icons.ts';
@@ -258,7 +258,7 @@ function cardHtml(t: Task): string {
     </div>`;
 }
 
-function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): string {
+function drawerHtml(t: Task, msgs: Message[]): string {
   const actions: string[] = [];
   if (t.status !== 'cancelled') actions.push(`<button data-cancel-task="${esc(t.id)}" class="danger">删除任务卡（取消并保留历史）…</button>`);
   if (t.lane === 'Backlog') actions.push(`<button data-move="Ready">解锁进 Ready</button>`);
@@ -299,10 +299,6 @@ function drawerHtml(t: Task, msgs: Message[], repoMode?: Board['repoMode']): str
     : '';
   const reviewState = t.reviewStatus !== 'none'
     ? `<div class="field"><label>独立审核</label><div>${esc(({ pending: '排队中', reviewing: '审核中', passed: '已通过', rework: `退回重做 ${t.reviewReworks}/2`, blocked: '超过重做上限，等待人工仲裁', failed: '审核运行失败', environment_blocked: '执行环境受阻', needs_evidence: '等待补充验证材料' } as Record<string, string>)[t.reviewStatus] ?? t.reviewStatus)}${t.reviewAttempts ? ` · 尝试 ${t.reviewAttempts}` : ''}</div></div>`
-    : '';
-  const canInspectDiff = repoMode === 'managed' && (t.lane === 'Review' || t.lane === 'Done' || t.reviewStatus !== 'none');
-  const diffPanel = canInspectDiff
-    ? `<div class="field"><label>代码改动</label><button data-diff-load="1">加载 Diff</button><div data-diff-host aria-live="polite" class="muted small" style="margin-top:8px"></div></div>`
     : '';
   const substream = msgs.length
     ? msgs
@@ -495,41 +491,9 @@ export async function render(el: HTMLElement): Promise<void> {
           .get<{ messages: Message[] }>(`/boards/${currentBoard}/messages?limit=500`)
           .catch(() => ({ messages: [] as Message[] }))
       ).messages.filter((m) => m.taskRef === id);
-    drawerHost.innerHTML = drawerHtml(t, sub, board.repoMode);
+    drawerHost.innerHTML = drawerHtml(t, sub);
     drawerHost.querySelector('#drawer-close')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
     drawerHost.querySelector('#drawer-mask')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
-    const diffButton = drawerHost.querySelector('[data-diff-load]') as HTMLButtonElement | null;
-    const diffHost = drawerHost.querySelector('[data-diff-host]') as HTMLElement | null;
-    diffButton?.addEventListener('click', async () => {
-      if (!diffHost) return;
-      diffButton.disabled = true;
-      diffButton.setAttribute('aria-busy', 'true');
-      diffButton.textContent = '正在加载 Diff…';
-      diffHost.setAttribute('role', 'status');
-      diffHost.textContent = '正在读取服务器托管仓库的任务差异…';
-      try {
-        const diff = await api.get<RepoTaskDiff>(`/tasks/${encodeURIComponent(id)}/repo-diff`);
-        const rows = diff.diffText.split('\n').map((line) => {
-          const kind = line.startsWith('+') && !line.startsWith('+++') ? 'diff-add'
-            : line.startsWith('-') && !line.startsWith('---') ? 'diff-del'
-              : line.startsWith('@@') ? 'diff-hunk' : '';
-          return `<span class="diff-line ${kind}">${esc(line) || '&nbsp;'}</span>`;
-        }).join('');
-        diffHost.innerHTML = `
-          <div class="diff-meta"><div><span class="muted">基线</span> <code>${esc(diff.base.slice(0, 12))}</code> <span class="muted">→ 任务提交</span> <code>${esc(diff.head.slice(0, 12))}</code></div>
-          <pre class="repo-diff"><code>${rows || '<span class="muted">没有文本差异</span>'}</code></pre>
-          ${diff.diffTruncated ? '<div class="warn" role="status">Diff 超过 50 KB，显示内容已截断；审核时不会对截断 Diff 自动判定通过。</div>' : ''}
-          <details><summary>变更文件与统计</summary><pre class="diff-stat">${esc(diff.diffStat || '无统计')}</pre><ul>${diff.changedFiles.map((path) => `<li><code>${esc(path)}</code></li>`).join('') || '<li class="muted">无变更文件</li>'}</ul></details>
-        </div>`;
-        diffButton.textContent = '重新加载 Diff';
-      } catch (err) {
-        diffHost.innerHTML = `<span class="warn" role="alert">Diff 加载失败：${esc(err instanceof Error ? err.message : String(err))}</span>`;
-        diffButton.textContent = '重试加载 Diff';
-      } finally {
-        diffButton.disabled = false;
-        diffButton.removeAttribute('aria-busy');
-      }
-    });
     const retryReviewBtn = drawerHost.querySelector('[data-review-retry]');
     retryReviewBtn?.addEventListener('click', async () => {
       const button = retryReviewBtn as HTMLButtonElement;

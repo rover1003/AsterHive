@@ -106,7 +106,6 @@ export function analyzeTaskDependencies(tasks: Task[]): {
         if (matchingWrite) {
           // 检查 consumer 是否已经直接或间接依赖 producer
           const currentDeps = graph.get(consumer.id);
-          const alreadyOrdered = currentDeps?.has(producer.id) || !wouldCreateCycle(graph, consumer.id, producer.id);
 
           if (!currentDeps?.has(producer.id)) {
             // 环路检查：加 consumer -> producer

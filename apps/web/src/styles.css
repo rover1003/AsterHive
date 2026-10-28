@@ -810,23 +810,6 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 .field label { display: block; font-size: 12px; color: var(--subtle-foreground); }
 .field input, .field textarea, .field select { width: 100%; }
 .acceptance { background: var(--secondary); padding: 8px 12px; border-radius: var(--radius-sm); white-space: pre-wrap; }
-.diff-meta { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.repo-diff, .diff-stat {
-  max-height: 360px; overflow: auto; margin: 0; padding: 10px 0;
-  background: var(--secondary); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--foreground); font: 12px/1.55 var(--font-mono, ui-monospace, monospace);
-  tab-size: 4;
-}
-.repo-diff code { display: block; padding: 0; background: transparent; white-space: pre; }
-.diff-line { display: block; min-height: 1.55em; padding: 0 10px; }
-.diff-add { background: rgba(34, 197, 94, 0.12); color: var(--ok); }
-.diff-del { background: rgba(239, 68, 68, 0.12); color: var(--danger); }
-.diff-hunk { color: var(--primary); }
-.diff-stat { max-height: 180px; padding: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.diff-meta details { min-width: 0; }
-.diff-meta summary { cursor: pointer; color: var(--muted-foreground); }
-.diff-meta ul { margin: 8px 0 0; padding-left: 18px; overflow-wrap: anywhere; }
-.diff-meta li { margin: 4px 0; }
 .evidence { margin: 0; padding-left: 16px; }
 .evidence li { margin-bottom: 4px; }
 .msg-mini { border-top: 1px solid var(--border); padding: 8px 0; font-size: 12px; }

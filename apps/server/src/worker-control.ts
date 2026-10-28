@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import type { Ctx } from './types.ts';
 import { HttpError } from './types.ts';
 import { getAgent, findAgent, type Agent } from './agents.ts';
-import { getTask, updateTask, type Task } from './tasks.ts';
+import { getTask, type Task } from './tasks.ts';
 import { getOverview, type AgentOverview } from './overview.ts';
 import { withWrite, logEvent } from './write.ts';
 import { withTaskIntegrationLock } from './task-integration-lock.ts';

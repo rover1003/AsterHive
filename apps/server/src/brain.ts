@@ -26,7 +26,7 @@
 //     ② session.prompt() 默认展开轮首 /skill:<名>（agent-session.js _expandSkillCommand，
 //        由 Pi 进程读文件全文注入该轮 prompt，与工具面无关）——为将来 UI 触发的定向调用预留。
 //     自定义工具扩展走 extensions/（additionalExtensionPaths，工厂签名见 examples/brain-extension/）。
-import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { Type, type TSchema } from 'typebox';
 import type { ZodType } from 'zod';
@@ -521,7 +521,6 @@ export class Brain {
   #timer: ReturnType<typeof setTimeout> | null = null;
   #reasons: string[] = []; // 本轮唤醒原因（下一轮 prompt 的"待处理"清单）
   #lastBoardId: string | null = null; // 最近一次唤醒事件所在板（失败提示要发回对应的房）
-  #lastMessageId: number | null = null; // 当前唤醒消息 ID：长需求优先完整带入快照
   #errorRetryTimer: ReturnType<typeof setTimeout> | null = null;
   #consecutiveModelFailures = 0; // 连续上游失败计数：≥3 停自动重试（成功/用户新消息复位）
   #aborting = false; // 主动中止标记：abortTurn 置位，#turn 收尾据此识别"用户主动停"并与上游失败隔离（用后即清）
@@ -655,9 +654,6 @@ export class Brain {
       try {
         eventBoardId = getTask(this.#ctx, payload.taskId).boardId;
       } catch { /* ignored */ }
-    }
-    if (type === 'message.created' && typeof payload.messageId === 'number') {
-      this.#lastMessageId = payload.messageId;
     }
 
     let reason: string | null = null;
@@ -891,7 +887,6 @@ export class Brain {
   }
   async #reviewOnce(group: ActiveOrchestratorGroup, input: string): Promise<{ verdict: 'pass' | 'reject' | 'environment_blocked' | 'needs_evidence'; summary: string }> {
     const rt = this.#runtime.ensureRuntimeEntry();
-    const key = JSON.stringify([rt.entryUrl, group.baseURL, group.model, group.apiKey]);
     const brainDir = join(this.#ctx.cfg.dataDir, 'brain-session');
     const workspace = join(brainDir, 'reviewer-workspace');
     const agentDir = join(brainDir, 'reviewer-agent');
@@ -1021,7 +1016,6 @@ export class Brain {
       logEvent(this.#ctx, 'brain.turn_started', { reasons, groupId: g.id, groupName: g.name, boardId: activeBoard });
     });
     try {
-      const agent = ensureBrainAgent(this.#ctx);
       const userAgent = this.#ctx.holder.db.prepare('SELECT handle FROM agent WHERE id = ?').get('user') as { handle?: string } | undefined;
       const session = await this.#ensureSession(g, userAgent?.handle && userAgent.handle !== 'user' ? userAgent.handle : '用户');
       const reasonLines = reasons.length > 0 ? reasons.map((r) => `- ${r}`) : ['- （无未处理唤醒，按快照巡检）'];

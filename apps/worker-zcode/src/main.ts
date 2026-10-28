@@ -23,26 +23,20 @@ import {
   type Task,
   type PendingMessage,
   EXECUTION_REPORT_FILENAME,
-  EXECUTION_REPORT_MAX_BYTES,
   serializeExecutionReport,
   redactExecutionText,
   type ExecutionReport,
   type ExecutionCommand,
-  type ExecutionPreflightCheck,
 } from './sdk.ts';
-import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canSubmitExecution, commitWorkspace, prepareWorkspace, git, type PreparedWorkspace } from './workspace.ts';
 import { firstSkip, nextBoardsToPoll, pollNextDirectedTask } from './polling.ts';
 import {
   runPreclaimPreflight,
-  checkNodePreflight,
-  checkGitPreflight,
-  checkShellPreflight,
   runWorkspaceDependencyPreflight,
 } from './preflight.ts';
 import { runValidationCommands } from './verification.ts';

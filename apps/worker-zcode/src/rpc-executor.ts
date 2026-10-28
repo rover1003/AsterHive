@@ -3,7 +3,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
 import { hostname } from 'node:os';
 
 export interface RpcState {
@@ -49,7 +48,6 @@ export class OmpRpcSession {
   #ready = false;
   #readyWaiters: Array<{ resolve: () => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }> = [];
   #stderrTail: string[] = [];
-  #stdoutFrameRejected = false;
   readonly modelId?: string;
   readonly sessionDir: string;
   private readonly opts: {
@@ -151,7 +149,6 @@ export class OmpRpcSession {
       const rl = createInterface({ input: proc.stdout });
       rl.on('line', (line: string) => {
         if (Buffer.byteLength(line, 'utf8') > 1_048_576) {
-          this.#stdoutFrameRejected = true;
           this.#dead = true;
           this.#logLocal('OMP RPC JSONL 帧超过协议 1MiB 限额；关闭该会话');
           proc.kill('SIGKILL');

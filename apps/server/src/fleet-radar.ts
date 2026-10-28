@@ -1,7 +1,6 @@
 import type { Ctx } from './types.ts';
-import { listAgents, findAgent, getAgentTelemetryHistory, isTelemetryFresh, type Agent, type AgentSpecs, type AgentTelemetry } from './agents.ts';
+import { listAgents, getAgentTelemetryHistory, isTelemetryFresh, type AgentSpecs, type AgentTelemetry } from './agents.ts';
 import { getOverview, type AgentOverview } from './overview.ts';
-import { listTasks, type Task } from './tasks.ts';
 
 export interface StagnationAlert {
   taskId: string;
