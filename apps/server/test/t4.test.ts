@@ -58,8 +58,8 @@ test('T4: next 按优先级原子认领，取完返回 null', async () => {
   const r = mkBoardRig();
   try {
     await setupBoard(r, [
-      { id: 'T1', title: '普通', lane: 'Ready', assignee: 'bee1' },
-      { id: 'T2', title: '紧急', lane: 'Ready', priority: 'P0', assignee: 'bee1' },
+      { id: 'T1', title: '普通', lane: 'Ready', assignee: 'bee1', files: ['ordinary.ts'] },
+      { id: 'T2', title: '紧急', lane: 'Ready', priority: 'P0', assignee: 'bee1', files: ['urgent.ts'] },
     ]);
     let res = await r.app.request('/boards/b/next', { method: 'POST', headers: H(r.bee1.token) });
     let body = (await res.json()) as { task: { id: string; lane: string; assignee: string } | null };

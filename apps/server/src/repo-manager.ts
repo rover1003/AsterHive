@@ -10,7 +10,7 @@ import { HttpError } from './types.ts';
 import { getBoard, getTask, setBoardRepoState, updateTask, type Board, type Task } from './tasks.ts';
 import type { Agent } from './agents.ts';
 import { withWrite, logEvent } from './write.ts';
-import { withTaskIntegrationLock } from './task-integration-lock.ts';
+import { withTaskIntegrationLock, withRepositoryIntegrationLock } from './task-integration-lock.ts';
 
 export type RepoInitMode = 'empty' | 'clone';
 
@@ -520,7 +520,7 @@ export class RepoManager {
   }
 
   async integrateTask(boardId: string, taskId: string, expected?: { attempt?: number; head?: string }): Promise<{ mergedCommit: string }> {
-    return withTaskIntegrationLock(taskId, () => this.#integrateTask(boardId, taskId, expected));
+    return withTaskIntegrationLock(taskId, () => withRepositoryIntegrationLock(this.repoPath(boardId), () => this.#integrateTask(boardId, taskId, expected)));
   }
 
   async acceptManualTask(taskId: string, actor: Agent): Promise<{ task: Task; mergedCommit: string | null }> {
@@ -532,7 +532,7 @@ export class RepoManager {
       const board = getBoard(this.#ctx, task.boardId);
       const shouldIntegrate = board.repoMode === 'managed' && task.workspace.noCode !== true;
       const mergedCommit = shouldIntegrate
-        ? (await this.#integrateTask(task.boardId, task.id)).mergedCommit
+        ? (await withRepositoryIntegrationLock(this.repoPath(task.boardId), () => this.#integrateTask(task.boardId, task.id))).mergedCommit
         : null;
       const done = updateTask(this.#ctx, actor, task.id, { lane: 'Done' }, { integratedManagedCode: mergedCommit !== null, manualAcceptance: true });
       return { task: done, mergedCommit };

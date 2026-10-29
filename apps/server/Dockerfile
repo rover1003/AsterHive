@@ -19,7 +19,7 @@ COPY apps/server/package.json apps/server/
 RUN npm ci --omit=dev --workspace @asterhive/server
 
 COPY apps/server/src apps/server/src
-# worker CLI 自举源码（/bootstrap/ 端点原样分发）：仅 packages/sdk/src 下两个 .ts 小文件
+# worker CLI 自举源码（/bootstrap/ 端点按白名单分发 CLI 及 SDK 依赖）
 COPY packages/sdk/src /app/sdk/
 COPY skills /app/skills
 COPY scripts /app/scripts

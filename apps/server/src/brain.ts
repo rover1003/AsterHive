@@ -792,6 +792,7 @@ export class Brain {
             this.#scheduleReviewerQueue(250);
           });
           this.#reviewJobs.set(claimed.id, job);
+          await job;
           return; // Reviewer 串行运行，避免并发放大模型成本与上游速率限制
         }
       }

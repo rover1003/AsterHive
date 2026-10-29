@@ -348,6 +348,7 @@ test('定向指派与领活强化: 仅认领明确指派给当前工蜂的任务
       title: '定向给 A 的任务',
       lane: 'Ready',
       assignee: beeA.id,
+      files: ['a.ts'],
     });
 
     // DIR-2: 定向派发给 bee-b
@@ -356,6 +357,7 @@ test('定向指派与领活强化: 仅认领明确指派给当前工蜂的任务
       title: '定向给 B 的任务',
       lane: 'Ready',
       assignee: beeB.id,
+      files: ['b.ts'],
     });
 
     // UNASSIGN-1: 蜂后尚未决策派工的未指派任务

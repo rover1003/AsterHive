@@ -204,3 +204,82 @@ test('托管无代码任务须先进入 Review，人工验收无需代码引用'
     rig.cleanup();
   }
 });
+
+test('重做转为无代码交付后人工验收不合入上一轮被退回的代码', async () => {
+  const rig = mkRig();
+  try {
+    const board = createBoard(rig.ctx, { id: 'runtime-no-code', name: 'Runtime no code', repoMode: 'managed' });
+    const manager = new RepoManager(rig.ctx);
+    manager.initialize(board.id, 'empty');
+    await manager.waitForJob(board.id);
+    const bare = manager.repoPath(board.id);
+    const seed = join(rig.ctx.cfg.dataDir, 'seed-no-code');
+    mkdirSync(seed);
+    git(['init', '-q', '-b', 'main'], seed);
+    writeFileSync(join(seed, 'README.md'), 'base\n');
+    git(['add', '-A'], seed);
+    git(['commit', '-q', '-m', 'Base'], seed);
+    const base = git(['rev-parse', 'HEAD'], seed);
+    git(['push', '-q', bare, 'main'], seed);
+    git(['symbolic-ref', 'HEAD', 'refs/heads/main'], bare);
+    setBoardRepoState(rig.ctx, board.id, { status: 'ready', head: base });
+    const worker = registerAgent(rig.ctx, { name: 'Runtime no code', handle: 'runtime-no-code' });
+    createTask(rig.ctx, board.id, { id: 'NC-3', title: 'Investigate', lane: 'Ready', assignee: worker.agent.id, files: ['rejected.txt'] });
+    claimTask(rig.ctx, worker.agent, 'NC-3');
+    writeFileSync(join(seed, 'rejected.txt'), 'rejected code\n');
+    git(['add', '-A'], seed);
+    git(['commit', '-q', '-m', 'First attempt, rejected'], seed);
+    git(['push', '-q', bare, 'HEAD:refs/asterhive/tasks/NC-3'], seed);
+    submitTask(rig.ctx, worker.agent, 'NC-3', { summary: 'First attempt', attempt: 1 });
+    const app = createApp(rig.ctx);
+    const returned = await app.request('/tasks/NC-3/review/return', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'Investigate further without accepting the old code' }) });
+    assert.equal(returned.status, 200);
+    const review = submitTask(rig.ctx, worker.agent, 'NC-3', { summary: 'Exploration result; no new code', attempt: 2, noCode: true });
+    assert.equal(review.lane, 'Review');
+    const response = await app.request('/tasks/NC-3/review/accept', { method: 'POST' });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.mergedCommit, null);
+    assert.equal(result.task.workspace.noCode, true);
+    assert.equal(result.task.lane, 'Done');
+    assert.equal(git(['rev-parse', 'HEAD'], bare), base);
+  } finally { rig.cleanup(); }
+});
+
+test('同一托管仓库的并行人工验收保留两份成果，不发生非快进推送竞态', async () => {
+  const rig = mkRig();
+  try {
+    const board = createBoard(rig.ctx, { id: 'parallel-merge', name: 'Parallel merge', repoMode: 'managed' });
+    const manager = new RepoManager(rig.ctx);
+    manager.initialize(board.id, 'empty');
+    await manager.waitForJob(board.id);
+    const bare = manager.repoPath(board.id);
+    const seed = join(rig.ctx.cfg.dataDir, 'seed');
+    mkdirSync(seed);
+    git(['init', '-q', '-b', 'main'], seed);
+    writeFileSync(join(seed, 'README.md'), 'initial\n');
+    git(['add', '-A'], seed);
+    git(['commit', '-q', '-m', 'Initial'], seed);
+    const base = git(['rev-parse', 'HEAD'], seed);
+    git(['push', '-q', bare, 'main'], seed);
+    git(['symbolic-ref', 'HEAD', 'refs/heads/main'], bare);
+    setBoardRepoState(rig.ctx, board.id, { status: 'ready', head: base });
+    for (const index of [1, 2]) {
+      const id = `MERGE-${index}`;
+      createTask(rig.ctx, board.id, { id, title: id, lane: 'Review', files: [`feature-${index}.txt`] });
+      git(['checkout', '-q', '-B', `task-${index}`, base], seed);
+      writeFileSync(join(seed, `feature-${index}.txt`), `result-${index}\n`);
+      git(['add', '-A'], seed);
+      git(['commit', '-q', '-m', id], seed);
+      git(['push', '-q', bare, `HEAD:refs/asterhive/tasks/${id}`], seed);
+    }
+    const app = createApp(rig.ctx);
+    const responses = await Promise.all([1, 2].map(index => app.request(`/tasks/MERGE-${index}/review/accept`, { method: 'POST' })));
+    const results = await Promise.all(responses.map(async response => ({ status: response.status, body: await response.json() })));
+    assert.deepEqual(results.map(result => result.status), [200, 200], JSON.stringify(results));
+    assert.equal(git(['show', 'HEAD:feature-1.txt'], bare), 'result-1');
+    assert.equal(git(['show', 'HEAD:feature-2.txt'], bare), 'result-2');
+    for (const result of results) assert.equal(result.body.task.lane, 'Done');
+    assert.equal(rig.ctx.holder.db.prepare('SELECT repo_head FROM board WHERE id=?').get(board.id)?.repo_head, git(['rev-parse', 'HEAD'], bare));
+  } finally { rig.cleanup(); }
+});

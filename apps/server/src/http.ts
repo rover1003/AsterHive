@@ -1282,11 +1282,11 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     });
   });
 
-  // ---- 自举快捷通道（/bootstrap/）：偏爱现成 CLI 的 agent 用两条命令把单文件 CLI 拉到本机 ----
+  // ---- 自举快捷通道（/bootstrap/）：分发可独立运行的 CLI 及其 SDK 依赖 ----
   // 公开只读端点（不挂 requireActor）：零令牌语义下匿名即可读，与 /skill/:name 同级。
   // 源文件定位（按序尝试）：容器布局 COPY packages/sdk/src → /app/sdk/（相对 http.ts 向上三级）；
   // 仓库直跑布局 <repo>/packages/sdk/src（同样向上三级即仓库根）。都缺失 → 503，不许崩。
-  const BOOTSTRAP_FILES = new Set(['cli.ts', 'index.ts']); // 白名单：仅这两个文件可读，不作目录敞开
+  const BOOTSTRAP_FILES: Record<string, true> = { 'cli.ts': true, 'index.ts': true, 'execution.ts': true, 'execution-report.ts': true };
 
   function readBootstrapSource(file: string): string {
     const candidates = [
@@ -1304,9 +1304,8 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     const text = [
       'AsterHive worker 自举（可选快捷通道；完整协议见 ' + `${base}/skill/asterhive-worker` + '）',
       '',
-      '# 1) 下载单文件 CLI（零第三方依赖，node >= 23.6 直接运行 .ts；cli.ts 依赖同目录的 index.ts）',
-      `curl -fLo cli.ts ${base}/bootstrap/cli.ts`,
-      `curl -fLo index.ts ${base}/bootstrap/index.ts`,
+      '# 1) 下载 CLI 及全部同目录依赖（零第三方依赖，node >= 23.6 直接运行 .ts）',
+      ...Object.keys(BOOTSTRAP_FILES).map(file => `curl -fLo ${file} ${base}/bootstrap/${file}`),
       '',
       '# 2) 注册（默认身份，撞名自愈；token 自动写入 ~/.asterhive/worker.json，仅此一次返回）',
       `node cli.ts register --url ${base}`,
@@ -1321,7 +1320,7 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   app.get('/bootstrap/', bootstrapIndex);
   app.get('/bootstrap/:file', (c) => {
     const file = c.req.param('file');
-    if (!BOOTSTRAP_FILES.has(file)) {
+    if (!Object.hasOwn(BOOTSTRAP_FILES, file)) {
       throw new HttpError(404, `unknown bootstrap file: ${file}`);
     }
     return c.body(readBootstrapSource(file), 200, { 'content-type': 'text/plain; charset=utf-8' });

@@ -68,8 +68,8 @@ test('C: next 与 claim 竞争——同一任务只能被一方原子认领', ()
   const r = mkRig2();
   try {
     createBoard(r.rig.ctx, { id: 'b-nc', name: 'NC' });
-    createTask(r.rig.ctx, 'b-nc', { id: 'NC-1', title: 't1', lane: 'Ready', assignee: 'bee1' });
-    createTask(r.rig.ctx, 'b-nc', { id: 'NC-2', title: 't2', lane: 'Ready', assignee: 'bee2' });
+    createTask(r.rig.ctx, 'b-nc', { id: 'NC-1', title: 't1', lane: 'Ready', assignee: 'bee1', files: ['first.ts'] });
+    createTask(r.rig.ctx, 'b-nc', { id: 'NC-2', title: 't2', lane: 'Ready', assignee: 'bee2', files: ['second.ts'] });
 
     // bee1 用 next 领取 NC-1
     const n1 = nextTask(r.rig.ctx, r.bee1.agent, 'b-nc');
@@ -95,7 +95,7 @@ test('C: 直接认领受 WIP 约束——与 next 同一容量判定', () => {
   try {
     createBoard(r.rig.ctx, { id: 'b-wip', name: 'WIP', wip: { InProgress: 2 } });
     for (const id of ['W1', 'W2', 'W3']) {
-      createTask(r.rig.ctx, 'b-wip', { id, title: id, lane: 'Ready', assignee: 'bee1' });
+      createTask(r.rig.ctx, 'b-wip', { id, title: id, lane: 'Ready', assignee: 'bee1', files: [`${id}.ts`] });
     }
     assert.equal(claimTask(r.rig.ctx, r.bee1.agent, 'W1').lane, 'InProgress');
     assert.equal(claimTask(r.rig.ctx, r.bee1.agent, 'W2').lane, 'InProgress');
@@ -162,6 +162,25 @@ test('C: 空写集保守互斥——未知写集阻塞同仓库已声明写任�
   } finally {
     r.rig.cleanup();
   }
+});
+
+test('C: 同仓库两份未知写集互斥，轮询不得认领；其他仓库与只读任务不受影响', () => {
+  const r = mkRig2();
+  try {
+    createBoard(r.rig.ctx, { id: 'unknown', name: 'Unknown', repo: 'https://example.invalid/shared.git', wip: { InProgress: 10 } });
+    createBoard(r.rig.ctx, { id: 'shared', name: 'Shared', repo: 'https://example.invalid/shared.git', wip: { InProgress: 10 } });
+    createBoard(r.rig.ctx, { id: 'other', name: 'Other', repo: 'https://example.invalid/other.git', wip: { InProgress: 10 } });
+    createTask(r.rig.ctx, 'unknown', { id: 'U1', title: 'Unknown writer A', lane: 'Ready', assignee: 'bee1' });
+    claimTask(r.rig.ctx, r.bee1.agent, 'U1');
+    createTask(r.rig.ctx, 'shared', { id: 'U2', title: 'Unknown writer B', lane: 'Ready', assignee: 'bee2' });
+    assert.throws(() => claimTask(r.rig.ctx, r.bee2.agent, 'U2'), is409);
+    assert.equal(nextTask(r.rig.ctx, r.bee2.agent, 'shared').task, null);
+    assert.equal(getTask(r.rig.ctx, 'U2').lane, 'Ready');
+    createTask(r.rig.ctx, 'other', { id: 'U3', title: 'Other repository', lane: 'Ready', assignee: 'bee2' });
+    assert.equal(claimTask(r.rig.ctx, r.bee2.agent, 'U3').lane, 'InProgress');
+    createTask(r.rig.ctx, 'shared', { id: 'U4', title: 'Explicit read-only task', lane: 'Ready', assignee: 'bee2', workspace: { noCode: true } });
+    assert.equal(claimTask(r.rig.ctx, r.bee2.agent, 'U4').lane, 'InProgress');
+  } finally { r.rig.cleanup(); }
 });
 
 test('C: noCode 只读任务不阻塞他人写任务', () => {
@@ -236,7 +255,7 @@ test('C: Review 并发提交撞 WIP——提交与 WIP 判定同一事务', () =
   try {
     createBoard(r.rig.ctx, { id: 'b-r', name: 'Review', wip: { Review: 2 } });
     for (const id of ['R1', 'R2', 'R3']) {
-      createTask(r.rig.ctx, 'b-r', { id, title: id, lane: 'Ready', assignee: 'bee1' });
+      createTask(r.rig.ctx, 'b-r', { id, title: id, lane: 'Ready', assignee: 'bee1', files: [`${id}.ts`] });
       claimTask(r.rig.ctx, r.bee1.agent, id);
     }
     submitTask(r.rig.ctx, r.bee1.agent, 'R1', { summary: 'done1', attempt: 1 });

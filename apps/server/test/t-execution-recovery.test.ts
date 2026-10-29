@@ -1044,7 +1044,7 @@ test('updateTask 状态机安全门禁: 严禁通过通用 PATCH 绕过物理停
     registerAgent(rig.ctx, { id: 'w-patch2', name: 'Worker 2', handle: 'w-patch2', role: 'worker' });
     const board = createBoard(rig.ctx, { id: 'b-patch-gate', name: 'Patch Gate Board' });
 
-    createTask(rig.ctx, board.id, { id: 'GAT-1', title: 'InProgress task', lane: 'Ready', assignee: 'w-patch1' });
+    createTask(rig.ctx, board.id, { id: 'GAT-1', title: 'InProgress task', lane: 'Ready', assignee: 'w-patch1', files: ['running.ts'] });
     claimTask(rig.ctx, workerReg.agent, 'GAT-1');
     assert.equal(getTask(rig.ctx, 'GAT-1').lane, 'InProgress');
 
@@ -1078,7 +1078,7 @@ test('updateTask 状态机安全门禁: 严禁通过通用 PATCH 绕过物理停
     assert.equal(metaUpdated.assignee, 'w-patch1', '编辑元数据不改变指派人');
 
     // 4. Review 任务禁止通过 updateTask 直接移入 InProgress（退回重做必须走具备代次自增与锁的专用 API）
-    createTask(rig.ctx, board.id, { id: 'GAT-2', title: 'Review task', lane: 'Ready', assignee: 'w-patch1' });
+    createTask(rig.ctx, board.id, { id: 'GAT-2', title: 'Review task', lane: 'Ready', assignee: 'w-patch1', files: ['review.ts'] });
     claimTask(rig.ctx, workerReg.agent, 'GAT-2');
     submitTask(rig.ctx, workerReg.agent, 'GAT-2', { summary: 'Submitting GAT-2' });
     assert.equal(getTask(rig.ctx, 'GAT-2').lane, 'Review');

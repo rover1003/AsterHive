@@ -42,6 +42,24 @@ docker compose up -d --build
 ```
 
 旧数据卷原样保留；数据库 schema 热迁移（启动时自动补列）。Pi 运行时升级走 Web UI「设置 → Pi 运行时」（装新版→原子切换→可回滚），与镜像升级解耦。
+### 生产升级操作规范与工蜂升级顺序
+
+1. **升级前备份**：在宿主机保存当前数据卷副本与镜像标签：
+   ```bash
+   docker compose exec -u root asterhive cp /data/asterhive.db /data/pre-release-backup.db
+   docker tag asterhive/server:latest asterhive/server:pre-release-backup
+   ```
+2. **部署服务端**：本地完成验证并提交后，通过 `git archive HEAD` 覆盖解压至服务器目录（保留 `.env` 与数据卷），在远端执行：
+   ```bash
+   docker compose up -d --build
+   ```
+3. **验证健康状态**：检查 `http://<server-ip>:8067/health`，确认 `db: true` 且数据表热迁移成功。
+4. **工蜂逐台更新（重要）**：
+   - **服务端部署不会自动升级已安装工蜂**；
+   - 升级服务端后，现有旧版工蜂仍可使用原有心跳与静态规格正常领活（兼容旧协议）；
+   - 若需获得执行实例秒级追踪、阶段等待计时与会话只读观察能力，需登录各目标设备，确保当前任务已完全停止，重新下载最新的 `worker.tar.gz` 解压至工蜂应用目录并重启常驻服务；
+   - 严禁通过删除设备身份、重命名 handle 或清空工作区现场来冒充升级。
+5. **回退方案**：若发布后发现异常，可直接拉起备份镜像并恢复数据库副本，历史版本具备向下读写兼容性，严禁通过清空数据库恢复。
 
 ### 蜂后模型组的思考等级
 

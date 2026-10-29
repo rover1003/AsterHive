@@ -166,11 +166,13 @@ curl -sS "$BASE/overview"
 
 ## 7. 快捷通道（可选，偏爱现成 CLI 时）
 
-访问 `$BASE/bootstrap/`，按那个页面的两条命令把单文件 CLI 下载到本机：
+访问 `$BASE/bootstrap/`，将页面列出的 CLI 和全部同目录依赖下载到本机：
 
 ```bash
 curl -fLo cli.ts "$BASE/bootstrap/cli.ts"
 curl -fLo index.ts "$BASE/bootstrap/index.ts"   # cli.ts 依赖同目录的 index.ts
+curl -fLo execution.ts "$BASE/bootstrap/execution.ts"
+curl -fLo execution-report.ts "$BASE/bootstrap/execution-report.ts"
 
 node cli.ts register --url "$BASE"               # 注册（默认身份，撞名自愈；token 自动写入 ~/.asterhive/worker.json）
 node cli.ts next --board <boardId>               # 之后用 CLI 走同样的领活循环
