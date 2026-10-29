@@ -14,6 +14,8 @@ import { fileURLToPath } from 'node:url';
 import { Type } from 'typebox';
 import type { ResourceLoader } from '@earendil-works/pi-coding-agent';
 import { WORKER_SYSTEM_PROMPT, HIVE_CHECKPOINT_TOOL_DESCRIPTION } from './hive-prompt.ts';
+import { createSessionObserver } from './session-observer.ts';
+import type { SessionObservationEvent } from './sdk.ts';
 
 export type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -29,6 +31,7 @@ export interface PiModelConfig {
 export interface PiActivity {
   kind: 'tool' | 'model';
   toolName?: string;
+  callId?: string;
   phase: 'start' | 'end';
   waitingFor?: string;
   timestamp: number;
@@ -43,6 +46,10 @@ export interface PiRunOptions {
   /** hive_checkpoint 落点：转发给守护进程的 worker.checkpoint(taskId, note) */
   checkpoint?: (note: string) => Promise<{ pendingMessages?: { author?: string; content?: string }[] }>;
   onActivity?: (activity: PiActivity) => void | Promise<void>;
+  onSessionEvent?: (event: Omit<SessionObservationEvent, 'sequence'>) => void;
+  observeSession?: () => boolean;
+  observationSecrets?: string[];
+  signal?: AbortSignal;
   /** 随包技能目录（缺省 = 包内 hive-skills） */
   skillsDir?: string;
   /** Pi agentDir 隔离根（缺省 ~/.asterhive/pi-worker-agent，与用户 ~/.pi 完全隔离） */
@@ -213,8 +220,12 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
     customTools: [checkpointTool],
   });
   const sessionHandle = session as unknown as PiSessionLike;
+  const observe = opts.onSessionEvent ? createSessionObserver({
+    enabled: opts.observeSession ?? (() => false),
+    emit: opts.onSessionEvent,
+    secrets: [config.apiKey, ...(opts.observationSecrets ?? [])],
+  }) : undefined;
 
-  const seenToolStarts = new Set<string>();
   let unsubscribe: (() => void) | undefined;
   const subscribable = session as unknown as {
     subscribe?: (fn: (event: Record<string, unknown>) => void) => () => void;
@@ -222,12 +233,15 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
   if (typeof subscribable.subscribe === 'function') {
     unsubscribe = subscribable.subscribe((event: Record<string, unknown>) => {
       if (!event || typeof event !== 'object') return;
+      observe?.(event);
       const type = typeof event.type === 'string' ? event.type : '';
+      const message = event.message;
       if (type === 'tool_execution_start') {
         const toolName = typeof event.toolName === 'string' ? event.toolName : 'tool';
         onActivity?.({
           kind: 'tool',
           toolName,
+          callId: typeof event.toolCallId === 'string' ? event.toolCallId : undefined,
           phase: 'start',
           waitingFor: `tool:${toolName}`,
           timestamp: Date.now(),
@@ -237,42 +251,32 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
         onActivity?.({
           kind: 'tool',
           toolName,
+          callId: typeof event.toolCallId === 'string' ? event.toolCallId : undefined,
           phase: 'end',
           timestamp: Date.now(),
         });
-      } else if (type === 'turn_start' || type === 'message_start') {
+      } else if (type === 'turn_start') {
         onActivity?.({
           kind: 'model',
           phase: 'start',
           waitingFor: 'model',
           timestamp: Date.now(),
         });
-      } else if (type === 'message_update') {
-        const msg = event.message as { content?: unknown[] } | undefined;
-        if (msg && Array.isArray(msg.content)) {
-          for (let i = 0; i < msg.content.length; i++) {
-            const b = msg.content[i] as { type?: string; name?: string } | undefined;
-            if (b && (b.type === 'tool_call' || b.type === 'tool_use')) {
-              const toolName = typeof b.name === 'string' ? b.name : 'tool';
-              const key = `${toolName}|${i}`;
-              if (!seenToolStarts.has(key)) {
-                seenToolStarts.add(key);
-                onActivity?.({
-                  kind: 'tool',
-                  toolName,
-                  phase: 'start',
-                  waitingFor: `tool:${toolName}`,
-                  timestamp: Date.now(),
-                });
-              }
-            }
-          }
-        }
+      } else if (type === 'message_end' && message !== null && typeof message === 'object' && 'role' in message && message.role === 'assistant') {
+        onActivity?.({ kind: 'model', phase: 'end', timestamp: Date.now() });
       }
     });
   }
   let aborted = false;
+  let sessionFailed = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+  const cancel = () => {
+    cancelled = true;
+    void Promise.resolve().then(() => sessionHandle.abort()).catch(error => log('Pi 取消请求失败，仍等待真实结束：', error instanceof Error ? error.message : error));
+  };
+  opts.signal?.addEventListener('abort', cancel, { once: true });
+  if (opts.signal?.aborted) cancel();
 
   timer = setTimeout(() => {
     aborted = true;
@@ -298,7 +302,11 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
 
   try {
     // 真实 await 原始 prompt 直到真正 settled；绝不提前 fake-resolve 退出
-    await sessionHandle.prompt(prompt);
+    if (!cancelled) await sessionHandle.prompt(prompt);
+    if (cancelled) return { stdout: '[pi-executor] 任务已取消，Pi 会话已结束；工作区现场已保留。', code: -2 };
+    if (aborted) {
+      return { stdout: `${lastAssistantText(sessionHandle)}\n[pi-executor] 会话超时被中止，已真正中止退出；工作区现场已保留。`.trim(), code: -1 };
+    }
     const agentError = sessionHandle.agent?.state?.errorMessage;
     if (agentError) {
       return {
@@ -324,16 +332,12 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
     }
 
     const text = lastAssistantText(session as PiSessionLike);
-    if (aborted) {
-      return {
-        stdout: `${text}\n[pi-executor] 会话超时被中止，已真正中止退出；工作区现场已保留。`.trim(),
-        code: -1,
-      };
-    }
+    sessionFailed = false;
     return { stdout: text || '(无文本输出)', code: 0 };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log('Pi 会话执行出错：', msg);
+    if (cancelled) return { stdout: '[pi-executor] 任务已取消，Pi 会话已结束；工作区现场已保留。', code: -2 };
     if (aborted) {
       const partial = lastAssistantText(session as PiSessionLike);
       return {
@@ -343,8 +347,10 @@ export async function runPiPrompt(opts: PiRunOptions): Promise<PiRunResult> {
     }
     return { stdout: `[pi-executor] 执行出错：${msg}`, code: 1 };
   } finally {
+    observe?.({ type: 'observation_session_end', failed: sessionFailed });
     unsubscribe?.();
     clearTimeout(timer);
+    opts.signal?.removeEventListener('abort', cancel);
     try {
       sessionHandle.dispose?.();
     } catch {

@@ -3,6 +3,7 @@
 // 页头由 render 装配；Agent 总览和任务上下文均保留。
 import { api, type Overview, type AgentOverview, type FleetRadarReport, type FleetTelemetryReport, type AgentTelemetry } from '../api.ts';
 import { subscribe } from '../sse.ts';
+import { onConnectionState } from '../sse.ts';
 import { currentQuery } from '../main.ts';
 import { esc, fmtDuration, fmtTime } from '../ui.ts';
 import { icon } from '../icons.ts';
@@ -124,9 +125,12 @@ export function renderFleetInto(
     }
     pendingTelemetry.clear();
   };
+  // 旧 SSE 帧不得覆盖重连后拉取的新快照：丢弃快照时间戳之前的迟到帧
   const queueTelemetryEvent = (payload: Record<string, unknown>) => {
     if (typeof payload.agentId !== 'string' || !payload.telemetry) return;
-    pendingTelemetry.set(payload.agentId, payload.telemetry as AgentTelemetry);
+    const sample = payload.telemetry as AgentTelemetry;
+    if (telemetrySnapshot && sample.timestamp <= telemetrySnapshot.timestamp) return;
+    pendingTelemetry.set(payload.agentId, sample);
     if (telemetryTimer === undefined) telemetryTimer = window.setTimeout(applyTelemetryEvents, 250);
   };
 
@@ -189,12 +193,17 @@ export function renderFleetInto(
     if (type === 'agent.telemetry') queueTelemetryEvent(payload);
     else if (type.startsWith('task.') || type.startsWith('agent.')) void load();
   });
+  const disconnect = onConnectionState((online) => {
+    if (online) void load();
+    else pendingTelemetry.clear();
+  });
   const timer = setInterval(() => void load(), 30_000);
   return {
     destroy: () => {
       if (disposed) return;
       disposed = true;
       unsub();
+      disconnect();
       clearInterval(timer);
       window.clearTimeout(telemetryTimer);
     },

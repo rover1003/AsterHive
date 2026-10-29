@@ -334,6 +334,35 @@ function rowToTask(r: TaskRow, ctx?: Ctx): Task {
 
 const TASK_ID_RE = /^[A-Z][A-Z0-9]*-?\d+$/; // T42 / BUG-17 / AUX-3
 
+// ---- 文件写路径契约（计划 §4.2）----
+
+// 路径归一化：Windows 分隔符 → '/'、去 ./ 前缀与尾部斜杠、小写（大小写不敏感互斥）
+export function normalizePath(p: string): string {
+  return p.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').toLowerCase();
+}
+
+// 非法写路径：空、绝对路径、盘符、UNC、空段、. / .. 段（防逃逸）
+export function isIllegalPath(p: string): boolean {
+  const norm = p.trim().replace(/\\/g, '/');
+  if (!norm) return true;
+  if (norm.startsWith('/') || norm.startsWith('//')) return true;
+  if (/^[A-Za-z]:/.test(norm)) return true;
+  return norm.split('/').some((seg) => seg === '' || seg === '.' || seg === '..');
+}
+
+// 边界单次校验并归一化文件清单（创建/更新/认领共用）；非法路径 422
+export function validateFileList(files: unknown, field = 'files'): string[] {
+  if (!Array.isArray(files)) throw new HttpError(422, `${field}: string[] required`);
+  const out: string[] = [];
+  for (const f of files) {
+    if (typeof f !== 'string') throw new HttpError(422, `${field}: string[] required`);
+    if (isIllegalPath(f)) throw new HttpError(422, `invalid ${field} path: ${f}`);
+    const norm = normalizePath(f);
+    if (norm && !out.includes(norm)) out.push(norm);
+  }
+  return out;
+}
+
 // ---- Board ----
 
 type BoardRow = {
@@ -351,16 +380,26 @@ type BoardRow = {
   updated_at: number;
 };
 
+function publicRepoUrl(value: string): string {
+  if (!URL.canParse(value)) return value;
+  const url = new URL(value);
+  if (url.protocol !== 'ssh:') url.username = '';
+  url.password = '';
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
 function rowToBoard(r: BoardRow): Board {
   return {
     id: r.id,
     name: r.name,
-    repo: r.repo,
+    repo: publicRepoUrl(r.repo),
     repoMode: r.repo_mode,
     repoStatus: r.repo_status,
     repoError: r.repo_error,
     repoHead: r.repo_head,
-    repoSource: r.repo_source,
+    repoSource: publicRepoUrl(r.repo_source),
     description: r.description,
     wip: JSON.parse(r.wip) as Board['wip'],
     createdAt: r.created_at,
@@ -388,6 +427,9 @@ export interface CreateBoardInput {
 function guardBoardInput(input: { name?: string; repo?: string; description?: string }): void {
   for (const [field, v] of Object.entries({ name: input.name, repo: input.repo, description: input.description })) {
     if (typeof v === 'string') assertNoMojibake(v, `board.${field}`);
+    if (field === 'repo' && typeof v === 'string' && URL.canParse(v) && publicRepoUrl(v) !== new URL(v).toString()) {
+      throw new HttpError(422, 'repository URL must not include credentials, query parameters or fragments');
+    }
   }
 }
 
@@ -665,6 +707,7 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
     assertWip(ctx, boardId, lane, id);
   }
   const requirements = normalizeRequirements(input.requirements);
+  const files = validateFileList(input.files ?? [], 'files');
   const now = Date.now();
   try {
     withWrite(ctx, 'task.create', () => {
@@ -684,7 +727,7 @@ export function createTask(ctx: Ctx, boardId: string, input: CreateTaskInput): T
           input.category ?? '',
           input.acceptance ?? '',
           JSON.stringify(input.workspace ?? {}),
-          JSON.stringify(input.files ?? []),
+          JSON.stringify(files),
           JSON.stringify(input.reads ?? []),
           JSON.stringify(input.protectedPaths ?? []),
           requirements ? JSON.stringify(requirements) : null,
@@ -810,7 +853,7 @@ export function updateTask(ctx: Ctx, actor: Agent, id: string, patch: PatchTaskI
     if (patch.category !== undefined) push('category', patch.category);
     if (patch.acceptance !== undefined) push('acceptance', patch.acceptance);
     if (patch.workspace !== undefined) push('workspace', JSON.stringify(patch.workspace));
-    if (patch.files !== undefined) push('files', JSON.stringify(patch.files));
+    if (patch.files !== undefined) push('files', JSON.stringify(validateFileList(patch.files, 'files')));
     if (patch.reads !== undefined) push('reads', JSON.stringify(patch.reads));
     if (patch.protectedPaths !== undefined) push('protected_paths', JSON.stringify(patch.protectedPaths));
     if (patch.requirements !== undefined) push('requirements', JSON.stringify(normalizeRequirements(patch.requirements)));

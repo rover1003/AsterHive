@@ -7,6 +7,7 @@ import { esc, fmtTime, LANE_LABELS, PRIORITY_CLASS, toast } from '../ui.ts';
 import { icon } from '../icons.ts';
 import { currentQuery, refreshNav } from '../main.ts';
 import { mountChatPanel, type ChatPanelHandle } from './room.ts';
+import { mountExecutionPanel } from './execution-panel.ts';
 
 const LANES = ['Backlog', 'Ready', 'InProgress', 'Review', 'Done'] as const;
 const DEFAULT_WIP: Record<string, number> = { InProgress: 3, Review: 3 };
@@ -126,17 +127,6 @@ function normalizeProgress(progress?: unknown): NormalizedTaskProgress {
   };
 }
 
-function formatProgressTime(ts: number | null): string {
-  if (!ts) return '暂无记录';
-  const now = Date.now();
-  const diff = now - ts;
-  const clock = fmtTime(ts);
-  if (diff < 0) return clock;
-  if (diff < 60_000) return `刚刚 (${clock})`;
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前 (${clock})`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前 (${clock})`;
-  return `${Math.floor(diff / 86_400_000)} 天前 (${clock})`;
-}
 
 const PROGRESS_STATUS_META: Record<
   NormalizedTaskProgress['status'],
@@ -194,56 +184,6 @@ function renderCardProgress(t: Task): string {
   return `<div class="card-progress ${meta.badgeClass}" title="${esc(tip)}"><span class="card-progress-dot"></span><span class="card-progress-text">${esc(meta.short)}</span></div>`;
 }
 
-function renderDrawerProgress(t: Task): string {
-  if (t.lane !== 'InProgress') return '';
-
-  const p = normalizeProgress(t.progress);
-  const meta = PROGRESS_STATUS_META[p.status];
-
-  return `
-    <div class="field">
-      <label>工蜂执行与进展遥测</label>
-      <div class="progress-panel">
-        <div class="progress-panel-head">
-          <span class="progress-status-badge ${meta.badgeClass}">
-            <span class="status-dot"></span>
-            <b>${esc(meta.label)}</b>
-          </span>
-          <span class="progress-panel-desc">${esc(meta.desc)}</span>
-        </div>
-        <div class="progress-alert ${meta.calloutClass}">
-          ${esc(meta.calloutText)}
-        </div>
-        ${p.status === 'failed' && p.errorNote ? `<div class="progress-alert alert-danger"><b>失败原因：</b>${esc(p.errorNote)}</div>` : ''}
-        <div class="progress-grid">
-          <div class="progress-row">
-            <div class="progress-row-header">
-              <span class="progress-row-label">工蜂保活心跳</span>
-              <span class="progress-row-val">${esc(formatProgressTime(p.workerLastSeenAt))}</span>
-            </div>
-            <div class="progress-row-hint muted">仅表示心跳上报，不代表任务有实质进展</div>
-          </div>
-          <div class="progress-row">
-            <div class="progress-row-header">
-              <span class="progress-row-label">最近可观察活动</span>
-              <span class="progress-row-val">${esc(formatProgressTime(p.lastActivityAt))}${p.lastActivityKind ? ` · <code class="activity-kind">${esc(p.lastActivityKind)}</code>` : ''}</span>
-            </div>
-            <div class="progress-row-hint muted">可观察到的事件记录</div>
-          </div>
-          <div class="progress-row">
-            <div class="progress-row-header">
-              <span class="progress-row-label">最近进展里程碑</span>
-              <span class="progress-row-val">${esc(formatProgressTime(p.lastProgressAt))}</span>
-            </div>
-            <div class="progress-row-hint muted">阶段进展或里程碑更新时间</div>
-          </div>
-        </div>
-        <div class="progress-evidence-note muted">
-          证据原则：仅展示可观察证据，无数据或旧工蜂显示未知；不要从心跳保活推断正在工作。
-        </div>
-      </div>
-    </div>`;
-}
 
 function cardHtml(t: Task): string {
   // 紧凑卡（176×88）：首行 P 色点 + 任务号（金色等宽）+ 负责人（蓝灰靠右），标题两行截断；
@@ -305,7 +245,6 @@ function drawerHtml(t: Task, msgs: Message[]): string {
         .map((m) => `<div class="msg-mini"><b>${esc(m.author)}</b> <time>${fmtTime(m.createdAt)}</time><div>${esc(m.content)}</div></div>`)
         .join('')
     : '<div class="muted">该任务暂无关联消息</div>';
-  const progressSection = renderDrawerProgress(t);
 
   return `
     <div class="drawer-mask" id="drawer-mask"></div>
@@ -322,7 +261,7 @@ function drawerHtml(t: Task, msgs: Message[]): string {
         ${t.detail ? `<div class="field"><label>说明</label><div>${esc(t.detail)}</div></div>` : ''}
         ${t.acceptance ? `<div class="field"><label>验收标准</label><div class="acceptance">${esc(t.acceptance)}</div></div>` : ''}
         ${reviewState}${submitSummary}${reviewSummary}
-        ${progressSection}
+        <section class="field" id="task-execution-panel" aria-label="执行实例观察"></section>
         <div class="field"><label>负责人</label><div>${t.assignee === 'unassigned' ? '<span class="muted">未指派</span>' : '@' + esc(t.assignee)}</div></div>
         <div class="field"><label>依赖</label><div>${deps}</div></div>
         <div class="field"><label>工作区</label><div>${workspace}</div></div>
@@ -385,18 +324,21 @@ export async function render(el: HTMLElement): Promise<void> {
   refreshNav(); // 当前板可能因深链/回落变化：同步侧栏项目高亮
 
   const board = boards.find((b) => b.id === currentBoard)!;
-  const needsInit = board.repoMode === 'managed' && (board.repoStatus === 'empty' || board.repoStatus === 'failed');
-  const initBanner = needsInit
-    ? `
-      <div class="panel init-banner" style="margin: 0 16px 12px; border-left: 3px solid var(--gold); background: rgba(217, 119, 6, 0.08); padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-radius: 6px;">
-        <div>
-          <div style="font-weight: 600; font-size: 13px; color: var(--gold-light);">📦 项目代码库尚未初始化</div>
-          <div class="muted small" style="margin-top: 2px;">
-            当前项目为托管空仓。在聊天室对蜂后说<b>“初始化项目”</b>，蜂后将协助从 GitHub 远端拉取；也可在「管理」中配置远端，或由本机终端导入。
-          </div>
-        </div>
-        <button class="sm ghost" id="btn-copy-import" style="white-space: nowrap;">复制导入命令</button>
-      </div>`
+  const needsInit = board.repoMode === 'managed' && !board.repoHead;
+  const importCommand = `node packages/sdk/src/cli.ts repo import --board "${board.id}" --path "<本机项目目录>" --url "${location.origin}"`;
+  const initBanner = board.repoMode === 'managed'
+    ? `<details class="panel" style="margin: 0 16px 16px; padding: 16px; overflow-wrap: anywhere;"${needsInit ? ' open' : ''}>
+        <summary>项目代码库与导入信息</summary>
+        <dl class="small">
+          <dt>看板 ID</dt><dd><code>${esc(board.id)}</code></dd>
+          <dt>用户填写的 Git 地址</dt><dd>${esc(board.repo || '未填写（旧项目可能未保存）')}</dd>
+          <dt>实际仓库来源</dt><dd>${esc(board.repoSource || '尚无已记录来源')}</dd>
+          <dt>仓库状态</dt><dd id="board-repo-status">${esc(board.repoStatus)} · ${board.repoHead ? `当前提交 ${esc(board.repoHead)}` : '尚无代码提交，未确认导入'}${board.repoError ? ` · ${esc(board.repoError)}` : ''}</dd>
+        </dl>
+        <p class="muted small">在持有源码的设备、AsterHive 源码根目录执行以下命令。需要工作树干净的 Git 仓库，导入保留提交历史；填写地址不会自动克隆或导入。</p>
+        <p class="small"><code>${esc(importCommand)}</code></p>
+        <button class="sm ghost" id="btn-copy-import">复制导入命令</button>
+      </details>`
     : '';
 
   // 页头两行：①项目名+仓库 pill+建卡主按钮 ②切板+管理+新项目（窄屏外加看板开关）
@@ -442,7 +384,7 @@ export async function render(el: HTMLElement): Promise<void> {
   const copyImportBtn = el.querySelector('#btn-copy-import');
   if (copyImportBtn) {
     copyImportBtn.addEventListener('click', async () => {
-      const cmd = `node packages/sdk/src/cli.ts repo import --board ${board.id} --path <你的本机项目目录> --url ${location.origin}`;
+      const cmd = importCommand;
       try {
         await navigator.clipboard.writeText(cmd);
         toast('导入命令已复制到剪贴板');
@@ -480,8 +422,11 @@ export async function render(el: HTMLElement): Promise<void> {
     return r.tasks;
   };
   let tasks = await load();
+  let disposeExecutionPanel: (() => void) | undefined;
+  let drawerRequest = 0;
 
   const openDrawer = async (id: string, msgs?: Message[]) => {
+    const request = ++drawerRequest;
     const t = tasks.find((x) => x.id === id);
     if (!t) return;
     const sub =
@@ -491,9 +436,18 @@ export async function render(el: HTMLElement): Promise<void> {
           .get<{ messages: Message[] }>(`/boards/${currentBoard}/messages?limit=500`)
           .catch(() => ({ messages: [] as Message[] }))
       ).messages.filter((m) => m.taskRef === id);
+    if (request !== drawerRequest || !drawerHost.isConnected) return;
+    disposeExecutionPanel?.();
     drawerHost.innerHTML = drawerHtml(t, sub);
-    drawerHost.querySelector('#drawer-close')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
-    drawerHost.querySelector('#drawer-mask')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
+    disposeExecutionPanel = mountExecutionPanel(drawerHost.querySelector<HTMLElement>('#task-execution-panel')!, t);
+    const closeDrawer = () => {
+      drawerRequest++;
+      disposeExecutionPanel?.();
+      disposeExecutionPanel = undefined;
+      drawerHost.innerHTML = '';
+    };
+    drawerHost.querySelector('#drawer-close')!.addEventListener('click', closeDrawer);
+    drawerHost.querySelector('#drawer-mask')!.addEventListener('click', closeDrawer);
     const retryReviewBtn = drawerHost.querySelector('[data-review-retry]');
     retryReviewBtn?.addEventListener('click', async () => {
       const button = retryReviewBtn as HTMLButtonElement;
@@ -612,6 +566,8 @@ export async function render(el: HTMLElement): Promise<void> {
 
   // 建卡表单（简易抽屉）
   (el.querySelector('#new-task') as HTMLElement).addEventListener('click', () => {
+    drawerRequest++;
+    disposeExecutionPanel?.();
     drawerHost.innerHTML = `
       <div class="drawer-mask" id="drawer-mask"></div>
       <aside class="drawer">
@@ -654,6 +610,8 @@ export async function render(el: HTMLElement): Promise<void> {
 
   // 看板管理抽屉：项目元数据 + 参与者开关 + 危险区删除
   (el.querySelector('#manage-board') as HTMLElement).addEventListener('click', async () => {
+    drawerRequest++;
+    disposeExecutionPanel?.();
     // 参与者数据：worker 角色 agent × 该板当前参与者列表。
     // 蜂后（orchestrator）结构性豁免参与门禁、必须参与，故不列出——避免用户误把它"开除"。
     let participants: string[];
@@ -772,6 +730,8 @@ export async function render(el: HTMLElement): Promise<void> {
 
   // 新建看板抽屉（＋，常驻入口）：成功后选中新板并刷新
   (el.querySelector('#new-board') as HTMLElement).addEventListener('click', () => {
+    drawerRequest++;
+    disposeExecutionPanel?.();
     drawerHost.innerHTML = `
       <div class="drawer-mask" id="drawer-mask"></div>
       <aside class="drawer">
@@ -781,7 +741,7 @@ export async function render(el: HTMLElement): Promise<void> {
           <div class="field"><label for="nb-repo-mode">代码库初始化</label>
             <select id="nb-repo-mode"><option value="empty">在服务器新建私有空仓库</option><option value="clone">从远程 Git 仓库克隆</option><option value="import">本机目录导入（建空仓，后续用 CLI 上传）</option></select>
           </div>
-          <div class="field" id="nb-remote-field" hidden><label for="nb-repo">远程 Git 地址</label><input id="nb-repo" placeholder="https://host/org/repo.git 或 SSH remote" /></div>
+          <div class="field" id="nb-remote-field" hidden><label for="nb-repo">Git 地址（本机导入时可选，仅记录来源意图）</label><input id="nb-repo" placeholder="https://host/org/repo.git 或 SSH remote，不含密码或 token" /></div>
           <div class="hint" id="nb-import-hint" hidden>创建看板后，在持有源码的设备运行：<code>node packages/sdk/src/cli.ts repo import --board &lt;看板ID&gt; --path &lt;本机项目目录&gt;</code>。仅支持工作树干净的 Git 仓库，并保留提交历史。</div>
           <div class="field"><label for="nb-desc">描述</label><textarea id="nb-desc" rows="3"></textarea></div>
           <button class="primary" id="nb-create">创建看板</button>
@@ -791,7 +751,7 @@ export async function render(el: HTMLElement): Promise<void> {
     const remoteField = drawerHost.querySelector('#nb-remote-field') as HTMLElement;
     const importHint = drawerHost.querySelector('#nb-import-hint') as HTMLElement;
     modeSelect.addEventListener('change', () => {
-      remoteField.hidden = modeSelect.value !== 'clone';
+      remoteField.hidden = modeSelect.value === 'empty';
       importHint.hidden = modeSelect.value !== 'import';
     });
     drawerHost.querySelector('#drawer-close')!.addEventListener('click', () => (drawerHost.innerHTML = ''));
@@ -811,7 +771,7 @@ export async function render(el: HTMLElement): Promise<void> {
       try {
         const r = await api.post<{ board: Board }>('/boards', {
           name,
-          repo: repoInit === 'clone' ? remote : '',
+          repo: repoInit === 'empty' ? '' : remote,
           repoMode: 'managed',
           repoInit: repoInit === 'clone' ? 'clone' : 'empty',
           description: (drawerHost.querySelector('#nb-desc') as HTMLTextAreaElement).value.trim(),
@@ -842,6 +802,8 @@ export async function render(el: HTMLElement): Promise<void> {
         board.repoStatus = status.repoStatus;
         board.repoError = status.repoError;
         board.repoHead = status.repoHead;
+        const statusLine = el.querySelector('#board-repo-status');
+        if (statusLine) statusLine.textContent = `${status.repoStatus} · ${status.repoHead ? `当前提交 ${status.repoHead}` : '尚无代码提交，未确认导入'}${status.repoError ? ` · ${status.repoError}` : ''}`;
         (el.querySelector('#board-repo-link') as HTMLElement).innerHTML = repoBadge(board);
         if (status.repoStatus !== 'queued' && status.repoStatus !== 'running' && repoStatusTimer) {
           clearInterval(repoStatusTimer);
@@ -860,6 +822,8 @@ export async function render(el: HTMLElement): Promise<void> {
   });
   (el as unknown as { __cleanup?: () => void }).__cleanup = () => {
     unsub();
+    drawerRequest++;
+    disposeExecutionPanel?.();
     if (repoStatusTimer) clearInterval(repoStatusTimer);
     chatPanel?.destroy(); // 视图卸载：面板 SSE 订阅一并退订
   };

@@ -23,6 +23,9 @@ const KNOWN_EVENTS = [
   'task.released',
   'task.ttl_released',
   'task.submitted',
+  'execution.updated',
+  'execution.session_updated',
+  'execution.observation_consent',
   'message.created',
   'settings.orchestrator_updated',
   // 蜂后体验：思考中指示（A）与流式回复（B）。brain.stream 为瞬态事件（服务端直接总线发布，不入台账）
@@ -37,11 +40,10 @@ const handlers = new Set<SseHandler>();
 let source: EventSource | null = null;
 const stateListeners = new Set<(connected: boolean) => void>();
 
-export function onConnectionState(fn: (connected: boolean) => void): void {
-  stateListeners.add(fn);
+export function onConnectionState(fn: (connected: boolean) => void): () => void {
   if (source) fn(source.readyState === EventSource.OPEN);
+  return () => stateListeners.delete(fn);
 }
-
 export function startSse(): void {
   if (source) return;
   source = new EventSource('/events');

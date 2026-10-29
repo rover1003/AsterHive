@@ -308,8 +308,9 @@ async function main(): Promise<void> {
   switch (cmd) {
     case 'repo': {
       const subcommand = rest[1];
-      if (subcommand !== 'import') throw new Error('用法：cli.ts repo import --board <看板ID> --path <本机 Git 仓库目录>');
-      const result = await importLocalRepository(cfg, need(flags, 'board'), need(flags, 'path'));
+      if (subcommand !== 'import') throw new Error('用法：cli.ts repo import --board <看板ID> --path <本机 Git 仓库目录> [--url <服务器>]');
+      const importConfig = flags.url !== undefined ? { ...cfg, url: flags.url } : cfg;
+      const result = await importLocalRepository(importConfig, need(flags, 'board'), need(flags, 'path'));
       console.log(JSON.stringify(result));
       break;
     }
