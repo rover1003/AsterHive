@@ -3,7 +3,7 @@ import { HttpError } from './types.ts';
 import type { SQLInputValue } from 'node:sqlite';
 import { withWrite, logEvent } from './write.ts';
 import type { Agent } from './agents.ts';
-import { getTask, getBoard, requireParticipant, type Task } from './tasks.ts';
+import { getTask, getBoard, requireParticipant, normalizePath, validateFileList, type Task } from './tasks.ts';
 import { messageInner } from './messages.ts';
 import { withTaskIntegrationLock } from './task-integration-lock.ts';
 function requireExecutingRole(actor: Agent): void {
@@ -21,29 +21,78 @@ function isElevated(actor: Agent): boolean {
   return actor.role === 'orchestrator' || actor.role === 'user';
 }
 
-function normalizePath(p: string): string {
-  return p.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').toLowerCase();
+// 通配符条目（src/** / src/*）的目录基座；非通配符返回 null
+function wildcardBase(p: string): string | null {
+  if (p.endsWith('/**')) return p.slice(0, -3);
+  if (p.endsWith('/*')) return p.slice(0, -2);
+  return null;
 }
 
-// 认领文件清单互斥（交接协议）：任意两份活跃认领的文件清单不允许重叠。
-// 全局生效（跨 board），按归一化路径比较；通配符条目按前缀段近似处理。
-function fileConflicts(ctx: Ctx, files: string[], selfActorId: string): string[] {
-  const mine = new Set(files.map(normalizePath).filter(Boolean));
-  if (mine.size === 0) return [];
+// 两条归一化路径是否互斥：精确相同、目录/后代、通配符前缀覆盖
+function pathsOverlap(a: string, b: string): boolean {
+  if (a === b) return true;
+  const ab = wildcardBase(a);
+  const bb = wildcardBase(b);
+  if (ab !== null && (b === ab || b.startsWith(ab + '/'))) return true;
+  if (bb !== null && (a === bb || a.startsWith(bb + '/'))) return true;
+  return a.startsWith(b + '/') || b.startsWith(a + '/');
+}
+
+interface ActiveClaimRow {
+  id: string;
+  files: string;
+  workspace: string;
+  board_id: string;
+  repo: string;
+  repo_mode: string;
+}
+
+// 认领文件清单互斥（交接协议，计划 §4.2）：任意两份活跃认领的写清单不允许重叠。
+// - 全局生效（跨 board），但仅同一仓库互斥：托管板各自独立裸仓（按 board 区分），
+//   remote-legacy 板按 board.repo URL 共享仓库；不同仓库同路径放行。
+// - 目录/后代路径与通配符前缀段均视为重叠。
+// - 空写集 = 未知写范围：与任何已声明写集互斥（保守串行）；空 vs 空 放行（兼容既有定向派发）。
+// - noCode 只读任务（workspace.noCode）不参与写互斥。
+function repoIdentity(board: { id: string; repo: string; repoMode: string }): string {
+  return board.repoMode === 'managed' ? `managed:${board.id}` : `remote:${board.repo}`;
+}
+
+function fileConflicts(ctx: Ctx, task: Task, files: string[]): string[] {
+  const mine = files.map(normalizePath).filter(Boolean);
+  const myNoCode = (task.workspace as Record<string, unknown>)?.noCode === true;
+  if (myNoCode) return [];
+  const myRepo = repoIdentity(getBoard(ctx, task.boardId));
   const rows = ctx.holder.db
-    .prepare("SELECT id, assignee, files FROM task WHERE status='active' AND lane = 'InProgress'")
-    .all() as { id: string; assignee: string; files: string }[];
+    .prepare(
+      `SELECT t.id, t.files, t.workspace, t.board_id, b.repo, b.repo_mode
+       FROM task t JOIN board b ON b.id = t.board_id
+       WHERE t.status='active' AND t.lane = 'InProgress'`,
+    )
+    .all() as unknown as ActiveClaimRow[];
   const conflicts: string[] = [];
   for (const r of rows) {
-    if (r.assignee === selfActorId) continue;
-    const theirs = (JSON.parse(r.files) as string[]).map(normalizePath);
-    if (theirs.some((f) => mine.has(f))) conflicts.push(r.id);
+    if (repoIdentity({ id: r.board_id, repo: r.repo, repoMode: r.repo_mode }) !== myRepo) continue; // 仅共享仓库跨看板互斥
+    let theirWorkspace: Record<string, unknown> = {};
+    try {
+      theirWorkspace = JSON.parse(r.workspace) as Record<string, unknown>;
+    } catch {
+      /* 忽略坏 JSON */
+    }
+    if (theirWorkspace.noCode === true) continue; // 只读任务不互斥
+    const theirs = (JSON.parse(r.files) as string[]).map(normalizePath).filter(Boolean);
+    if (theirs.length === 0 || mine.length === 0) {
+      // 未知写集与已声明写集互斥；空 vs 空 保守放行
+      if (theirs.length > 0 || mine.length > 0) conflicts.push(r.id);
+      continue;
+    }
+    if (theirs.some((f) => mine.some((m) => pathsOverlap(m, f)))) conflicts.push(r.id);
   }
   return conflicts;
 }
 
 function assertClaimable(ctx: Ctx, task: Task, actor: Agent, files: string[]): void {
   requireExecutingRole(actor);
+  if (task.status === 'cancelled') throw new HttpError(409, `task ${task.id} is cancelled`);
   if (task.lane !== 'Ready') throw new HttpError(409, `task ${task.id} not in Ready (lane: ${task.lane})`);
   // 主脑 dispatch 预指派的卡，仅指派对象本人（或管理员）可认领执行；未指派或指派给他人均不可认领
   if (
@@ -53,13 +102,26 @@ function assertClaimable(ctx: Ctx, task: Task, actor: Agent, files: string[]): v
   ) {
     throw new HttpError(409, `task ${task.id} assigned to ${task.assignee}`);
   }
-  const conflicts = fileConflicts(ctx, files, actor.id);
+  const conflicts = fileConflicts(ctx, task, files);
   if (conflicts.length > 0) {
     throw new HttpError(409, `files overlap with active claims: ${conflicts.join(', ')}`);
   }
 }
 
-// 内层认领动作（不自行开事务）：claimTask 与 nextTask 各自在自己的 withWrite 里调用
+// WIP 容量判定（与 nextTask 同一语义）：InProgress 活跃数达到 board.wip.InProgress（默认 3）即拒绝
+function assertClaimWip(ctx: Ctx, boardId: string): void {
+  const board = getBoard(ctx, boardId);
+  const limit = board.wip.InProgress ?? 3;
+  const row = ctx.holder.db
+    .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND status='active' AND lane = 'InProgress'")
+    .get(boardId) as { n: number };
+  if (row.n >= limit) {
+    throw new HttpError(409, `WIP limit reached for InProgress on board ${boardId} (limit ${limit})`);
+  }
+}
+
+// 内层认领动作（不自行开事务）：claimTask 与 nextTask 各自在自己的 withWrite 里调用。
+// UPDATE 带 lane='Ready' AND status='active' 条件 + changes 校验，与复核同事务，杜绝并发穿透。
 function claimInner(ctx: Ctx, task: Task, actor: Agent, files: string[] | null, via: string): Task {
   const now = Date.now();
   const isFirstClaim = (task.attempt ?? 0) <= 1 && task.claimedAt === null && (task.reviewReworks ?? 0) === 0;
@@ -71,9 +133,12 @@ function claimInner(ctx: Ctx, task: Task, actor: Agent, files: string[] | null, 
     sql += ', files = ?';
     args.push(JSON.stringify(files));
   }
-  sql += ' WHERE id = ?';
+  sql += " WHERE id = ? AND lane = 'Ready' AND status = 'active'";
   args.push(task.id);
-  ctx.holder.db.prepare(sql).run(...args);
+  const res = ctx.holder.db.prepare(sql).run(...args);
+  if (Number(res.changes) !== 1) {
+    throw new HttpError(409, `task ${task.id} state changed concurrently`);
+  }
   logEvent(ctx, 'task.claimed', { taskId: task.id, by: actor.id, via, files: files ?? task.files });
   return getTask(ctx, task.id);
 }
@@ -81,9 +146,14 @@ function claimInner(ctx: Ctx, task: Task, actor: Agent, files: string[] | null, 
 export function claimTask(ctx: Ctx, actor: Agent, taskId: string, files?: string[]): Task {
   const task = requireTaskRow(ctx, taskId);
   requireParticipant(ctx, task.boardId, actor); // 看板参与限制（worker 须在参与者列表内）
-  if (task.status === 'cancelled') throw new HttpError(409, `task ${task.id} is cancelled`);
-  assertClaimable(ctx, task, actor, files ?? task.files);
-  return withWrite(ctx, 'task.claim', () => claimInner(ctx, task, actor, files === undefined ? null : files, 'claim'));
+  return withWrite(ctx, 'task.claim', () => {
+    // 同事务复核：lane/assignee/文件互斥/WIP 与写入原子（计划 §4.2）
+    const current = getTask(ctx, taskId);
+    const effectiveFiles = files === undefined ? current.files : validateFileList(files);
+    assertClaimable(ctx, current, actor, effectiveFiles);
+    assertClaimWip(ctx, current.boardId);
+    return claimInner(ctx, current, actor, files === undefined ? null : effectiveFiles, 'claim');
+  });
 }
 
 // TTL 断线判定（交接协议，计划 §4.3.6）：
@@ -113,25 +183,30 @@ export function nextTask(
   requireParticipant(ctx, boardId, actor); // 看板参与限制（worker 须在参与者列表内）
   return withWrite(ctx, 'task.next', () => {
     const swept = sweepStale(ctx, boardId);
-    const candidate = ctx.holder.db
+    const candidates = ctx.holder.db
       .prepare(
         `SELECT id FROM task
          WHERE board_id = ? AND status='active' AND lane = 'Ready'
            AND (assignee = ? OR assignee = ?)
-         ORDER BY priority, created_at, id
-         LIMIT 1`,
+         ORDER BY priority, created_at, id`,
       )
-      .get(boardId, actor.id, actor.handle) as { id: string } | undefined;
-    if (!candidate) return { task: null, swept };
-    const task = getTask(ctx, candidate.id);
+      .all(boardId, actor.id, actor.handle) as { id: string }[];
+    if (candidates.length === 0) return { task: null, swept };
+    // 与 claimTask 同一 WIP 容量判定（同事务）
+    const board = getBoard(ctx, boardId);
+    const limit = board.wip.InProgress ?? 3;
     const wip = ctx.holder.db
       .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND status='active' AND lane = 'InProgress'")
       .get(boardId) as { n: number };
-    const board = getBoard(ctx, boardId);
-    const limit = board.wip.InProgress ?? 3;
     if (wip.n >= limit) return { task: null, swept };
-    const claimed = claimInner(ctx, task, actor, null, 'next');
-    return { task: claimed, swept };
+    // 跳过与活跃认领文件冲突的卡，领取下一张可执行卡（计划 §4.2）
+    for (const c of candidates) {
+      const task = getTask(ctx, c.id);
+      if (fileConflicts(ctx, task, task.files).length > 0) continue;
+      const claimed = claimInner(ctx, task, actor, null, 'next');
+      return { task: claimed, swept };
+    }
+    return { task: null, swept };
   });
 }
 export interface CheckpointInput {
@@ -299,27 +374,30 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
   if (task.lastActivityKind === 'error' || task.lastActivityKind === 'timeout' || task.lastActivityKind === 'environment_blocked') {
     throw new HttpError(409, 'task execution failed or environment blocked; 确认工蜂停止后受控恢复');
   }
-  // Review 泳道同样受 WIP 约束
-  const board = getBoard(ctx, task.boardId);
-  const reviewLimit = board.wip.Review ?? 3;
-  const reviewCount = ctx.holder.db
-    .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND status='active' AND lane = 'Review' AND id != ?")
-    .get(task.boardId, taskId) as { n: number };
-  if (reviewCount.n >= reviewLimit) {
-    throw new HttpError(409, `WIP limit reached for Review on board ${task.boardId} (limit ${reviewLimit})`);
-  }
   const noCode = input.noCode === true || task.workspace.noCode === true;
   const settingsRow = ctx.holder.db.prepare("SELECT value FROM settings WHERE key='orchestrator'").get() as { value?: string } | undefined;
+  const board = getBoard(ctx, task.boardId);
   let reviewerEnabled = false;
   try {
     reviewerEnabled = !noCode && JSON.parse(settingsRow?.value ?? '{}').reviewerEnabled === true && board.repoMode === 'managed';
   } catch { /* invalid settings fall back to manual review */ }
   const evidence = [...(task.evidence ?? []), ...(input.evidence ?? [])];
   return withWrite(ctx, 'task.submit', () => {
+    // Review 泳道同样受 WIP 约束；判定与写入同事务（计划 §4.2），防并发穿透
+    const reviewLimit = board.wip.Review ?? 3;
+    const reviewCount = ctx.holder.db
+      .prepare("SELECT COUNT(*) AS n FROM task WHERE board_id = ? AND status='active' AND lane = 'Review' AND id != ?")
+      .get(task.boardId, taskId) as { n: number };
+    if (reviewCount.n >= reviewLimit) {
+      throw new HttpError(409, `WIP limit reached for Review on board ${task.boardId} (limit ${reviewLimit})`);
+    }
     const now = Date.now();
-    ctx.holder.db
-      .prepare("UPDATE task SET lane='Review', review_status=?, review_attempts=0, review_reworks=CASE WHEN review_status='rework' THEN review_reworks ELSE 0 END, review_summary='', submit_summary=?, evidence=?, last_activity_at=?, last_real_activity_at=?, last_activity_kind='submit', last_progress_at=?, updated_at=? WHERE id=?")
+    const res = ctx.holder.db
+      .prepare("UPDATE task SET lane='Review', review_status=?, review_attempts=0, review_reworks=CASE WHEN review_status='rework' THEN review_reworks ELSE 0 END, review_summary='', submit_summary=?, evidence=?, last_activity_at=?, last_real_activity_at=?, last_activity_kind='submit', last_progress_at=?, updated_at=? WHERE id=? AND lane='InProgress' AND status='active'")
       .run(reviewerEnabled ? 'pending' : 'none', input.summary.trim().slice(0, 6000), JSON.stringify(evidence), now, now, now, now, taskId);
+    if (Number(res.changes) !== 1) {
+      throw new HttpError(409, `task ${taskId} state changed concurrently`);
+    }
     logEvent(ctx, 'task.submitted', {
       taskId,
       by: actor.id,

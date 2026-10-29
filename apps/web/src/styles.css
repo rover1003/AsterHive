@@ -949,7 +949,106 @@ time { font-size: 11px; color: var(--subtle-foreground); }
 .res-ok { color: var(--ok); }
 .res-fail { color: var(--danger); }
 
-/* ---------- toast：右下浮层 ---------- */
+/* ---------- 资源驾驶舱（cockpit） ---------- */
+.cp-toolbar { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+.cp-title { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 600; }
+.cp-title svg.i { color: var(--primary); }
+.cp-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.cp-actions button { white-space: nowrap; flex-shrink: 0; }
+.cp-body { display: flex; flex-direction: column; gap: 16px; }
+
+/* 汇总条：统计块 + 语义色数值 */
+.cp-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 8px; }
+.cp-stat {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px; min-width: 0;
+}
+.cp-stat span { display: block; color: var(--subtle-foreground); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cp-stat b { display: block; margin-top: 2px; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cp-stat b i { font-style: normal; color: var(--subtle-foreground); font-weight: 400; font-size: 13px; margin: 0 3px; }
+.cp-stat .cp-note { font-size: 11px; font-weight: 400; color: var(--subtle-foreground); }
+
+/* 节点网格：动态大量节点分页，非固定数量 */
+.cp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 12px; }
+.cp-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 14px; min-width: 0; }
+.cp-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cp-head > b { overflow-wrap: anywhere; }
+.cp-handle { color: var(--subtle-foreground); font-size: 12px; overflow-wrap: anywhere; }
+.cp-status { margin-left: auto; color: var(--muted-foreground); font-size: 12px; white-space: nowrap; }
+.cp-specs { margin-top: 4px; font-size: 11px; overflow-wrap: anywhere; }
+.cp-task { margin-top: 8px; font-size: 13px; display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.cp-task-id { color: var(--info); font-size: 11px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.cp-task-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cp-telemetry { margin-top: 12px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--background); }
+.cp-telemetry.cp-expired { border-color: rgba(234, 179, 8, 0.45); }
+.cp-t-head, .cp-metric > div:first-child { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.cp-t-head b { font-size: 12px; }
+.cp-t-state { color: var(--ok); font-size: 11px; }
+.cp-expired .cp-t-state { color: var(--warn); }
+.cp-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 10px; margin-top: 10px; }
+.cp-metric { min-width: 0; }
+.cp-metric > div:first-child { font-size: 11px; color: var(--muted-foreground); }
+.cp-metric > div:first-child b { color: var(--foreground); font-size: 13px; font-variant-numeric: tabular-nums; }
+.cp-track { height: 6px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: var(--secondary); }
+.cp-track i { display: block; width: var(--usage, 0%); height: 100%; border-radius: inherit; background: var(--primary); }
+.cp-expired .cp-track i { background: var(--warn); }
+.cp-trends { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 8px 12px; margin-top: 10px; }
+.cp-trends > div { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; min-width: 0; color: var(--muted-foreground); font-size: 10px; }
+.cp-spark { display: block; width: 100%; height: 34px; overflow: visible; }
+.cp-spark polyline { fill: none; stroke: var(--info); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.cp-trends > div:nth-child(2) .cp-spark polyline { stroke: var(--primary); }
+.cp-no-history { color: var(--subtle-foreground); font-size: 10px; }
+.cp-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); color: var(--subtle-foreground); font-size: 10px; }
+.cp-meta b { color: var(--muted-foreground); font-weight: 500; }
+
+/* 分页 */
+.cp-pager { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.cp-page-info { color: var(--subtle-foreground); font-size: 12px; }
+.cp-pages { display: flex; gap: 6px; flex-wrap: wrap; }
+.cp-page {
+  min-width: 28px; height: 28px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--secondary); color: var(--muted-foreground);
+  font-size: 12px; font-variant-numeric: tabular-nums;
+  cursor: pointer; white-space: nowrap; flex-shrink: 0;
+}
+.cp-page:hover { color: var(--foreground); border-color: var(--border-strong); }
+.cp-page.active { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+
+/* 调度与任务区 */
+.cp-tasks { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 14px 16px; }
+.cp-tasks-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.cp-tasks-head b { font-size: 14px; }
+.cp-lanes { display: flex; gap: 8px; flex-wrap: wrap; }
+.cp-lane {
+  background: var(--secondary); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 12px; display: flex; align-items: baseline; gap: 8px; min-width: 0;
+}
+.cp-lane span { color: var(--subtle-foreground); font-size: 12px; white-space: nowrap; }
+.cp-lane b { font-size: 16px; font-variant-numeric: tabular-nums; }
+.cp-agents { display: flex; gap: 6px 16px; flex-wrap: wrap; margin-top: 10px; color: var(--muted-foreground); font-size: 12px; }
+.cp-agents b { color: var(--foreground); font-variant-numeric: tabular-nums; }
+
+/* 全屏态：隐藏侧栏，驾驶舱占满视口 */
+body.cockpit-fullscreen .sidebar { display: none; }
+body.cockpit-fullscreen .main { padding: 16px 24px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-card { transition: none; }
+}
+
+/* 响应式：375 / 768 / 1280 / 1600 */
+@media (max-width: 768px) {
+  .cp-grid { grid-template-columns: 1fr; }
+  .cp-actions { margin-left: 0; }
+}
+@media (max-width: 375px) {
+  .cp-toolbar { flex-direction: column; align-items: stretch; }
+  .cp-actions { justify-content: space-between; }
+  .cp-stat b { font-size: 16px; }
+}
+
+
 .toast {
   position: fixed; bottom: 24px; right: 24px;
   background: var(--popover);

@@ -27,6 +27,7 @@ import {
   redactExecutionText,
   type ExecutionReport,
   type ExecutionCommand,
+  type SessionObservationEvent,
 } from './sdk.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
@@ -42,7 +43,8 @@ import {
 import { runValidationCommands } from './verification.ts';
 import { TelemetryReporter } from './telemetry-reporter.ts';
 import { runCliExecutor } from './cli-runner.ts';
-import { runPiPrompt, type PiThinkingLevel } from './pi-executor.ts';
+import { runPiPrompt, type PiThinkingLevel, type PiActivity } from './pi-executor.ts';
+import { TaskObserver } from './task-observer.ts';
 import {
   OmpRpcSession,
   DEFAULT_THRESHOLDS,
@@ -336,7 +338,11 @@ async function executeTask(
   hooks?: {
     taskId?: string;
     checkpoint?: (note: string) => Promise<{ pendingMessages?: { author?: string; content?: string }[] }>;
-    onActivity?: (activity: { kind: 'tool' | 'model'; toolName?: string; phase: 'start' | 'end'; timestamp: number }) => void | Promise<void>;
+    onActivity?: (activity: PiActivity) => void | Promise<void>;
+    onSessionEvent?: (event: Omit<SessionObservationEvent, 'sequence'>) => void;
+    observeSession?: () => boolean;
+    observationSecrets?: string[];
+    signal?: AbortSignal;
   },
 ): Promise<{ stdout: string; code: number | null }> {
   // 托管工蜂（T19）：pi 执行器 = 进程内 Pi 会话，零外部 CLI 依赖；
@@ -356,6 +362,10 @@ async function executeTask(
       log,
       checkpoint: hooks?.checkpoint,
       onActivity: hooks?.onActivity,
+      onSessionEvent: hooks?.onSessionEvent,
+      observeSession: hooks?.observeSession,
+      observationSecrets: hooks?.observationSecrets,
+      signal: hooks?.signal,
     });
   }
   const projectRoot = join(CFG.workdirRoot, 'projects');
@@ -536,6 +546,7 @@ async function main(): Promise<void> {
     if (busy) return;
     busy = true;
     let task: Task | undefined;
+    let observer: TaskObserver | undefined;
     try {
       // 每轮取活前采样并上报实时硬件遥测指标
       await telemetryReporter.reportOnce();
@@ -641,6 +652,12 @@ async function main(): Promise<void> {
       }
       log(`领取任务 ${task.id}：${task.title}`);
       const currentTask = task;
+      const previousExecutions = await worker.getExecutions(currentTask.id);
+      const previousExecution = previousExecutions.find((execution) => execution.attempt === (currentTask.attempt ?? 1));
+      if (previousExecution && (previousExecution.lastSequence > 0 || previousExecution.state === 'unknown')) {
+        log(`[${task.id}] 当前轮次已有执行记录或旧执行结果未知；保留现场，不自动重放。请确认物理停止后通过受控恢复建立新轮次。`);
+        return;
+      }
       telemetryReporter.setTaskInProgress(task.id);
 
       // 工作区准备（T15 / §9.4 / managed 模式）：
@@ -724,6 +741,16 @@ async function main(): Promise<void> {
       });
       logPending(cp1.pendingMessages);
 
+      const cancellation = new AbortController();
+      const runObserver = new TaskObserver({
+        worker, taskId: currentTask.id, attempt: currentTask.attempt ?? 1,
+        lastActivitySequence: previousExecution?.lastSequence ?? 0, log,
+        onCancel: () => cancellation.abort(),
+      });
+      observer = runObserver;
+      await runObserver.start(ws.baseCommit, detectExecutorKind());
+      if (cancellation.signal.aborted) return;
+
       const startTime = Date.now();
       const keepAliveIntervalMs = 60000;
       const keepAliveTimer = setInterval(() => {
@@ -746,22 +773,14 @@ async function main(): Promise<void> {
         execRes = await executeTask(buildPrompt(task, ws, reworkNotes), ws.dir, model, {
           taskId: task.id,
           checkpoint: (note) => worker.checkpoint(currentTask.id, { note, kind: 'milestone', attempt: currentTask.attempt }),
-          onActivity: (activity) => {
-            if (activity.phase === 'start') {
-              const note = activity.kind === 'tool'
-                ? `正在执行工具 ${activity.toolName || 'tool'}`
-                : '正在进行模型推理思考';
-              void worker.checkpoint(currentTask.id, {
-                note,
-                kind: activity.kind,
-                attempt: currentTask.attempt,
-              }).catch((err) => {
-                log('活动事件上报异常（非致命）：', err instanceof Error ? err.message : err);
-              });
-            }
-          },
+          onActivity: (activity) => runObserver.activity(activity),
+          onSessionEvent: (event) => runObserver.session(event),
+          observeSession: () => runObserver.sessionEnabled,
+          observationSecrets: [worker.token ?? ''],
+          signal: cancellation.signal,
         });
       } catch (err) {
+        if (cancellation.signal.aborted) return;
         const reason = `执行异常：${err instanceof Error ? err.message : String(err)}；工作区已保留（${ws.dir}），现场可恢复，任务结果未上交。`;
         await worker.checkpoint(task.id, { note: reason, kind: 'error', attempt: task.attempt });
         log(`${reason}；任务保持 InProgress 保留现场，等待干预`);
@@ -770,6 +789,7 @@ async function main(): Promise<void> {
         clearInterval(keepAliveTimer);
       }
       const { stdout, code } = execRes;
+      if (cancellation.signal.aborted) return;
       log(`执行结束（exit=${code}），输出 ${stdout.length} 字符`);
       const noCode = task.workspace.noCode === true;
       const cp2 = await worker.checkpoint(task.id, {
@@ -974,6 +994,8 @@ async function main(): Promise<void> {
         log('上传任务执行报告失败（不阻断交活，保留现场）：', uploadErr instanceof Error ? uploadErr.message : uploadErr);
       }
 
+      if (cancellation.signal.aborted) return;
+      await runObserver.finish();
       await worker.submit(task.id, summary, evidence, { noCode: effectiveNoCode, attempt: task.attempt });
       log(`已上交 ${task.id}，证据 ${evidence.length} 项`);
 
@@ -1001,6 +1023,12 @@ async function main(): Promise<void> {
         }
       }
     } finally {
+      if (observer) {
+        await observer.finish();
+        if (observer.cancelRequested) {
+          await observer.confirmCancelled().catch(error => log('任务停止确认上报失败：', error instanceof Error ? error.message : error));
+        }
+      }
       telemetryReporter.setTaskInProgress(null);
       busy = false;
     }

@@ -4,8 +4,11 @@
 // 附：inbox / postMessage（聊天室）、getTask 与 getBoards / getBoard（看板元数据，含 repo）。
 
 export * from './execution-report.ts';
+export * from './execution.ts';
+import type { Execution, ExecutionActivity, SessionObservationEvent } from './execution.ts';
 import { createHash } from 'node:crypto';
 import { platform, arch, cpus, totalmem, freemem, loadavg, uptime } from 'node:os';
+
 
 /** 工蜂设备硬件能力规格（Phase 4：隐私最小化，仅上报调度相关指标） */
 export interface AgentSpecs {
@@ -267,12 +270,14 @@ async function call<T>(
   method: string,
   path: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<T> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (token) headers.authorization = `Bearer ${token}`;
   const res = await fetch(`${baseUrl}${path}`, {
     method,
     headers,
+    signal,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
@@ -433,6 +438,24 @@ export class Worker {
   ): Promise<{ task: Task; pendingMessages: PendingMessage[] }> {
     const body = typeof noteOrOptions === 'string' ? { note: noteOrOptions } : noteOrOptions;
     return call(this.#baseUrl, this.#token, 'POST', `/tasks/${taskId}/checkpoint`, body);
+  }
+
+  /** Current-attempt observable phases only; no command arguments, tool results or reasoning. */
+  async reportExecutionActivity(taskId: string, attempt: number, activity: ExecutionActivity, signal = AbortSignal.timeout(15_000)): Promise<void> {
+    await call(this.#baseUrl, this.#token, 'POST', `/tasks/${encodeURIComponent(taskId)}/executions/${attempt}/events`, activity, signal);
+  }
+
+  async getExecutions(taskId: string): Promise<Execution[]> {
+    const result = await call<{ executions: Execution[] }>(this.#baseUrl, this.#token, 'GET', `/tasks/${encodeURIComponent(taskId)}/executions`, undefined, AbortSignal.timeout(15_000));
+    return result.executions;
+  }
+
+  async getSessionObservation(taskId: string): Promise<{ enabled: boolean; updatedAt: number | null; cancelRequested: boolean }> {
+    return call(this.#baseUrl, this.#token, 'GET', `/tasks/${encodeURIComponent(taskId)}/session-observation`, undefined, AbortSignal.timeout(15_000));
+  }
+
+  async reportSessionEvents(taskId: string, attempt: number, events: SessionObservationEvent[], signal = AbortSignal.timeout(15_000)): Promise<void> {
+    await call(this.#baseUrl, this.#token, 'POST', `/tasks/${encodeURIComponent(taskId)}/executions/${attempt}/session`, { events }, signal);
   }
 
   /** 将 Review 状态任务受控退回指定工蜂重做 */

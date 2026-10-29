@@ -2,6 +2,7 @@ import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
+import { bodyLimit } from 'hono/body-limit';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Ctx } from './types.ts';
@@ -78,6 +79,9 @@ import { Brain } from './brain.ts';
 import { withTaskIntegrationLock } from './task-integration-lock.ts';
 import { fileURLToPath } from 'node:url';
 import { serveStatic } from '@hono/node-server/serve-static';
+import { listExecutions, executionEvents, recordExecutionActivity } from './executions.ts';
+import type { ExecutionActivity } from '../../../packages/sdk/src/execution.ts';
+import { parseSessionBatch, storeSessionBatch, readSessionSnapshot, getSessionObservation, setSessionObservation } from './session-observation.ts';
 
 function bearerToken(c: Context): string | null {
   const h = c.req.header('authorization');
@@ -175,28 +179,58 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
 
   // SSE 事件流：主脑唤醒与 UI 实时刷新共用（立项计划 §7）。
   // 连接建立即订阅总线；事务提交后的领域事件实时下发，另以心跳保活。
+  // 有界队列（立项计划 §3.2）：同节点 agent.telemetry 合并为最新帧（可重建，慢消费者
+  // 丢弃中间帧并经快照恢复）；非遥测事件逐条入队；总队列超上限即真实终止流
+  // （stream.abort()，非 Promise.race 伪取消）——客户端 EventSource onerror 自动重连并重拉权威快照。
   app.get('/events', (c) =>
     streamSSE(c, async (stream) => {
-      await stream.writeSSE({ event: 'hello', data: 'asterhive event stream' });
+      const MAX_QUEUE = 1000;
       const queue: { id: number; type: string; payload: Record<string, unknown> }[] = [];
-      let notify: (() => void) | undefined;
+      // dirty 标志覆盖建立期间事件与唤醒竞态：事件在等待间隙到达但 wake 尚未设置时不丢失。
+      let dirty = false;
+      let wake: (() => void) | null = null;
       const unsub = ctx.bus.subscribe((type, payload, id) => {
-        queue.push({ id, type, payload });
-        notify?.();
+        // 同节点 agent.telemetry 合并为最新帧（丢弃可重建的中间遥测）
+        if (type === 'agent.telemetry' && payload && typeof payload === 'object' && 'agentId' in payload) {
+          const agentId = payload.agentId;
+          const idx = queue.findIndex(
+            (e) => e.type === 'agent.telemetry' && e.payload && e.payload.agentId === agentId,
+          );
+          if (idx !== -1) {
+            queue[idx] = { id, type, payload };
+          } else {
+            queue.push({ id, type, payload });
+          }
+        } else {
+          queue.push({ id, type, payload });
+        }
+        if (queue.length > MAX_QUEUE) {
+          // 队列溢出：真实终止流，客户端重连后重拉快照，杜绝无界内存增长
+          unsub();
+          stream.abort();
+          return;
+        }
+        dirty = true;
+        wake?.();
       });
       stream.onAbort(() => unsub());
+      await stream.writeSSE({ event: 'hello', data: 'asterhive event stream' });
       while (!stream.aborted) {
-        if (queue.length === 0) {
+        if (queue.length === 0 && !dirty) {
           await new Promise<void>((resolve) => {
             const timer = setTimeout(resolve, 15_000);
-            notify = () => {
+            wake = () => {
               clearTimeout(timer);
               resolve();
             };
           });
-          notify = undefined;
+          if (stream.aborted) break;
+          if (queue.length === 0 && !dirty) {
+            await stream.writeSSE({ event: 'heartbeat', data: String(Date.now()) });
+            continue;
+          }
         }
-        if (stream.aborted) break;
+        dirty = false;
         while (queue.length > 0 && !stream.aborted) {
           const e = queue.shift()!;
           await stream.writeSSE({
@@ -204,9 +238,6 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
             event: e.type,
             data: JSON.stringify(e.payload),
           });
-        }
-        if (queue.length === 0 && !stream.aborted) {
-          await stream.writeSSE({ event: 'heartbeat', data: String(Date.now()) });
         }
       }
     }),
@@ -422,7 +453,7 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
     const board = createBoard(ctx, {
       id: body.id,
       name: body.name,
-      repo: repoMode === 'remote-legacy' ? repo : '',
+      repo,
       repoSource: repoMode === 'managed' && repoInit === 'clone' ? repo : '',
       repoMode,
       repoStatus: repoMode === 'managed' ? (repoInit === 'clone' ? 'queued' : 'empty') : 'ready',
@@ -527,6 +558,100 @@ export function createApp(ctx: Ctx, repoManager = new RepoManager(ctx)): Hono {
   });
 
   app.get('/tasks/:id', (c) => c.json({ task: getTask(ctx, c.req.param('id')) }));
+
+  app.get('/tasks/:id/executions', (c) => {
+    const actor = requireActor(ctx, c);
+    const task = getTask(ctx, c.req.param('id'));
+    requireParticipant(ctx, task.boardId, actor);
+    if (actor.role === 'worker' && task.assignee !== actor.id && task.assignee !== actor.handle) {
+      throw new HttpError(403, 'task belongs to another worker');
+    }
+    return c.json({ executions: listExecutions(ctx, task.id) });
+  });
+
+  app.get('/tasks/:id/executions/:executionId/events', (c) => {
+    const actor = requireActor(ctx, c);
+    const task = getTask(ctx, c.req.param('id'));
+    requireParticipant(ctx, task.boardId, actor);
+    if (actor.role === 'worker' && task.assignee !== actor.id && task.assignee !== actor.handle) {
+      throw new HttpError(403, 'task belongs to another worker');
+    }
+    const after = Number(c.req.query('after') ?? 0);
+    if (!Number.isSafeInteger(after) || after < 0) throw new HttpError(422, 'invalid event cursor');
+    return c.json(executionEvents(ctx, task.id, c.req.param('executionId'), after));
+  });
+
+  app.post('/tasks/:id/executions/:attempt/events', async (c) => {
+    const actor = requireTokenActor(ctx, c);
+    const attempt = Number(c.req.param('attempt'));
+    const body = await c.req.json().catch(() => null) as ExecutionActivity | null;
+    if (!Number.isSafeInteger(attempt) || attempt < 1 || !body ||
+        !Number.isSafeInteger(body.sequence) || body.sequence < 1 ||
+        !['started', 'model', 'tool', 'user', 'milestone', 'completed', 'failed', 'cancel_requested', 'cancelled', 'gap'].includes(body.kind) ||
+        (['model', 'tool', 'user'].includes(body.kind) && body.phase !== 'start' && body.phase !== 'end') ||
+        (body.toolName !== undefined && !['read', 'write', 'edit', 'bash', 'powershell', 'hive_checkpoint', 'unknown'].includes(body.toolName)) ||
+        (body.kind === 'tool' && (typeof body.callId !== 'string' || !body.callId)) ||
+        (body.baseCommit !== undefined && body.baseCommit !== null && (typeof body.baseCommit !== 'string' || !/^[a-f0-9]{40,64}$/.test(body.baseCommit))) ||
+        (body.executor !== undefined && (typeof body.executor !== 'string' || !/^[a-z0-9-]{1,32}$/.test(body.executor))) ||
+        (body.callId !== undefined && (typeof body.callId !== 'string' || body.callId.length > 128))) {
+      throw new HttpError(422, 'invalid execution activity');
+    }
+    const execution = withWrite(ctx, 'execution.activity', () => {
+      const result = recordExecutionActivity(ctx, actor, c.req.param('id'), attempt, body);
+      logEvent(ctx, 'execution.updated', { taskId: result.taskId, boardId: result.boardId, executionId: result.id, attempt: result.attempt });
+      return result;
+    });
+    return c.json({ execution });
+  });
+
+  app.get('/tasks/:id/session-observation', (c) => {
+    const actor = requireActor(ctx, c);
+    const task = getTask(ctx, c.req.param('id'));
+    requireParticipant(ctx, task.boardId, actor);
+    if (actor.role === 'worker' && task.assignee !== actor.id && task.assignee !== actor.handle) throw new HttpError(403, 'task belongs to another worker');
+    return c.json({ ...getSessionObservation(ctx, task.id), cancelRequested: task.status === 'cancelled' });
+  });
+
+  app.put('/tasks/:id/session-observation', async (c) => {
+    const actor = requireActor(ctx, c);
+    if (actor.role !== 'user') throw new HttpError(403, 'only the user can authorize session observation');
+    const task = getTask(ctx, c.req.param('id'));
+    const body = await c.req.json().catch(() => null) as { enabled?: unknown } | null;
+    if (!body || typeof body.enabled !== 'boolean') throw new HttpError(422, 'enabled must be boolean');
+    const enabled = body.enabled;
+    const consent = withWrite(ctx, 'session.observation_consent', () => {
+      const result = setSessionObservation(ctx, actor, task.id, enabled);
+      logEvent(ctx, 'execution.observation_consent', { taskId: task.id, enabled, by: actor.id });
+      return result;
+    });
+    return c.json(consent);
+  });
+
+  app.get('/tasks/:id/executions/:executionId/session', (c) => {
+    const actor = requireActor(ctx, c);
+    const task = getTask(ctx, c.req.param('id'));
+    requireParticipant(ctx, task.boardId, actor);
+    if (actor.role === 'worker' && task.assignee !== actor.id && task.assignee !== actor.handle) throw new HttpError(403, 'task belongs to another worker');
+    const after = Number(c.req.query('after') ?? 0);
+    if (!Number.isSafeInteger(after) || after < 0) throw new HttpError(422, 'invalid session cursor');
+    return c.json(readSessionSnapshot(ctx, task.id, c.req.param('executionId'), after));
+  });
+
+  app.post('/tasks/:id/executions/:attempt/session',
+    bodyLimit({ maxSize: 16_384, onError: (c) => c.json({ error: 'session batch exceeds 16 KiB' }, 413) }),
+    async (c) => {
+      const actor = requireTokenActor(ctx, c);
+      const attempt = Number(c.req.param('attempt'));
+      if (!Number.isSafeInteger(attempt) || attempt < 1) throw new HttpError(422, 'invalid execution attempt');
+      const events = parseSessionBatch(await c.req.json().catch(() => null));
+      const taskId = c.req.param('id');
+      const result = withWrite(ctx, 'session.observation', () => {
+        const stored = storeSessionBatch(ctx, actor, taskId, attempt, events);
+        logEvent(ctx, 'execution.session_updated', { taskId, executionId: stored.executionId, attempt, cursor: stored.cursor });
+        return stored;
+      });
+      return c.json(result);
+    });
 
   app.patch('/tasks/:id', async (c) => {
     const actor = requireActor(ctx, c);

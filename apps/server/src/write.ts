@@ -1,5 +1,6 @@
 import type { Ctx } from './types.ts';
 import { snapshotNow, auditWrite } from './backup.ts';
+import { projectExecutionEvent } from './executions.ts';
 
 export function logEvent(
   ctx: Ctx,
@@ -10,6 +11,7 @@ export function logEvent(
     .prepare('INSERT INTO event (type, payload, time_created) VALUES (?, ?, ?)')
     .run(type, JSON.stringify(payload), Date.now());
   const id = Number(result.lastInsertRowid);
+  projectExecutionEvent(ctx.holder.db, id, type, payload, Date.now());
   ctx.pending.push({ id, type, payload });
   return id;
 }

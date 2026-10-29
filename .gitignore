@@ -12,3 +12,5 @@ apps/server/data/
 Thumbs.db
 .shots/
 .zcode/
+.sandbox-data/
+nul

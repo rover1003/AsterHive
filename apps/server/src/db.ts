@@ -1,6 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { initializeExecutions } from './executions.ts';
+import { initializeSessionObservation } from './session-observation.ts';
 
 export function openDb(dataDir: string): DatabaseSync {
   mkdirSync(dataDir, { recursive: true });
@@ -201,6 +203,8 @@ export function openDb(dataDir: string): DatabaseSync {
   } catch {
     /* 列已存在 */
   }
+  initializeExecutions(db);
+  initializeSessionObservation(db);
   return db;
 }
 
