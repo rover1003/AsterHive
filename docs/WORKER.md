@@ -6,10 +6,10 @@
 
 | 条件 | 说明 |
 |---|---|
-| Node ≥ 23.6 | 直接运行 TypeScript，无需构建步骤 |
+| Node 24 LTS（最低 23.6） | 直接运行 TypeScript，无需构建步骤 |
 | 网络 | 设备能经内网/WireGuard 隧道访问服务器（如 `http://<your-server-ip>:8067`） |
 | 服务器在线 | 已部署 AsterHive 服务器，`GET /health` 可达 |
-| 执行内核 | 默认 omp（pi 系 CLI）需设备自行安装并登录；或改用 zcode（见下文"执行内核"） |
+| 执行内核 | 默认 Pi SDK 直接调用本机配置的模型；选择 omp / zcode 时需设备自行安装相应 CLI 并登录 |
 
 ## 两步接入
 
@@ -197,8 +197,8 @@ Windows、Linux 和 macOS 的 `install-bee` 一键安装/升级脚本提供思�
 ### 无代码任务与安全上交
 
 - 研究、调研等无需修改项目源码的任务，建卡时显式设置 `workspace: { "noCode": true }`。这只是声明该任务无需代码提交，不代表任务已通过验收。
-- Worker 成功执行后以 `noCode: true` 提交（官方 worker 根据任务卡标记自动处理；SDK/HTTP 客户端可显式传入）。任务进入人工 Review，不进入自动 diff Reviewer，也不会自动移入 Done。未在任务卡声明的 no-code 标记会被服务器拒绝。
-- 对 `repo` / `managed` 代码任务，执行退出码必须为 0 且必须产生真实 commit；执行异常、commit 或 bundle 回传失败、或无代码变更但任务未显式标记 noCode 时，不会 submit。Worker 会记录 checkpoint、释放任务供后续处理，并保留工作区现场；修复后可重领重做。
+- Worker 成功执行且无源码变更时，可将探索结论作为 `noCode: true` 交付；服务端会持久化 `workspace.noCode`，进入人工 Review，不进入自动 diff Reviewer，也不会自动移入 Done。无需为调研结果强行制造文件或 commit。
+- 对有代码产出的 `repo` / `managed` 任务，执行退出码、声明的验证命令、真实 commit 与 bundle 上传均需成功。执行异常、环境受阻或回传失败时保留工作区和任务现场，不自动释放、改派或伪装无代码成功；确认实际停止后再受控恢复。
 - 托管审核若提示 `task ref ... not found`，先确认 Worker 对 `POST /tasks/:id/repo-result` 收到 HTTP 200；缺失 ref 的审核保持 failed/Review，不会自动通过。补齐有效结果 bundle 后，由有权限的用户/蜂后重试审核。
 
 ## 取活与生命周期
@@ -212,38 +212,28 @@ Windows、Linux 和 macOS 的 `install-bee` 一键安装/升级脚本提供思�
 
 ### 实时硬件性能遥测（Telemetry Heartbeat）
 
-工蜂端（如 `@asterhive/sdk`）定时向 `POST /agents/:id/heartbeat` 上报当前设备负载帧：
+每 10 秒通过带工蜂令牌的 HTTP heartbeat 上报设备采样，服务端通过 SSE 通知界面更新。工蜂不是双向 WebSocket 长连接。
+
 ```json
 {
-  "specs": {
-    "os": "win32",
-    "arch": "x64",
-    "cpus": 16,
-    "memoryTotalGb": 32,
-    "executor": "omp"
-  },
   "telemetry": {
-    "cpuPercent": 18.5,
-    "memoryUsedGb": 12.4,
-    "memoryTotalGb": 32.0,
-    "memoryFreeGb": 19.6,
-    "memoryPercent": 38.8,
-    "loadAvg": [1.2, 0.9, 0.5],
-    "uptimeSec": 84200,
+    "cpuPercent": null,
+    "memoryUsedGb": 19.6,
+    "memoryTotalGb": 32,
+    "memoryFreeGb": 12.4,
+    "memoryPercent": 61.3,
+    "loadAvg": null,
+    "uptimeSec": 3600,
     "taskInProgress": null
   }
 }
 ```
 
-**安全鉴权与身份防伪**：
-+ `POST /agents/:id/heartbeat` 强制校验调用凭据（`Authorization: Bearer <token>`），未提供凭据报 401；
-+ 严格限制 `actor.id === id`（仅允许工蜂自身或管理员上报），跨工蜂冒名发送心跳与遥测直接报 403 拒绝。
-
-**字段空值与新鲜度语义**：
-+ `cpuPercent`: 首样本无间隔或系统调用失败时为 `null`，严禁伪报 0%；
-+ `loadAvg`: 在 Windows 等不支持平台为 `null`；
-+ `timestamp`: 服务端记录时以**接收时间**为准，防止设备端时钟偏移；
-+ 数据有效期为 60 秒（`TELEMETRY_FRESHNESS_MS`），超过 60 秒未更新自动降为非新鲜，调度器不采信过期负载。
+- CPU 是两次 OS 累计 tick 的差值；首样本、无间隔或采集失败均为 `null`，不能据此判断设备空闲。Windows `loadAvg` 不可用时同样为 `null`。
+- 内存字段沿用协议中的 `Gb` 名称，数值按 `1024^3` 换算；百分比为 `0–100`，不是 `0–1` 比例。
+- 服务端接收时间用于保鲜判断；当前调度器新鲜窗口为 60 秒，超过后不采信旧负载，不使用设备墙钟决定工蜂是否在线。静态规格也不等于实时空闲资源或资源预留。
+- 服务端保存最近 60 秒、每节点最多 60 个遥测样本；这是进程内历史，重启后会丢失，界面不得补造连续曲线。计划中的 30 秒 stale 分层与 120 点上限尚未全部对齐，见计划状态表。
+- 大屏入口 `#/cockpit` 与常规 Agent 总览并存。CPU/内存未知、心跳过期、资源高负载应分别看待，不能把心跳正常当成任务推进。
 
 **旧工蜂兼容保证**：
 + 未升级遥测的旧工蜂：仍可正常上报静态 `specs` 或仅更新在线时间戳；
@@ -307,6 +297,29 @@ curl -s -X POST http://<your-server-ip>:8067/tasks/<任务号>/submit \
 | `POST /tasks/:id/submit` | 上交（body：`summary`、`evidence?`——`{path, machine}` 数组） |
 
 TS/Node 侧也可直接用 [`@asterhive/sdk`](../packages/sdk/src/index.ts) 的 `Worker` 类（register / next / claim / checkpoint / submit / release / heartbeat，附 inbox / postMessage / getTask），不必手写请求。
+## 执行实例、结果未知与受控恢复
+
+任务卡描述目标，`executionId` 标识某一 `attempt` 的执行。任务详情中的轮次选择可以区分当前执行和历史执行，分别展示工蜂心跳、模型/工具活动、主动里程碑、阶段等待和本轮耗时。
+
+- `waiting_model` / `waiting_tool`：观察到对应阶段开始；`awaiting_review`：执行已交付但尚未验收；`completed`：已经验收。
+- 断线、旧任务迁移或中止尚未 settled 时，结果为未知。`cancel_requested` 不等于进程已经停止；只有实际结束后才能确认取消或失败。
+- 执行与事件记录持久化；活动序号用于去重，丢帧或裁剪会显示缺口，不能把前后片段拼成完整历史。
+- 工蜂启动发现本代已有执行活动或旧执行为 unknown 时，保留现场，不自动重放。确认旧进程已停止后，使用管理员受控恢复建立新代次；不要直接改派 InProgress 任务、重置计数或删除工作区。
+- 同仓库代码任务未声明 `files` 时视为未知写集，与另一份未知写集也互斥。只读/noCode 任务明确声明后可放行；有写集的任务需提供真实目录/文件范围，不能用虚构的独占路径绕过互斥。
+- 同仓库的最终 Git 集成串行执行；不同任务各自的取消、验收与重做仍受任务锁和代次校验约束。
+
+## Pi 会话只读观察
+
+在任务详情中主动启用“会话共享”后，Pi 工蜂可共享助手可见回复及工具名称、调用关联和开始/结束状态。默认不启用；其他执行器明确显示不支持。
+
+- 工蜂端先按完整行缓冲过滤，再发送白名单字段；不发送思考、原始工具参数或工具结果正文，代码块、凭据和无法安全展示的片段隐藏。不是逐 token 原样转发。
+- 授权单独存储，携带 worker 令牌不能自授权限，修改任务 workspace 也不能启用共享。停止共享后服务端拒收，页面清除已显示内容。
+- 每个执行实例最多保留 24 小时、512 个事件或 256 KiB；浏览器采用同等有界窗口。过期、裁剪、断线缺帧会明确标注，缺口前后的同一消息不会直接拼接。
+- 用户阅读旧片段时不强制滚到底部；阅读位置被裁剪时回到最早仍可用内容并显示缺口。切换实例、撤销授权或关闭详情会释放旧缓存与监听。
+- **访问边界沿用现有可信内网单用户模式**：无 Bearer 请求视作用户，不是多租户登录鉴权。能访问 Hive 的可信内网用户可能读取已授权片段；不要直接暴露公网或向不可信网络开放。
+
+服务端升级不会升级已安装工蜂；缺少新观察协议的旧工蜂只会提供原有状态，不能据此声称已经订阅会话。升级前先确认执行真正停止，并备份本机身份配置与工作区；激活脚本仅修复常驻进程，不负责升级代码。不得通过卸载、重注册或清空现场冒充热升级。操作顺序见 [DEPLOY.md](DEPLOY.md)。
+
 ## 安全注意
 
 - **worker token 等同设备身份**：妥善保管；一旦泄露，在 Web 界面 Agent 页吊销即可（吊销后该 token 全部请求 401），再注册/重发新 token 恢复接入。

@@ -15,21 +15,35 @@ export function createSessionObserver(options: {
   let skipped = false;
   let messageId = '';
   let messageNumber = 0;
-  let fenced = false;
+  let fence: { marker: string; length: number } | null = null;
+  let suppressRemainder = false;
   let privateKey = false;
   const blocks = new Map<number, { pending: string; overflow: boolean }>();
   const emit = options.emit;
   const redact = (contentIndex?: number) => emit({ kind: 'redacted', messageId: messageId || undefined, contentIndex });
   const line = (text: string, contentIndex: number) => {
-    const fenceCount = text.match(/```/g)?.length ?? 0;
-    if (fenceCount) {
-      if (fenceCount % 2) fenced = !fenced;
+    if (suppressRemainder) { redact(contentIndex); return; }
+    const delimiter = /`{3,}|~{3,}/.exec(text);
+    if (fence) {
+      if (delimiter && delimiter[0][0] === fence.marker && delimiter[0].length >= fence.length &&
+          /^[ \t>]*$/.test(text.slice(0, delimiter.index)) &&
+          text.slice(delimiter.index + delimiter[0].length).trim() === '') fence = null;
+      redact(contentIndex);
+      return;
+    }
+    if (delimiter) {
+      fence = { marker: delimiter[0][0], length: delimiter[0].length };
       redact(contentIndex);
       return;
     }
     if (/-----BEGIN .*PRIVATE KEY-----/.test(text)) privateKey = true;
-    const hidden = fenced || privateKey ||
-      /(?:api[_-]?key|password|passwd|secret|token)\s*["']?\s*[:=]/i.test(text) ||
+    const label = /(?:api[_-]?key|password|passwd|secret|token|authorization)\s*["']?\s*[:=]\s*/i.exec(text);
+    const value = label ? text.slice(label.index + label[0].length).trim() : '';
+    const incompleteValue = label !== null && (!value || /^[|>]/.test(value) ||
+      ((value.startsWith('"') || value.startsWith("'")) && !value.endsWith(value[0])));
+    if (incompleteValue || /\bBearer\s*$/i.test(text)) suppressRemainder = true;
+    const hidden = privateKey || suppressRemainder || label !== null ||
+      /^(?: {0,3}> ?)*(?: {4}|\t)/.test(text) ||
       /https?:\/\/[^\s/@:]+:[^\s@]+@|[?&](?:key|token|secret|password)=/i.test(text);
     if (/-----END .*PRIVATE KEY-----/.test(text)) privateKey = false;
     if (hidden || redactExecutionText(text, options.secrets) !== text) {
@@ -40,14 +54,15 @@ export function createSessionObserver(options: {
   };
   const flush = () => {
     for (const [index, block] of blocks) {
-      if (block.overflow) redact(index);
+      if (block.overflow) { suppressRemainder = true; redact(index); }
       else if (block.pending) line(block.pending, index);
     }
     blocks.clear();
   };
   const startMessage = () => {
     messageId = `message-${++messageNumber}`;
-    fenced = false;
+    fence = null;
+    suppressRemainder = false;
     privateKey = false;
     blocks.clear();
     emit({ kind: 'assistant_start', messageId });
@@ -61,14 +76,33 @@ export function createSessionObserver(options: {
     }
     if (!sessionStarted) { emit({ kind: 'session_start' }); sessionStarted = true; }
     if (skipped) { emit({ kind: 'gap' }); skipped = false; }
-    const message = event.message as { role?: string } | undefined;
-    if (event.type === 'message_start' && message?.role === 'assistant') startMessage();
+    const message = event.message;
+    const role = message !== null && typeof message === 'object' && 'role' in message ? message.role : undefined;
+    if (event.type === 'message_start' && role === 'assistant') startMessage();
     if (event.type === 'message_update') {
-      const delta = event.assistantMessageEvent as { type?: string; delta?: string; contentIndex?: number } | undefined;
-      if (delta?.type !== 'text_delta' || typeof delta.delta !== 'string') return;
-      const index = delta.contentIndex ?? 0;
-      if (!Number.isSafeInteger(index) || index < 0 || index >= 8) { redact(); return; }
-      if (!messageId) startMessage();
+      const delta = event.assistantMessageEvent;
+      if (delta === null || typeof delta !== 'object' || !('type' in delta) ||
+          (delta.type !== 'text_delta' && delta.type !== 'text_end')) return;
+      const index = 'contentIndex' in delta ? delta.contentIndex : 0;
+      if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0 || index >= 8) { redact(); return; }
+      if (delta.type === 'text_end') {
+        const completed = blocks.get(index);
+        if (completed?.overflow) { suppressRemainder = true; redact(index); }
+        else if (completed?.pending) line(completed.pending, index);
+        blocks.delete(index);
+        return;
+      }
+      if (!('delta' in delta) || typeof delta.delta !== 'string') return;
+      for (const [other, pending] of blocks) {
+        if (other !== index && (pending.pending.length > 0 || pending.overflow)) {
+          suppressRemainder = true;
+          break;
+        }
+      }
+      if (!messageId) {
+        messageId = `fragment-${++messageNumber}`;
+        suppressRemainder = true;
+      }
       let block = blocks.get(index);
       if (!block) { block = { pending: '', overflow: false }; blocks.set(index, block); }
       // Hold complete lines, not prefixes: a credential split across chunks is inspected as one unit.
@@ -78,13 +112,13 @@ export function createSessionObserver(options: {
           if (block.pending.length > 2048) { block.pending = ''; block.overflow = true; }
         }
         if (part.endsWith('\n')) {
-          if (block.overflow) redact(index); else line(block.pending, index);
+          if (block.overflow) { suppressRemainder = true; redact(index); } else line(block.pending, index);
           block.pending = '';
           block.overflow = false;
         }
       }
     }
-    if (event.type === 'message_end' && message?.role === 'assistant') {
+    if (event.type === 'message_end' && role === 'assistant') {
       flush();
       if (messageId) emit({ kind: 'assistant_end', messageId });
       messageId = '';

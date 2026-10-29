@@ -5,6 +5,8 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPiPrompt } from '../src/pi-executor.ts';
+import { createSessionObserver } from '../src/session-observer.ts';
+import type { SessionObservationEvent } from '../src/sdk.ts';
 
 test('real Pi observation filters split credentials, reasoning and tool/file content before delivery', async () => {
   const root = mkdtempSync(join(tmpdir(), 'hive-session-observation-'));
@@ -94,4 +96,88 @@ test('user cancellation aborts the real model stream and waits for Pi prompt set
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+function observerFixture() {
+  const delivered: Omit<SessionObservationEvent, 'sequence'>[] = [];
+  let enabled = true;
+  const observe = createSessionObserver({ enabled: () => enabled, secrets: [], emit: event => { delivered.push(event); } });
+  return {
+    begin: () => observe({ type: 'message_start', message: { role: 'assistant' } }),
+    text: (delta: string, contentIndex = 0) => observe({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta, contentIndex } }),
+    endBlock: (contentIndex: number) => observe({ type: 'message_update', assistantMessageEvent: { type: 'text_end', contentIndex } }),
+    end: () => observe({ type: 'message_end', message: { role: 'assistant' } }),
+    setEnabled: (value: boolean) => { enabled = value; },
+    visible: () => delivered.filter(event => event.kind === 'assistant_text').map(event => event.text).join(''),
+  };
+}
+
+test('session observation hides tilde fences and does not close a longer fence with a shorter delimiter', () => {
+  for (const source of [
+    'safe-before\n~~~ts\nPRIVATE_TILDE_BODY\n~~~\nsafe-after\n',
+    'safe-before\n````ts\nPRIVATE_LONG_FENCE\n```\nPRIVATE_SHORT_CLOSING\n````\nsafe-after\n',
+  ]) {
+    const fixture = observerFixture();
+    fixture.begin(); fixture.text(source); fixture.end();
+    assert.match(fixture.visible(), /safe-before/);
+    assert.match(fixture.visible(), /safe-after/);
+    assert.doesNotMatch(fixture.visible(), /PRIVATE_/);
+  }
+});
+
+test('session observation suppresses multiline sensitive values through the message boundary', () => {
+  for (const source of [
+    'safe-before\npassword:\nopaque-demo-credential-739204\n',
+    'safe-before\nAuthorization:\nBearer\nopaque-demo-credential-739204\n',
+    'safe-before\nBearer\nopaque-demo-credential-739204\n',
+  ]) {
+    const fixture = observerFixture();
+    fixture.begin(); fixture.text(source); fixture.end();
+    fixture.begin(); fixture.text('safe-new-message\n'); fixture.end();
+    assert.match(fixture.visible(), /safe-before/);
+    assert.match(fixture.visible(), /safe-new-message/);
+    assert.doesNotMatch(fixture.visible(), /opaque-demo-credential/);
+  }
+});
+
+test('overflowed fence lines do not expose following private code', () => {
+  const fixture = observerFixture();
+  fixture.begin();
+  fixture.text('safe-before\n```' + 'x'.repeat(2100) + '\nPRIVATE_AFTER_OVERFLOW\n```\n');
+  fixture.end();
+  fixture.begin(); fixture.text('safe-new-message\n'); fixture.end();
+  assert.match(fixture.visible(), /safe-before/);
+  assert.match(fixture.visible(), /safe-new-message/);
+  assert.doesNotMatch(fixture.visible(), /PRIVATE_AFTER_OVERFLOW/);
+});
+
+test('enabling observation inside an existing code block stays hidden until a new assistant message', () => {
+  const fixture = observerFixture();
+  fixture.begin(); fixture.text('safe-before\n```ts\n');
+  fixture.setEnabled(false); fixture.text('hidden while disabled\n');
+  fixture.setEnabled(true); fixture.text('PRIVATE_AFTER_RESUME\n```\n');
+  fixture.end();
+  fixture.begin(); fixture.text('safe-new-message\n'); fixture.end();
+  assert.match(fixture.visible(), /safe-before/);
+  assert.match(fixture.visible(), /safe-new-message/);
+  assert.doesNotMatch(fixture.visible(), /PRIVATE_AFTER_RESUME/);
+});
+
+test('sensitive labels pending in one content block cannot expose a value in another block', () => {
+  const fixture = observerFixture();
+  fixture.begin();
+  fixture.text('password:', 0);
+  fixture.text('opaque-other-block-credential\n', 1);
+  fixture.end();
+  assert.doesNotMatch(fixture.visible(), /opaque-other-block-credential/);
+});
+
+test('completed public text blocks remain visible without requiring a newline', () => {
+  const fixture = observerFixture();
+  fixture.begin();
+  fixture.text('public-first-block', 0);
+  fixture.endBlock(0);
+  fixture.text('public-second-block\n', 1);
+  fixture.end();
+  assert.equal(fixture.visible(), 'public-first-blockpublic-second-block\n');
 });

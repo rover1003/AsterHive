@@ -41,7 +41,7 @@ async function setupBoardWithTasks(r: Rig, n = 3): Promise<void> {
     const t = await r.app.request('/boards/b/tasks', {
       method: 'POST',
       headers: JSON_H,
-      body: JSON.stringify({ id: `T${i}`, title: `卡${i}`, lane: 'Ready' }),
+      body: JSON.stringify({ id: `T${i}`, title: `卡${i}`, lane: 'Ready', files: [`task-${i}.ts`] }),
     });
     assert.equal(t.status, 201);
   }

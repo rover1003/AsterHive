@@ -5,6 +5,11 @@ import { createApp } from '../src/http.ts';
 import { registerAgent, ensureBrainAgent, findAgent } from '../src/agents.ts';
 import { listEvents } from '../src/write.ts';
 import type { Agent } from '../src/agents.ts';
+import { serve } from '@hono/node-server';
+import { once } from 'node:events';
+import { spawn } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // 单用户模型·零令牌终态测试：GET/PUT /api/user 改名流程、旧 user 迁移清理、
 // asterhive-brain 不受影响、主脑设置与 agent 启停的 requireElevated 闸门、技能分发。
@@ -362,35 +367,41 @@ test('技能分发：GET /skill/asterhive-worker 返回技能全文，未知技�
   }
 });
 
-test('自举快捷通道：/bootstrap/ 返回下载指引，cli.ts/index.ts 原样返回 sdk 源码，白名单外 404', async () => {
+test('按自举指引下载的独立 CLI 能直接运行并注册，无需仓库或第三方依赖', async () => {
   const rig = mkRig();
+  const server = serve({ fetch: createApp(rig.ctx).fetch, hostname: '127.0.0.1', port: 0 });
   try {
-    const app = createApp(rig.ctx);
-
-    // 指引页：公开可读（零令牌语义），含两条下载命令与注册命令
-    const page = await app.request('/bootstrap/');
-    assert.equal(page.status, 200);
-    assert.match(page.headers.get('content-type') ?? '', /text\/plain/);
-    const pageText = await page.text();
-    assert.ok(pageText.includes('cli.ts'), '指引含 cli.ts 下载命令');
-    assert.ok(pageText.includes('/bootstrap/cli.ts'), '下载命令指向本端点');
-    assert.ok(pageText.includes('register'), '含注册命令');
-
-    // cli.ts 原样返回（文本明文，非 markdown）
-    const cli = await app.request('/bootstrap/cli.ts');
-    assert.equal(cli.status, 200);
-    assert.match(cli.headers.get('content-type') ?? '', /text\/plain/);
-    assert.ok((await cli.text()).includes('registerWithRetry'), 'cli.ts 源码原样返回');
-
-    // index.ts 原样返回
-    const idx = await app.request('/bootstrap/index.ts');
-    assert.equal(idx.status, 200);
-    assert.ok((await idx.text()).includes('defaultWorkerIdentity'), 'index.ts 源码原样返回');
-
-    // 白名单外文件一律 404（不作任意文件读取口）
-    const miss = await app.request('/bootstrap/nope.ts');
-    assert.equal(miss.status, 404);
+    if (!server.listening) await once(server, 'listening');
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const base = `http://127.0.0.1:${address.port}`;
+    const guide = await (await fetch(base + '/bootstrap/')).text();
+    const client = join(rig.ctx.cfg.dataDir, 'standalone-client');
+    mkdirSync(client);
+    for (const [, name, url] of guide.matchAll(/^curl -fLo (\S+) (\S+)$/gm)) {
+      const response = await fetch(url);
+      assert.equal(response.status, 200);
+      writeFileSync(join(client, name), await response.text());
+    }
+    const child = spawn(process.execPath, [join(client, 'cli.ts'), 'register', '--url', base, '--handle', 'standalone-bootstrap'], {
+      cwd: client, windowsHide: true, signal: AbortSignal.timeout(15000),
+      env: { ...process.env, HOME: client, USERPROFILE: client },
+    });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.stdout.resume();
+    const [exitCode] = await once(child, 'exit');
+    assert.equal(exitCode, 0, stderr);
+    const config = JSON.parse(readFileSync(join(client, '.asterhive', 'worker.json'), 'utf8'));
+    const profile = await fetch(base + '/agents/me/profile', { headers: { authorization: `Bearer ${config.token}` } });
+    assert.equal(profile.status, 200);
+    const registered = findAgent(rig.ctx, 'standalone-bootstrap');
+    assert.ok(registered);
+    assert.equal((await profile.json()).agentId, registered.id);
+    assert.equal((await fetch(base + '/bootstrap/not-public.ts')).status, 404);
   } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
     rig.cleanup();
   }
 });

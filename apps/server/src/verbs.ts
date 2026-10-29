@@ -51,7 +51,7 @@ interface ActiveClaimRow {
 // - 全局生效（跨 board），但仅同一仓库互斥：托管板各自独立裸仓（按 board 区分），
 //   remote-legacy 板按 board.repo URL 共享仓库；不同仓库同路径放行。
 // - 目录/后代路径与通配符前缀段均视为重叠。
-// - 空写集 = 未知写范围：与任何已声明写集互斥（保守串行）；空 vs 空 放行（兼容既有定向派发）。
+// - 空写集 = 未知写范围：与同仓库其他写任务互斥，包括另一份未知写集。
 // - noCode 只读任务（workspace.noCode）不参与写互斥。
 function repoIdentity(board: { id: string; repo: string; repoMode: string }): string {
   return board.repoMode === 'managed' ? `managed:${board.id}` : `remote:${board.repo}`;
@@ -81,8 +81,7 @@ function fileConflicts(ctx: Ctx, task: Task, files: string[]): string[] {
     if (theirWorkspace.noCode === true) continue; // 只读任务不互斥
     const theirs = (JSON.parse(r.files) as string[]).map(normalizePath).filter(Boolean);
     if (theirs.length === 0 || mine.length === 0) {
-      // 未知写集与已声明写集互斥；空 vs 空 保守放行
-      if (theirs.length > 0 || mine.length > 0) conflicts.push(r.id);
+      conflicts.push(r.id);
       continue;
     }
     if (theirs.some((f) => mine.some((m) => pathsOverlap(m, f)))) conflicts.push(r.id);
@@ -397,6 +396,10 @@ export function submitTask(ctx: Ctx, actor: Agent, taskId: string, input: Submit
       .run(reviewerEnabled ? 'pending' : 'none', input.summary.trim().slice(0, 6000), JSON.stringify(evidence), now, now, now, now, taskId);
     if (Number(res.changes) !== 1) {
       throw new HttpError(409, `task ${taskId} state changed concurrently`);
+    }
+    if (noCode && task.workspace.noCode !== true) {
+      ctx.holder.db.prepare('UPDATE task SET workspace=? WHERE id=?')
+        .run(JSON.stringify({ ...task.workspace, noCode: true }), taskId);
     }
     logEvent(ctx, 'task.submitted', {
       taskId,

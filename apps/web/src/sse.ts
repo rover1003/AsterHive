@@ -41,6 +41,7 @@ let source: EventSource | null = null;
 const stateListeners = new Set<(connected: boolean) => void>();
 
 export function onConnectionState(fn: (connected: boolean) => void): () => void {
+  stateListeners.add(fn);
   if (source) fn(source.readyState === EventSource.OPEN);
   return () => stateListeners.delete(fn);
 }
