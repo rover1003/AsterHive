@@ -14,3 +14,4 @@ Thumbs.db
 .zcode/
 .sandbox-data/
 nul
+apps/worker-zcode/work/

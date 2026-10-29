@@ -31,8 +31,8 @@ docker compose up -d --build
 └── pi-runtime/         内置蜂后 Pi 运行时（版本、社区扩展、技能挂载点）
 ```
 
-**备份**：打包整个 `/data`（或至少 `asterhive.db` + `repos/` + `evidence/`）即可完整保留全部状态。
-**恢复**：解压回数据卷并启动容器，服务自动对齐数据库与托管仓库。
+**备份**：先确认没有正在执行或集成的任务，停服后归档整个 `/data`，再恢复服务；也可对在线 SQLite 使用其 backup API，但不能直接复制正在写入的 `.db` 文件而忽略 WAL。数据库单独备份不等于代码仓与证据文件的完整备份。
+**恢复**：在停服状态下恢复经过校验的一致性数据副本，配合对应镜像启动并验证健康；不要覆盖仍在使用的数据卷。
 
 ## 4. 升级
 
@@ -44,11 +44,19 @@ docker compose up -d --build
 旧数据卷原样保留；数据库 schema 热迁移（启动时自动补列）。Pi 运行时升级走 Web UI「设置 → Pi 运行时」（装新版→原子切换→可回滚），与镜像升级解耦。
 ### 生产升级操作规范与工蜂升级顺序
 
-1. **升级前备份**：在宿主机保存当前数据卷副本与镜像标签：
+1. **升级前备份**：先确认真实执行状态；开关停用和心跳离线不等于工蜂已停止。无执行中任务时，在宿主机保留一致性数据归档及独立回退镜像，例如：
    ```bash
-   docker compose exec -u root asterhive cp /data/asterhive.db /data/pre-release-backup.db
-   docker tag asterhive/server:latest asterhive/server:pre-release-backup
+   release=$(date -u +%Y%m%dT%H%M%SZ)
+   backup_dir="$HOME/asterhive-backups/$release"
+   mkdir -p "$backup_dir" && chmod 700 "$backup_dir"
+   docker tag asterhive/server:latest "asterhive/server:pre-release-$release"
+   docker compose stop asterhive
+   docker run --rm --user 0 --volumes-from asterhive \
+     --mount "type=bind,src=$backup_dir,dst=/backup" --entrypoint tar \
+     "asterhive/server:pre-release-$release" -cf /backup/data.tar -C /data .
+   tar -tf "$backup_dir/data.tar" >/dev/null
    ```
+   停服期间备份失败时，应先恢复原服务并排查，不继续发布。配置文件单独受限保存，不能写入公共仓库或日志。镜像标签与数据归档均保留到新版本验收后，不作为构建缓存删除。
 2. **部署服务端**：本地完成验证并提交后，通过 `git archive HEAD` 覆盖解压至服务器目录（保留 `.env` 与数据卷），在远端执行：
    ```bash
    docker compose up -d --build
@@ -59,7 +67,11 @@ docker compose up -d --build
    - 升级服务端后，现有旧版工蜂仍可使用原有心跳与静态规格正常领活（兼容旧协议）；
    - 若需获得执行实例秒级追踪、阶段等待计时与会话只读观察能力，需登录各目标设备，确保当前任务已完全停止，重新下载最新的 `worker.tar.gz` 解压至工蜂应用目录并重启常驻服务；
    - 严禁通过删除设备身份、重命名 handle 或清空工作区现场来冒充升级。
-5. **回退方案**：若发布后发现异常，可直接拉起备份镜像并恢复数据库副本，历史版本具备向下读写兼容性，严禁通过清空数据库恢复。
+5. **回退方案**：保持现场，停服后使用匹配的备份镜像和一致性数据副本恢复，再验证业务数据与健康。历史兼容验证只覆盖当时实测路径，不能推断任意版本可直接读写新版数据库；严禁通过清空数据库恢复。
+
+### 发布后清理边界
+
+只清理本项目已确认可再生成的临时归档、截图、构建输出和缓存；必要源码、测试、锁文件、设计工具、配置、`journal/`、业务数据、验收证据与回退备份保留。共享主机上不执行无范围的 `docker system prune`、卷清理或全局 npm 缓存删除，也不按进程名批量结束 Node。生产镜像中的 `/app/public`、运行依赖与工蜂分发包是运行所需，不能当临时产物删除。
 
 ### 蜂后模型组的思考等级
 

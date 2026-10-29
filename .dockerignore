@@ -7,3 +7,9 @@ apps/server/data
 *.db-shm
 *.log
 .env
+apps/worker-zcode/work
+.shots
+.zcode
+**/dist
+**/.vite
+**/.vite-temp
